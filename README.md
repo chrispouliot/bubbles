@@ -43,4 +43,10 @@ OpenSSL, `protobuf` for the prost-build glue).
 ## License
 
 The moment `rustpush` is linked, this crate becomes a "covered work" under
-`rustpush`'s Server Side Public License v1 (SSPL-1.0)
+`rustpush`'s **Server Side Public License v1 (SSPL-1.0)**, which carries
+GPLv3-style whole-work copyleft. Distributing the client (including hosting
+source here on GitHub) requires the entire repo to be SSPL-licensed; it cannot
+be permissive or proprietary. Add the full SSPL v1 text as `LICENSE` before the
+first dependency on `rustpush` lands.
+
+This is not legal advice.

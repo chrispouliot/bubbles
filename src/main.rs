@@ -1,36 +1,54 @@
+mod gtk_bridge;
+mod protocol;
+mod runtime;
+mod setup;
+mod store;
+
+#[cfg(feature = "rustpush")]
+mod api;
+
+// The Mac-hardware protobuf, compiled by build.rs into OUT_DIR. Referenced as
+// `crate::bbhwinfo` by the vendored api subset.
+#[cfg(feature = "rustpush")]
+pub mod bbhwinfo {
+    include!(concat!(env!("OUT_DIR"), "/bbhwinfo.rs"));
+}
+
+use std::sync::Arc;
+
 use adw::prelude::*;
-use adw::{Application, ApplicationWindow, HeaderBar, WindowTitle};
-use gtk::{Box as GtkBox, Label, Orientation};
+
+use protocol::Backend;
 
 const APP_ID: &str = "app.openbubbles.Gtk.Devel";
 
 fn main() -> glib::ExitCode {
-    let app = Application::builder().application_id(APP_ID).build();
-    app.connect_activate(build_ui);
+    let app = adw::Application::builder()
+        .application_id(APP_ID)
+        .build();
+
+    app.connect_activate(|app| {
+        let window = setup::view::build_window(app, make_backend());
+        window.present();
+    });
+
     app.run()
 }
 
-fn build_ui(app: &Application) {
-    let header = HeaderBar::builder()
-        .title_widget(&WindowTitle::new("OpenBubbles", "scaffold"))
-        .build();
+/// Real backend: initialises the rustpush state dir + logger, then hands the
+/// onboarding flow a live `RustpushBackend`.
+#[cfg(feature = "rustpush")]
+fn make_backend() -> Arc<dyn Backend> {
+    let dir = glib::user_data_dir().join("openbubbles-gtk");
+    std::fs::create_dir_all(&dir).ok();
+    let path = dir.to_string_lossy().into_owned();
+    api::do_first_time_init(path.clone());
+    Arc::new(protocol::rustpush_backend::RustpushBackend::new(path))
+}
 
-    let label = Label::builder()
-        .label("Native GTK4 / libadwaita client — scaffold")
-        .vexpand(true)
-        .build();
-
-    let content = GtkBox::new(Orientation::Vertical, 0);
-    content.append(&header);
-    content.append(&label);
-
-    let window = ApplicationWindow::builder()
-        .application(app)
-        .title("OpenBubbles")
-        .default_width(420)
-        .default_height(320)
-        .content(&content)
-        .build();
-
-    window.present();
+/// Default backend: canned values so the flow is click-through-able without
+/// rustpush linked.
+#[cfg(not(feature = "rustpush"))]
+fn make_backend() -> Arc<dyn Backend> {
+    Arc::new(protocol::stub::StubBackend)
 }

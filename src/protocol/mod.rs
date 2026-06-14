@@ -1,0 +1,271 @@
+//! The protocol facade.
+//!
+//! This defines the *call surface* the onboarding flow needs, mirroring the
+//! sequence the upstream Dart app runs through `rust/src/api/api.rs`
+//! (which is itself thin glue over `rustpush`).
+//!
+//! The handles below (`Config`, `Connection`, `Account`, ...) are opaque: the
+//! flow never inspects them, it only threads them between `Backend` calls. The
+//! real backend (the lifted, de-FRB'd `api.rs`) wraps the corresponding
+//! `rustpush` `Arc<...>` types inside them; [`stub::StubBackend`] wraps unit
+//! values so the UI compiles and is click-through-able today.
+
+use async_trait::async_trait;
+
+pub mod stub;
+
+#[cfg(feature = "rustpush")]
+pub mod rustpush_backend;
+
+pub use anyhow::Result;
+
+/// Generates an opaque, cheaply-cloneable, `Send + Sync` handle type.
+macro_rules! opaque_handle {
+    ($(#[$m:meta])* $name:ident) => {
+        $(#[$m])*
+        #[derive(Clone)]
+        pub struct $name(pub std::sync::Arc<dyn std::any::Any + Send + Sync>);
+
+        impl $name {
+            pub fn new<T: std::any::Any + Send + Sync>(v: T) -> Self {
+                Self(std::sync::Arc::new(v))
+            }
+            /// Recover the concrete inner value (used by the real backend).
+            pub fn downcast<T: std::any::Any + Send + Sync>(&self) -> Option<&T> {
+                self.0.downcast_ref::<T>()
+            }
+        }
+
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(concat!(stringify!($name), "(..)"))
+            }
+        }
+    };
+}
+
+opaque_handle!(
+    /// `rustpush::JoinedOSConfig` — the Apple "hardware token" / validation data.
+    Config
+);
+opaque_handle!(
+    /// `rustpush::APSConnection` — the APNs/courier connection.
+    Connection
+);
+opaque_handle!(
+    /// The anisette client.
+    Anisette
+);
+opaque_handle!(
+    /// `rustpush::IDSNGMIdentity`.
+    Identity
+);
+opaque_handle!(
+    /// `Arc<Mutex<AppleAccount<..>>>`.
+    Account
+);
+opaque_handle!(
+    /// A registered `rustpush::IDSUser`.
+    IdsUser
+);
+opaque_handle!(
+    /// `CircleClientSession` — carries trusted-device 2FA state.
+    CircleSession
+);
+opaque_handle!(
+    /// SMS-2FA context (`VerifyBody`) returned when an SMS code is requested.
+    VerifyBody
+);
+opaque_handle!(
+    /// `Arc<IMClient>` — the messaging client produced after registration.
+    ImClient
+);
+
+/// Device identity extracted from a [`Config`], shown to the user during setup.
+#[derive(Clone, Debug, Default)]
+pub struct DeviceInfo {
+    pub name: String,
+    pub serial: String,
+    pub os_version: String,
+}
+
+/// Mirror of `rustpush` `api::HwExtra`. Fields are TODO until the real backend
+/// is wired; only the validation-data path needs them (the relay path doesn't).
+#[derive(Clone, Debug, Default)]
+pub struct HwExtra {}
+
+/// An Apple-side message that blocked registration (account locked, etc.).
+#[derive(Clone, Debug)]
+pub struct SupportAlert {
+    pub title: String,
+    pub body: String,
+}
+
+/// Result of `register_ids`.
+#[derive(Debug)]
+pub enum RegisterOutcome {
+    /// Registration succeeded; carries the registered user set.
+    Registered(Vec<IdsUser>),
+    /// Apple blocked registration; surface the alert to the user.
+    Blocked(SupportAlert),
+}
+
+/// A session restored from disk (Phase A2): the end-state of a completed
+/// onboarding minus the login/2FA detour — equivalent to what the flow holds
+/// after `register` + `make_imclient`. Lets a relaunch skip onboarding entirely.
+#[derive(Debug)]
+pub struct RestoredSession {
+    pub config: Config,
+    pub connection: Connection,
+    pub identity: Identity,
+    pub client: ImClient,
+    pub handles: Vec<String>,
+}
+
+/// The login/2FA state machine, mirroring `rustpush`'s `LoginState`.
+#[derive(Clone, Debug)]
+pub enum LoginState {
+    /// Need an Apple ID + password.
+    NeedsLogin,
+    /// Trusted-device 2FA must be triggered (push a code to Apple devices).
+    NeedsDevice2Fa,
+    /// SMS 2FA must be triggered.
+    NeedsSms2Fa,
+    /// A trusted-device code is now expected from the user.
+    Needs2FaVerification,
+    /// An SMS code is now expected from the user.
+    NeedsSms2FaVerification(VerifyBody),
+    /// Apple requires an extra step (carries a human-readable description).
+    NeedsExtraStep(String),
+    /// Fully authenticated.
+    LoggedIn,
+}
+
+impl Default for LoginState {
+    fn default() -> Self {
+        LoginState::NeedsLogin
+    }
+}
+
+/// The async surface over `rustpush`. The onboarding flow in [`crate::setup::flow`]
+/// is written purely against this trait, so the stub and the real backend are
+/// interchangeable.
+///
+/// Methods take `&Handle` and return owned handles; callers clone the cheap
+/// `Arc`-backed handles before moving them onto the tokio runtime.
+#[async_trait]
+pub trait Backend: Send + Sync {
+    // --- 1. hardware token / validation data -> Config ---
+
+    /// `api::config_from_relay` (hosted relay, e.g. `https://hw.openbubbles.app`).
+    async fn config_from_relay(
+        &self,
+        code: String,
+        host: String,
+        token: Option<String>,
+    ) -> Result<Config>;
+
+    /// `api::config_from_validation_data` (your own Mac's validation data).
+    async fn config_from_validation_data(&self, data: Vec<u8>, extra: HwExtra) -> Result<Config>;
+
+    /// `api::config_from_encoded` (a cached `bbhwinfo` blob from a prior local
+    /// pairing; the OABS magic + flag byte are stripped before calling this).
+    async fn config_from_encoded(&self, encoded: Vec<u8>) -> Result<Config>;
+
+    /// `api::get_device_info`.
+    async fn device_info(&self, config: &Config) -> Result<DeviceInfo>;
+
+    // --- 2. push connection + identity + anisette ---
+
+    /// `api::new_ngm_identity`.
+    fn new_identity(&self) -> Result<Identity>;
+
+    /// `api::setup_push`.
+    async fn setup_push(&self, config: &Config, identity: &Identity) -> Result<Connection>;
+
+    /// `api::make_anisette`.
+    async fn make_anisette(&self, config: &Config, conn: &Connection) -> Result<Anisette>;
+
+    // --- 3. Apple ID login + 2FA ---
+
+    /// `api::try_auth` — `creds` is `Some((apple_id, password))` on first login.
+    async fn try_auth(
+        &self,
+        config: &Config,
+        conn: &Connection,
+        anisette: &Anisette,
+        creds: Option<(String, String)>,
+    ) -> Result<(Account, LoginState)>;
+
+    /// `api::try_icloud_login`.
+    async fn try_icloud_login(&self, config: &Config, account: &Account)
+        -> Result<Option<IdsUser>>;
+
+    /// `api::send_2fa_to_devices` (trusted-device path).
+    async fn send_2fa_to_devices(
+        &self,
+        account: &Account,
+        conn: &Connection,
+    ) -> Result<(CircleSession, LoginState)>;
+
+    /// `api::verify_2fa` (trusted-device code).
+    async fn verify_2fa(
+        &self,
+        session: &CircleSession,
+        anisette: &Anisette,
+        config: &Config,
+        account: &Account,
+        code: String,
+    ) -> Result<(LoginState, Option<IdsUser>)>;
+
+    /// Wraps `api::get_2fa_sms_opts` + `api::send_2fa_sms`. The real impl picks a
+    /// number (or surfaces the option list); here it just requests the code.
+    async fn send_2fa_sms(&self, account: &Account) -> Result<LoginState>;
+
+    /// `api::verify_2fa_sms` (SMS code).
+    async fn verify_2fa_sms(
+        &self,
+        account: &Account,
+        anisette: &Anisette,
+        config: &Config,
+        body: &VerifyBody,
+        code: String,
+    ) -> Result<(LoginState, Option<IdsUser>)>;
+
+    // --- 4. IDS registration ---
+
+    /// `api::register_ids`.
+    async fn register_ids(
+        &self,
+        config: &Config,
+        conn: &Connection,
+        identity: &Identity,
+        users: Vec<IdsUser>,
+    ) -> Result<RegisterOutcome>;
+
+    /// `api::make_imclient`.
+    async fn make_imclient(
+        &self,
+        conn: &Connection,
+        identity: &Identity,
+        users: Vec<IdsUser>,
+    ) -> Result<ImClient>;
+
+    /// `api::get_handles`.
+    async fn get_handles(&self, client: &ImClient) -> Result<Vec<String>>;
+
+    // --- 5. session restore (Phase A2) ---
+
+    /// Attempt to restore a previously-registered session from the state dir.
+    /// `Ok(None)` => nothing saved (run onboarding); `Ok(Some(_))` => restored
+    /// and ready to message without re-registering with Apple.
+    async fn restore_session(&self) -> Result<Option<RestoredSession>>;
+
+    // --- 6. receive (Phase C spike) ---
+
+    /// Spawn a detached background task that logs every inbound iMessage. A
+    /// throwaway spike to confirm the live client receives and to inspect real
+    /// payload shapes; Phase C replaces the log sink with persistence + a UI
+    /// stream. No-op on backends without a live connection.
+    fn start_receive_log(&self, connection: &Connection, client: &ImClient);
+}
