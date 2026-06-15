@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=OpenBubbles
+Comment=Native iMessage client
+Type=Application
+Exec=openbubbles-gtk
+Icon=app.openbubbles.Gtk.Devel
+Terminal=false
+Categories=Network;InstantMessaging;GTK;
+StartupNotify=true
+StartupWMClass=app.openbubbles.Gtk.Devel

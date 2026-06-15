@@ -19,6 +19,8 @@ pub mod rustpush_backend;
 
 pub use anyhow::Result;
 
+use crate::store::{ChatRef, IncomingMessage, Store};
+
 /// Generates an opaque, cheaply-cloneable, `Send + Sync` handle type.
 macro_rules! opaque_handle {
     ($(#[$m:meta])* $name:ident) => {
@@ -261,11 +263,55 @@ pub trait Backend: Send + Sync {
     /// and ready to message without re-registering with Apple.
     async fn restore_session(&self) -> Result<Option<RestoredSession>>;
 
-    // --- 6. receive (Phase C spike) ---
+    // --- 6. receive (Phase C) ---
 
-    /// Spawn a detached background task that logs every inbound iMessage. A
-    /// throwaway spike to confirm the live client receives and to inspect real
-    /// payload shapes; Phase C replaces the log sink with persistence + a UI
-    /// stream. No-op on backends without a live connection.
-    fn start_receive_log(&self, connection: &Connection, client: &ImClient);
+    /// Spawn the detached receive loop: decode inbound pushes, persist each to
+    /// `store`, and pulse `notify` after every applied event so the UI can
+    /// refresh. No-op on backends without a live connection.
+    fn start_receiving(
+        &self,
+        connection: &Connection,
+        client: &ImClient,
+        handles: Vec<String>,
+        store: Store,
+        notify: async_channel::Sender<()>,
+    );
+
+    // --- 7. send (Phase D) ---
+
+    /// Send a text message to `chat` as `my_handle`. Returns the locally
+    /// persistable record (already flagged `is_from_me`) on success.
+    async fn send_text(
+        &self,
+        client: &ImClient,
+        chat: &ChatRef,
+        my_handle: &str,
+        text: String,
+        guid: String,
+    ) -> Result<IncomingMessage>;
+
+    /// Upload a file to MMCS and send it as an attachment. Returns the locally
+    /// persistable record (with a cached `local_path`) on success.
+    async fn send_attachment(
+        &self,
+        client: &ImClient,
+        connection: &Connection,
+        chat: &ChatRef,
+        my_handle: &str,
+        path: String,
+        mime: String,
+        name: String,
+        guid: String,
+    ) -> Result<IncomingMessage>;
+
+    /// Fire-and-forget a delivered (`read=false`) or read (`read=true`) receipt
+    /// for `target_guid` to `chat`'s participants.
+    fn send_receipt(
+        &self,
+        client: &ImClient,
+        chat: &ChatRef,
+        my_handle: &str,
+        read: bool,
+        target_guid: String,
+    );
 }

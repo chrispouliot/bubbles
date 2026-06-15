@@ -7,6 +7,7 @@ use crate::protocol::{
     Account, Anisette, CircleSession, Config, Connection, Identity, IdsUser, ImClient, LoginState,
     VerifyBody,
 };
+use crate::store::Store;
 
 /// State threaded across the onboarding pages. Lives in an `Rc<RefCell<_>>` on
 /// the GTK main thread; handles are cloned out of it before each tokio call and
@@ -24,4 +25,5 @@ pub struct SetupState {
     pub login_state: LoginState,
     pub client: Option<ImClient>,
     pub handles: Vec<String>,
+    pub store: Option<Store>,
 }

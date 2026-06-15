@@ -35,6 +35,10 @@
           perl # vendored OpenSSL (rustpush pins openssl/vendored)
           protobuf # protoc, for the prost-build glue (bbhwinfo / cloudkit_proto)
           cmake # insurance for assorted -sys crates
+
+          # flatpak-builder shells out to appstreamcli for its metainfo compose
+          # step; without it on PATH the build fails at the very end.
+          appstream
         ];
 
         buildInputs = with pkgs; [

@@ -18,9 +18,7 @@ pub use model::*;
 use std::path::Path;
 
 use anyhow::Result;
-use rusqlite::{params, Connection};
-
-const SCHEMA_VERSION: i64 = 1;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 const DDL: &str = "
 CREATE TABLE handle(
@@ -81,11 +79,72 @@ CREATE TABLE attachment(
 /// Apply pending migrations and enable FK enforcement on this connection.
 pub fn migrate(c: &Connection) -> rusqlite::Result<()> {
     c.pragma_update(None, "foreign_keys", true)?;
-    let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if v < SCHEMA_VERSION {
+    let mut v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if v < 1 {
         c.execute_batch(DDL)?;
-        c.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        v = 1;
     }
+    if v < 2 {
+        // Track which inbound messages we've already sent a read receipt for.
+        c.execute_batch("ALTER TABLE message ADD COLUMN read_sent INTEGER NOT NULL DEFAULT 0;")?;
+        v = 2;
+    }
+    c.pragma_update(None, "user_version", v)?;
+    Ok(())
+}
+
+/// The most recent inbound message in `chat_id` we have not yet acknowledged
+/// with a read receipt, as `(guid, date)`.
+pub fn latest_unread_incoming(c: &Connection, chat_id: i64) -> rusqlite::Result<Option<(String, i64)>> {
+    c.query_row(
+        "SELECT guid, date FROM message
+         WHERE chat_id = ?1 AND is_from_me = 0 AND read_sent = 0
+         ORDER BY date DESC, id DESC LIMIT 1",
+        params![chat_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+}
+
+/// The earliest unacknowledged inbound message — the boundary where the unread
+/// run begins. Used to place the "new messages" marker and scroll to it.
+pub fn first_unread_incoming(c: &Connection, chat_id: i64) -> rusqlite::Result<Option<(String, i64)>> {
+    c.query_row(
+        "SELECT guid, date FROM message
+         WHERE chat_id = ?1 AND is_from_me = 0 AND read_sent = 0
+         ORDER BY date ASC, id ASC LIMIT 1",
+        params![chat_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+}
+
+/// Mark every inbound message in `chat_id` up to `date` as read-acknowledged.
+pub fn mark_read_through(c: &Connection, chat_id: i64, date: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE message SET read_sent = 1
+         WHERE chat_id = ?1 AND is_from_me = 0 AND date <= ?2",
+        params![chat_id, date],
+    )?;
+    Ok(())
+}
+
+/// Mark as read any inbound message that already has a *later* message we sent in
+/// the same chat. Replying after a message proves we saw it, so even if a read
+/// receipt never arrives (receipts off, lost, or never echoed) the unread state
+/// should clear. Backstops the receipt path and any out-of-order delivery.
+pub fn reconcile_implicit_reads(c: &Connection) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE message SET read_sent = 1
+         WHERE is_from_me = 0 AND read_sent = 0
+           AND EXISTS (
+               SELECT 1 FROM message s
+               WHERE s.chat_id = message.chat_id
+                 AND s.is_from_me = 1
+                 AND s.date > message.date
+           )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -147,6 +206,42 @@ fn insert_message(c: &Connection, m: &IncomingMessage) -> rusqlite::Result<()> {
             m.date, m.effect, m.reply_to_guid, m.reply_part, m.item_type
         ],
     )?;
+    // Attach files only on first insert (fan-out duplicates reuse the guid).
+    let newly_inserted = c.changes() > 0;
+    if newly_inserted && !m.attachments.is_empty() {
+        let msg_id = c.last_insert_rowid();
+        for a in &m.attachments {
+            c.execute(
+                "INSERT INTO attachment
+                   (message_id, guid, mime_type, transfer_name, total_bytes,
+                    local_path, part_index, is_sticker)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    msg_id, a.guid, a.mime, a.name, a.total_bytes,
+                    a.local_path, a.part_index, a.is_sticker as i64
+                ],
+            )?;
+        }
+    }
+    // Sending from any of our devices marks the conversation read up to that
+    // point on all of them. Mirror that locally so a reply sent on the phone
+    // clears the unread state we picked up here.
+    if newly_inserted && m.is_from_me {
+        mark_read_through(c, chat_id, m.date)?;
+    } else if newly_inserted {
+        // Reverse order (our reply was already stored, this incoming arrived late):
+        // if a later message we sent exists, this was clearly seen -> read.
+        let seen_later: bool = c.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM message
+                WHERE chat_id = ?1 AND is_from_me = 1 AND date > ?2)",
+            params![chat_id, m.date],
+            |r| r.get(0),
+        )?;
+        if seen_later {
+            c.execute("UPDATE message SET read_sent = 1 WHERE guid = ?1", params![m.guid])?;
+        }
+    }
     bump_chat_date(c, chat_id, m.date)
 }
 
@@ -183,21 +278,63 @@ pub fn apply_blocking(c: &mut Connection, ingest: Ingest) -> rusqlite::Result<()
             )?;
         }
         Ingest::Receipt(Receipt::Read { guid, date }) => {
-            tx.execute(
-                "UPDATE message SET date_read = ?1
-                 WHERE guid = ?2 AND date_read IS NULL",
-                params![date, guid],
-            )?;
+            // A read receipt means different things depending on whose message it
+            // targets. Apple echoes our own read receipts to our other devices, so
+            // a receipt against one of *our incoming* messages is a cross-device
+            // signal that we read it elsewhere -> clear unread through it. A receipt
+            // against an *outgoing* message is the recipient reading us -> date_read.
+            let target: Option<(i64, i64, i64)> = tx
+                .query_row(
+                    "SELECT is_from_me, chat_id, date FROM message WHERE guid = ?1",
+                    params![guid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            match target {
+                Some((0, chat_id, msg_date)) => mark_read_through(&tx, chat_id, msg_date)?,
+                _ => {
+                    tx.execute(
+                        "UPDATE message SET date_read = ?1
+                         WHERE guid = ?2 AND date_read IS NULL",
+                        params![date, guid],
+                    )?;
+                }
+            }
         }
         Ingest::Ignored(_) => {}
     }
     tx.commit()
 }
 
+/// Inbound messages newer than `date` (a notification watermark), oldest-first.
+/// Excludes our own messages and tapbacks. Used to raise desktop notifications.
+pub fn incoming_since(c: &Connection, date: i64) -> rusqlite::Result<Vec<NewMessage>> {
+    let mut stmt = c.prepare(
+        "SELECT m.chat_id, h.address, m.text, m.date,
+                EXISTS(SELECT 1 FROM attachment a WHERE a.message_id = m.id)
+         FROM message m
+         LEFT JOIN handle h ON h.id = m.sender_handle_id
+         WHERE m.is_from_me = 0 AND m.date > ?1 AND m.associated_guid IS NULL
+         ORDER BY m.date ASC, m.id ASC",
+    )?;
+    let rows = stmt.query_map(params![date], |r| {
+        Ok(NewMessage {
+            chat_id: r.get(0)?,
+            sender: r.get(1)?,
+            text: r.get(2)?,
+            date: r.get(3)?,
+            has_attachment: r.get::<_, i64>(4)? != 0,
+        })
+    })?;
+    rows.collect()
+}
+
 pub fn query_chats(c: &Connection) -> rusqlite::Result<Vec<ChatSummary>> {
     let mut stmt = c.prepare(
         "SELECT c.id, c.key, c.display_name, c.is_group, c.service, c.last_message_date,
-                COALESCE(GROUP_CONCAT(h.address, ';'), '')
+                COALESCE(GROUP_CONCAT(h.address, ';'), ''),
+                (SELECT COUNT(*) FROM message m
+                   WHERE m.chat_id = c.id AND m.is_from_me = 0 AND m.read_sent = 0)
          FROM chat c
          LEFT JOIN chat_participant cp ON cp.chat_id = c.id
          LEFT JOIN handle h            ON h.id = cp.handle_id
@@ -218,42 +355,152 @@ pub fn query_chats(c: &Connection) -> rusqlite::Result<Vec<ChatSummary>> {
             } else {
                 parts.split(';').map(String::from).collect()
             },
+            unread: r.get(7)?,
         })
     })?;
     rows.collect()
 }
 
+/// Columns selected for a `StoredMessage`, in the order [`map_message_row`] expects.
+const MSG_COLS: &str = "m.id, m.guid, m.chat_id, h.address, m.is_from_me, m.text, m.subject, \
+     m.service, m.date, m.date_delivered, m.date_read, m.effect, m.reply_to_guid, m.reply_part, \
+     m.associated_guid, m.associated_type, m.item_type";
+
+fn map_message_row(r: &rusqlite::Row) -> rusqlite::Result<StoredMessage> {
+    Ok(StoredMessage {
+        id: r.get(0)?,
+        guid: r.get(1)?,
+        chat_id: r.get(2)?,
+        sender: r.get(3)?,
+        is_from_me: r.get::<_, i64>(4)? != 0,
+        text: r.get(5)?,
+        subject: r.get(6)?,
+        service: r.get(7)?,
+        date: r.get(8)?,
+        date_delivered: r.get(9)?,
+        date_read: r.get(10)?,
+        effect: r.get(11)?,
+        reply_to_guid: r.get(12)?,
+        reply_part: r.get(13)?,
+        associated_guid: r.get(14)?,
+        associated_type: r.get(15)?,
+        item_type: r.get(16)?,
+        attachments: Vec::new(),
+    })
+}
+
+/// Attachments for a specific set of message ids, grouped by message.
+fn load_attachments(
+    c: &Connection,
+    ids: &[i64],
+) -> rusqlite::Result<std::collections::HashMap<i64, Vec<StoredAttachment>>> {
+    let mut by_msg: std::collections::HashMap<i64, Vec<StoredAttachment>> =
+        std::collections::HashMap::new();
+    if ids.is_empty() {
+        return Ok(by_msg);
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT a.message_id, a.mime_type, a.transfer_name, a.local_path, a.is_sticker
+         FROM attachment a WHERE a.message_id IN ({placeholders})
+         ORDER BY a.part_index ASC, a.id ASC"
+    );
+    let mut astmt = c.prepare(&sql)?;
+    let arows = astmt.query_map(params_from_iter(ids.iter()), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            StoredAttachment {
+                mime: r.get(1)?,
+                name: r.get(2)?,
+                local_path: r.get(3)?,
+                is_sticker: r.get::<_, i64>(4)? != 0,
+            },
+        ))
+    })?;
+    for row in arows {
+        let (mid, att) = row?;
+        by_msg.entry(mid).or_default().push(att);
+    }
+    Ok(by_msg)
+}
+
+fn attach_to(c: &Connection, messages: &mut [StoredMessage]) -> rusqlite::Result<()> {
+    let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
+    let mut by_msg = load_attachments(c, &ids)?;
+    for m in messages.iter_mut() {
+        if let Some(atts) = by_msg.remove(&m.id) {
+            m.attachments = atts;
+        }
+    }
+    Ok(())
+}
+
 pub fn query_messages(c: &Connection, chat_id: i64) -> rusqlite::Result<Vec<StoredMessage>> {
-    let mut stmt = c.prepare(
-        "SELECT m.id, m.guid, m.chat_id, h.address, m.is_from_me, m.text, m.subject, m.service,
-                m.date, m.date_delivered, m.date_read, m.effect, m.reply_to_guid, m.reply_part,
-                m.associated_guid, m.associated_type, m.item_type
+    let mut stmt = c.prepare(&format!(
+        "SELECT {MSG_COLS}
          FROM message m LEFT JOIN handle h ON h.id = m.sender_handle_id
          WHERE m.chat_id = ?1
-         ORDER BY m.date ASC, m.id ASC",
-    )?;
-    let rows = stmt.query_map(params![chat_id], |r| {
-        Ok(StoredMessage {
-            id: r.get(0)?,
-            guid: r.get(1)?,
-            chat_id: r.get(2)?,
-            sender: r.get(3)?,
-            is_from_me: r.get::<_, i64>(4)? != 0,
-            text: r.get(5)?,
-            subject: r.get(6)?,
-            service: r.get(7)?,
-            date: r.get(8)?,
-            date_delivered: r.get(9)?,
-            date_read: r.get(10)?,
-            effect: r.get(11)?,
-            reply_to_guid: r.get(12)?,
-            reply_part: r.get(13)?,
-            associated_guid: r.get(14)?,
-            associated_type: r.get(15)?,
-            item_type: r.get(16)?,
-        })
-    })?;
-    rows.collect()
+         ORDER BY m.date ASC, m.id ASC"
+    ))?;
+    let rows = stmt.query_map(params![chat_id], map_message_row)?;
+    let mut messages = rows.collect::<rusqlite::Result<Vec<StoredMessage>>>()?;
+    attach_to(c, &mut messages)?;
+    Ok(messages)
+}
+
+/// One page of a chat's messages, newest-first window returned in ascending
+/// (oldest-first) order ready to render. `before` is the `(date, id)` cursor of
+/// the oldest message already loaded; pass `None` for the most recent page.
+/// Loads attachments only for the page's messages.
+pub fn query_messages_page(
+    c: &Connection,
+    chat_id: i64,
+    before: Option<(i64, i64)>,
+    limit: i64,
+) -> rusqlite::Result<Vec<StoredMessage>> {
+    let (has_before, bd, bid) = match before {
+        Some((d, i)) => (1i64, d, i),
+        None => (0, 0, 0),
+    };
+    let mut stmt = c.prepare(&format!(
+        "SELECT {MSG_COLS}
+         FROM message m LEFT JOIN handle h ON h.id = m.sender_handle_id
+         WHERE m.chat_id = ?1
+           AND (?2 = 0 OR (m.date < ?3 OR (m.date = ?3 AND m.id < ?4)))
+         ORDER BY m.date DESC, m.id DESC
+         LIMIT ?5"
+    ))?;
+    let rows = stmt.query_map(params![chat_id, has_before, bd, bid, limit], map_message_row)?;
+    let mut messages = rows.collect::<rusqlite::Result<Vec<StoredMessage>>>()?;
+    messages.reverse(); // DESC window -> ascending for display
+    attach_to(c, &mut messages)?;
+    Ok(messages)
+}
+
+/// All messages at or after the `(date, id)` cursor, ascending. Used to rebuild
+/// the currently-loaded window (cursor = oldest shown) on refresh, so newly
+/// arrived messages appear without collapsing any older pages already loaded.
+/// `None` loads the whole chat.
+pub fn query_messages_from(
+    c: &Connection,
+    chat_id: i64,
+    since: Option<(i64, i64)>,
+) -> rusqlite::Result<Vec<StoredMessage>> {
+    let (has_since, sd, sid) = match since {
+        Some((d, i)) => (1i64, d, i),
+        None => (0, 0, 0),
+    };
+    let mut stmt = c.prepare(&format!(
+        "SELECT {MSG_COLS}
+         FROM message m LEFT JOIN handle h ON h.id = m.sender_handle_id
+         WHERE m.chat_id = ?1
+           AND (?2 = 0 OR (m.date > ?3 OR (m.date = ?3 AND m.id >= ?4)))
+         ORDER BY m.date ASC, m.id ASC"
+    ))?;
+    let rows = stmt.query_map(params![chat_id, has_since, sd, sid], map_message_row)?;
+    let mut messages = rows.collect::<rusqlite::Result<Vec<StoredMessage>>>()?;
+    attach_to(c, &mut messages)?;
+    Ok(messages)
 }
 
 // --- async wrapper (used by the app) ---
@@ -271,6 +518,9 @@ impl Store {
         let conn = tokio_rusqlite::Connection::open(path.as_ref().to_owned()).await?;
         conn.call(|c| {
             migrate(c)?;
+            // Clear any unread that a later sent message already implies we read,
+            // in case those events were missed while this device was offline.
+            reconcile_implicit_reads(c)?;
             Ok(())
         })
         .await?;
@@ -302,8 +552,64 @@ impl Store {
         Ok(self.conn.call(|c| Ok(query_chats(c)?)).await?)
     }
 
+    /// Inbound messages newer than `date`, for desktop notifications.
+    pub async fn incoming_since(&self, date: i64) -> Result<Vec<NewMessage>> {
+        Ok(self.conn.call(move |c| Ok(incoming_since(c, date)?)).await?)
+    }
+
     pub async fn messages(&self, chat_id: i64) -> Result<Vec<StoredMessage>> {
         Ok(self.conn.call(move |c| Ok(query_messages(c, chat_id)?)).await?)
+    }
+
+    /// One page of a chat's messages (ascending). `before` is the `(date, id)`
+    /// cursor of the oldest message already shown; `None` fetches the newest page.
+    pub async fn messages_page(
+        &self,
+        chat_id: i64,
+        before: Option<(i64, i64)>,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>> {
+        Ok(self
+            .conn
+            .call(move |c| Ok(query_messages_page(c, chat_id, before, limit)?))
+            .await?)
+    }
+
+    /// Rebuilds the loaded window: all messages at/after `since` (oldest shown),
+    /// ascending. `None` loads the whole chat.
+    pub async fn messages_from(
+        &self,
+        chat_id: i64,
+        since: Option<(i64, i64)>,
+    ) -> Result<Vec<StoredMessage>> {
+        Ok(self
+            .conn
+            .call(move |c| Ok(query_messages_from(c, chat_id, since)?))
+            .await?)
+    }
+
+    pub async fn latest_unread_incoming(&self, chat_id: i64) -> Result<Option<(String, i64)>> {
+        Ok(self
+            .conn
+            .call(move |c| Ok(latest_unread_incoming(c, chat_id)?))
+            .await?)
+    }
+
+    pub async fn first_unread_incoming(&self, chat_id: i64) -> Result<Option<(String, i64)>> {
+        Ok(self
+            .conn
+            .call(move |c| Ok(first_unread_incoming(c, chat_id)?))
+            .await?)
+    }
+
+    pub async fn mark_read_through(&self, chat_id: i64, date: i64) -> Result<()> {
+        self.conn
+            .call(move |c| {
+                mark_read_through(c, chat_id, date)?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
     }
 }
 
@@ -340,6 +646,19 @@ mod tests {
         }
     }
 
+    // An outgoing message (sent by us, possibly synced from another device).
+    fn sent(guid: &str, date: i64) -> IncomingMessage {
+        IncomingMessage {
+            guid: guid.into(),
+            chat: chat_1to1(),
+            sender: Some("mailto:me@icloud.com".into()),
+            is_from_me: true,
+            text: Some("From me".into()),
+            date,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn dedupes_duplicate_delivery() {
         let mut c = db();
@@ -360,8 +679,8 @@ mod tests {
     #[test]
     fn receipt_updates_existing_message() {
         let mut c = db();
-        apply_blocking(&mut c, Ingest::Message(msg("G2", 2000))).unwrap();
-        // Receipt reuses the target guid, carries no chat.
+        // A read receipt against one of *our* messages = the recipient read it.
+        apply_blocking(&mut c, Ingest::Message(sent("G2", 2000))).unwrap();
         apply_blocking(&mut c, Ingest::Receipt(Receipt::Read { guid: "G2".into(), date: 2500 }))
             .unwrap();
 
@@ -370,6 +689,95 @@ mod tests {
         assert_eq!(msgs.len(), 1, "receipt did not insert a new row");
         assert_eq!(msgs[0].date_read, Some(2500));
         assert_eq!(msgs[0].date_delivered, None);
+    }
+
+    #[test]
+    fn read_receipt_on_incoming_clears_unread_cross_device() {
+        let mut c = db();
+        // Three incoming messages, all unread.
+        apply_blocking(&mut c, Ingest::Message(msg("I1", 1000))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(msg("I2", 1100))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(msg("I3", 1200))).unwrap();
+        let chats = query_chats(&c).unwrap();
+        assert_eq!(chats[0].unread, 3, "all unread before sync");
+
+        // We read up to I2 on another device; Apple echoes that read receipt to us.
+        apply_blocking(&mut c, Ingest::Receipt(Receipt::Read { guid: "I2".into(), date: 1500 }))
+            .unwrap();
+
+        let chats = query_chats(&c).unwrap();
+        assert_eq!(chats[0].unread, 1, "I1+I2 cleared, I3 still unread");
+        // It must not have written date_read onto our incoming row.
+        let msgs = query_messages(&c, chats[0].id).unwrap();
+        assert!(msgs.iter().all(|m| m.date_read.is_none()));
+    }
+
+    #[test]
+    fn self_sent_message_marks_conversation_read() {
+        let mut c = db();
+        apply_blocking(&mut c, Ingest::Message(msg("I1", 1000))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(msg("I2", 1100))).unwrap();
+        let chats = query_chats(&c).unwrap();
+        assert_eq!(chats[0].unread, 2);
+
+        // A reply we sent (here or synced from the phone) clears prior unread.
+        apply_blocking(&mut c, Ingest::Message(sent("S1", 1200))).unwrap();
+        let chats = query_chats(&c).unwrap();
+        assert_eq!(chats[0].unread, 0, "sending implies the chat was read");
+
+        // An incoming that arrives *after* our reply stays unread.
+        apply_blocking(&mut c, Ingest::Message(msg("I3", 1300))).unwrap();
+        let chats = query_chats(&c).unwrap();
+        assert_eq!(chats[0].unread, 1);
+    }
+
+    #[test]
+    fn out_of_order_send_then_incoming_marks_read() {
+        let mut c = db();
+        // Our reply is stored first; an earlier incoming arrives late (reordering).
+        apply_blocking(&mut c, Ingest::Message(sent("S1", 1200))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(msg("I1", 1000))).unwrap();
+        let chats = query_chats(&c).unwrap();
+        assert_eq!(chats[0].unread, 0, "a later send implies the late incoming was seen");
+
+        // But an incoming after the send is genuinely new.
+        apply_blocking(&mut c, Ingest::Message(msg("I2", 1300))).unwrap();
+        let chats = query_chats(&c).unwrap();
+        assert_eq!(chats[0].unread, 1);
+    }
+
+    #[test]
+    fn incoming_since_returns_only_newer_inbound() {
+        let mut c = db();
+        apply_blocking(&mut c, Ingest::Message(msg("I1", 1000))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(sent("S1", 1100))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(msg("I2", 1200))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(msg("I3", 1300))).unwrap();
+
+        // Only inbound messages strictly after the watermark, oldest-first.
+        let got = incoming_since(&c, 1100).unwrap();
+        assert_eq!(got.len(), 2, "I2 and I3 (not the sent one, not I1)");
+        assert_eq!(got[0].date, 1200);
+        assert_eq!(got[1].date, 1300);
+        assert_eq!(got[0].text.as_deref(), Some("Hello me"));
+        assert!(got.iter().all(|m| m.sender.as_deref() == Some("mailto:asd@icloud.com")));
+    }
+
+    #[test]
+    fn reconcile_clears_stale_unread_before_a_send() {
+        let mut c = db();
+        // Simulate state persisted before the implicit-read logic existed: an
+        // incoming and a later send both stored, but the unread flag still set.
+        apply_blocking(&mut c, Ingest::Message(msg("I1", 1000))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(sent("S1", 1200))).unwrap();
+        c.execute("UPDATE message SET read_sent = 0 WHERE is_from_me = 0", [])
+            .unwrap();
+        let chats = query_chats(&c).unwrap();
+        assert_eq!(chats[0].unread, 1, "forced stale unread");
+
+        reconcile_implicit_reads(&c).unwrap();
+        let chats = query_chats(&c).unwrap();
+        assert_eq!(chats[0].unread, 0, "sweep cleared unread that a later send implies");
     }
 
     #[test]
@@ -419,6 +827,80 @@ mod tests {
     }
 
     #[test]
+    fn first_unread_is_earliest_unacked() {
+        let mut c = db();
+        apply_blocking(&mut c, Ingest::Message(msg("U1", 100))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(msg("U2", 200))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(msg("U3", 300))).unwrap();
+        let chat_id = query_chats(&c).unwrap()[0].id;
+
+        let (guid, date) = first_unread_incoming(&c, chat_id).unwrap().unwrap();
+        assert_eq!((guid.as_str(), date), ("U1", 100), "earliest unread");
+
+        // Ack through the middle; boundary advances to the next unread.
+        mark_read_through(&c, chat_id, 200).unwrap();
+        let (guid, _) = first_unread_incoming(&c, chat_id).unwrap().unwrap();
+        assert_eq!(guid, "U3");
+
+        mark_read_through(&c, chat_id, 300).unwrap();
+        assert!(first_unread_incoming(&c, chat_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn attachments_round_trip() {
+        let mut c = db();
+        let mut m = msg("IMG1", 100);
+        m.text = None;
+        m.attachments = vec![AttachmentRecord {
+            mime: Some("image/jpeg".into()),
+            name: Some("photo.jpg".into()),
+            local_path: Some("/tmp/photo.jpg".into()),
+            part_index: Some(0),
+            ..Default::default()
+        }];
+        apply_blocking(&mut c, Ingest::Message(m.clone())).unwrap();
+        // Fan-out duplicate must not double-insert attachments.
+        apply_blocking(&mut c, Ingest::Message(m)).unwrap();
+
+        let chat_id = query_chats(&c).unwrap()[0].id;
+        let msgs = query_messages(&c, chat_id).unwrap();
+        assert_eq!(msgs.len(), 1, "deduped message");
+        let atts = &msgs[0].attachments;
+        assert_eq!(atts.len(), 1, "single attachment, not duplicated");
+        assert!(atts[0].is_image());
+        assert_eq!(atts[0].local_path.as_deref(), Some("/tmp/photo.jpg"));
+    }
+
+    #[test]
+    fn unread_count_reflects_read_sent() {
+        let mut c = db();
+        apply_blocking(&mut c, Ingest::Message(msg("N1", 100))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(msg("N2", 200))).unwrap();
+        let summary = &query_chats(&c).unwrap()[0];
+        assert_eq!(summary.unread, 2, "two unacked inbound messages");
+
+        mark_read_through(&c, summary.id, 200).unwrap();
+        assert_eq!(query_chats(&c).unwrap()[0].unread, 0, "cleared after read");
+    }
+
+    #[test]
+    fn read_sent_tracking() {
+        let mut c = db();
+        apply_blocking(&mut c, Ingest::Message(msg("U1", 100))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(msg("U2", 200))).unwrap();
+        let cid = query_chats(&c).unwrap()[0].id;
+
+        let unread = latest_unread_incoming(&c, cid).unwrap();
+        assert_eq!(unread.map(|(g, _)| g), Some("U2".to_string()), "newest unread");
+
+        mark_read_through(&c, cid, 200).unwrap();
+        assert!(
+            latest_unread_incoming(&c, cid).unwrap().is_none(),
+            "all acknowledged"
+        );
+    }
+
+    #[test]
     fn tapback_stored_with_association() {
         let mut c = db();
         apply_blocking(&mut c, Ingest::Message(msg("T1", 100))).unwrap();
@@ -443,5 +925,86 @@ mod tests {
         let react = msgs.iter().find(|m| m.guid == "R1").unwrap();
         assert_eq!(react.associated_guid.as_deref(), Some("T1"));
         assert_eq!(react.associated_type, Some(2000));
+    }
+
+    #[test]
+    fn paginates_newest_first_then_scrolls_back() {
+        let mut c = db();
+        // 25 messages with increasing dates.
+        for i in 0..25 {
+            apply_blocking(&mut c, Ingest::Message(msg(&format!("M{i}"), 1000 + i)))
+                .unwrap();
+        }
+        let chats = query_chats(&c).unwrap();
+        let cid = chats[0].id;
+
+        // Newest page of 10, returned ascending.
+        let page1 = query_messages_page(&c, cid, None, 10).unwrap();
+        assert_eq!(page1.len(), 10);
+        assert_eq!(page1.first().unwrap().date, 1015);
+        assert_eq!(page1.last().unwrap().date, 1024, "last is the newest message");
+
+        // Scroll up from the oldest currently shown.
+        let cursor = (page1[0].date, page1[0].id);
+        let page2 = query_messages_page(&c, cid, Some(cursor), 10).unwrap();
+        assert_eq!(page2.len(), 10);
+        assert_eq!(page2.last().unwrap().date, 1014, "ends just before the cursor");
+        assert_eq!(page2.first().unwrap().date, 1005);
+
+        // Final partial page.
+        let cursor = (page2[0].date, page2[0].id);
+        let page3 = query_messages_page(&c, cid, Some(cursor), 10).unwrap();
+        assert_eq!(page3.len(), 5, "only 5 older messages remain");
+        assert_eq!(page3.first().unwrap().date, 1000);
+
+        // Exhausted.
+        let cursor = (page3[0].date, page3[0].id);
+        let page4 = query_messages_page(&c, cid, Some(cursor), 10).unwrap();
+        assert!(page4.is_empty());
+    }
+
+    #[test]
+    fn messages_from_reloads_window_and_new_arrivals() {
+        let mut c = db();
+        for i in 0..10 {
+            apply_blocking(&mut c, Ingest::Message(msg(&format!("W{i}"), 2000 + i)))
+                .unwrap();
+        }
+        let chats = query_chats(&c).unwrap();
+        let cid = chats[0].id;
+        // Simulate having scrolled so the oldest shown is the 5th message.
+        let all = query_messages(&c, cid).unwrap();
+        let cursor = (all[4].date, all[4].id);
+        let window = query_messages_from(&c, cid, Some(cursor)).unwrap();
+        assert_eq!(window.len(), 6, "messages 5..10 inclusive of the cursor");
+        assert_eq!(window.first().unwrap().date, 2004);
+
+        // A new message arrives; the same cursor still yields the window + it.
+        apply_blocking(&mut c, Ingest::Message(msg("W-new", 2100))).unwrap();
+        let window2 = query_messages_from(&c, cid, Some(cursor)).unwrap();
+        assert_eq!(window2.len(), 7);
+        assert_eq!(window2.last().unwrap().guid, "W-new");
+    }
+
+    #[test]
+    fn page_carries_attachments() {
+        let mut c = db();
+        let mut m = msg("A1", 500);
+        m.text = None;
+        m.attachments = vec![AttachmentRecord {
+            guid: Some("att-1".into()),
+            mime: Some("image/jpeg".into()),
+            name: Some("cat.jpg".into()),
+            total_bytes: Some(1234),
+            local_path: Some("/tmp/cat.jpg".into()),
+            part_index: Some(0),
+            is_sticker: false,
+        }];
+        apply_blocking(&mut c, Ingest::Message(m)).unwrap();
+        let chats = query_chats(&c).unwrap();
+        let page = query_messages_page(&c, chats[0].id, None, 10).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].attachments.len(), 1);
+        assert_eq!(page[0].attachments[0].name.as_deref(), Some("cat.jpg"));
     }
 }

@@ -32,3 +32,14 @@ where
         }
     });
 }
+
+/// Drain `rx` on the GTK main thread, invoking `on_each` for every item until
+/// the channel closes. The streaming counterpart to [`spawn`]: a tokio-side
+/// producer pushes items into `rx` and the UI reacts to each on the main thread.
+pub fn forward<T: 'static>(rx: async_channel::Receiver<T>, mut on_each: impl FnMut(T) + 'static) {
+    glib::spawn_future_local(async move {
+        while let Ok(item) = rx.recv().await {
+            on_each(item);
+        }
+    });
+}

@@ -1,0 +1,57 @@
+# Flatpak manifest for OpenBubbles GTK.
+#
+# This is set up for LOCAL builds (flatpak-builder --user), not Flathub: the
+# build step is allowed network access so it can clone rustpush, pull its
+# submodules, seed the FairPlay certs, and fetch crates. Flathub requires fully
+# offline/sandboxed builds (declared sources + vendored cargo), which is a
+# later step — see flatpak/README.md.
+app-id: app.openbubbles.Gtk.Devel
+
+# Match these to what you actually have installed:
+#   flatpak list --runtime | grep -E 'gnome|rust-stable'
+# GNOME 50 -> freedesktop base 25.08 -> rust-stable//25.08
+# (the extension branch tracks the freedesktop base, not the GNOME number).
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+
+command: openbubbles-gtk
+
+finish-args:
+  - --share=network        # Apple IDS/APNs + your self-hosted relay sidecar (LAN)
+  - --share=ipc            # X11 shm (paired with fallback-x11)
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri           # GTK4 GL rendering
+  - --talk-name=org.freedesktop.Notifications   # desktop notifications
+  # messages.db + rustpush credentials live under the per-app data dir
+  # (XDG_DATA_HOME -> ~/.var/app/app.openbubbles.Gtk.Devel/data/openbubbles-gtk),
+  # which Flatpak sandboxes automatically. No host --filesystem grant needed
+  # unless you later want to save attachments outside the sandbox.
+
+build-options:
+  build-args:
+    - --share=network      # LOCAL ONLY: lets the build clone/fetch
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_NET_GIT_FETCH_WITH_CLI: '1'
+
+modules:
+  - name: openbubbles-gtk
+    buildsystem: simple
+    build-commands:
+      - bash flatpak/build.sh
+    sources:
+      # Build straight from the working tree. Switch to a git source once you
+      # want reproducible builds.
+      - type: dir
+        path: .
+        skip:
+          - third_party     # build.sh clones rustpush fresh inside the sandbox
+          - target
+          - .cargo-home
+          - .flatpak-builder
+          - build-dir
+          - .git

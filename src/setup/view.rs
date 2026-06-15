@@ -15,6 +15,7 @@ use adw::prelude::*;
 use crate::gtk_bridge;
 use crate::protocol::{Backend, LoginState};
 use crate::setup::{flow, SetupState};
+use crate::store::Store;
 
 // Relay host + token, overridable at runtime so the client can point at a
 // self-hosted validation sidecar without recompiling:
@@ -45,13 +46,18 @@ type Shared = Rc<RefCell<SetupState>>;
 
 /// Build the onboarding window. Hand it the stub today, the real rustpush
 /// backend later — nothing else changes.
-pub fn build_window(app: &adw::Application, backend: Arc<dyn Backend>) -> adw::ApplicationWindow {
+pub fn build_window(
+    app: &adw::Application,
+    backend: Arc<dyn Backend>,
+    store: Store,
+) -> adw::ApplicationWindow {
     let state: Shared = Rc::new(RefCell::new(SetupState::default()));
+    state.borrow_mut().store = Some(store);
     let nav = adw::NavigationView::new();
 
     // Phase A2: try to restore a saved session before showing onboarding. While
     // the async restore runs we show a placeholder; on completion we replace the
-    // stack with either the finalize (restored) page or the hardware page.
+    // stack with either the messaging UI (restored) or the hardware page.
     nav.push(&restoring_page());
 
     let fut = flow::restore(backend.clone());
@@ -68,8 +74,7 @@ pub fn build_window(app: &adw::Application, backend: Arc<dyn Backend>) -> adw::A
                 s.client = Some(restored.client);
                 s.handles = restored.handles.clone();
             }
-            start_receiving(&backend_cb, &state_cb);
-            nav_cb.replace(&[finalize_page(&restored.handles)]);
+            go_messaging(&nav_cb, &state_cb, &backend_cb);
         }
         Ok(None) => {
             nav_cb.replace(&[hardware_page(&nav_cb, &state_cb, &backend_cb)]);
@@ -82,11 +87,25 @@ pub fn build_window(app: &adw::Application, backend: Arc<dyn Backend>) -> adw::A
 
     adw::ApplicationWindow::builder()
         .application(app)
-        .title("OpenBubbles — Setup")
+        .title("OpenBubbles")
         .default_width(460)
         .default_height(560)
         .content(&nav)
         .build()
+}
+
+/// Hand off to the messaging UI, pulling the live session out of `state`.
+fn go_messaging(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Backend>) {
+    let (store, connection, client, handles) = {
+        let s = state.borrow();
+        (
+            s.store.clone().expect("store set at startup"),
+            s.connection.clone().expect("connection set"),
+            s.client.clone().expect("client set"),
+            s.handles.clone(),
+        )
+    };
+    crate::ui::enter_messaging(nav, backend, store, connection, client, handles);
 }
 
 /// Brief placeholder shown while [`flow::restore`] checks for a saved session.
@@ -547,8 +566,7 @@ fn do_register(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Back
         Ok(Ok(registered)) => {
             state.borrow_mut().handles = registered.handles.clone();
             state.borrow_mut().client = Some(registered.client);
-            start_receiving(&backend, &state);
-            nav.push(&finalize_page(&registered.handles));
+            go_messaging(&nav, &state, &backend);
         }
         Ok(Err(alert)) => {
             errors.set_text(&format!("{}: {}", alert.title, alert.body));
@@ -556,35 +574,4 @@ fn do_register(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Back
         }
         Err(e) => show_error(&errors, &e),
     });
-}
-
-/// Spike: start the background receive-logging loop from whatever live
-/// connection + client are currently in `state`. No-op if either is missing.
-fn start_receiving(backend: &Arc<dyn Backend>, state: &Shared) {
-    let (conn, client) = {
-        let s = state.borrow();
-        (s.connection.clone(), s.client.clone())
-    };
-    if let (Some(conn), Some(client)) = (conn, client) {
-        backend.start_receive_log(&conn, &client);
-    }
-}
-
-fn finalize_page(handles: &[String]) -> adw::NavigationPage {
-    let content = column();
-
-    let done = gtk::Label::builder()
-        .label("You're set up. Registered handles:")
-        .wrap(true)
-        .xalign(0.0)
-        .build();
-    content.append(&done);
-
-    let group = adw::PreferencesGroup::new();
-    for h in handles {
-        group.add(&adw::ActionRow::builder().title(h).build());
-    }
-    content.append(&group);
-
-    nav_page("Done", &content)
 }

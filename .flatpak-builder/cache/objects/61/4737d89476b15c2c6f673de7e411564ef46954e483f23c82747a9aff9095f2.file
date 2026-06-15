@@ -1,0 +1,4 @@
+[Application]
+name=app.openbubbles.Gtk.Devel
+runtime=org.gnome.Platform/x86_64/50
+sdk=org.gnome.Sdk/x86_64/50

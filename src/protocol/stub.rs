@@ -144,7 +144,78 @@ impl Backend for StubBackend {
         Ok(None)
     }
 
-    fn start_receive_log(&self, _connection: &Connection, _client: &ImClient) {
+    fn start_receiving(
+        &self,
+        _connection: &Connection,
+        _client: &ImClient,
+        _handles: Vec<String>,
+        _store: crate::store::Store,
+        _notify: async_channel::Sender<()>,
+    ) {
         // No live connection in the stub; nothing to receive.
     }
+
+    async fn send_text(
+        &self,
+        _client: &ImClient,
+        chat: &crate::store::ChatRef,
+        my_handle: &str,
+        text: String,
+        guid: String,
+    ) -> Result<crate::store::IncomingMessage> {
+        Ok(crate::store::IncomingMessage {
+            guid,
+            chat: chat.clone(),
+            sender: Some(my_handle.to_string()),
+            is_from_me: true,
+            text: Some(text),
+            date: 0,
+            ..Default::default()
+        })
+    }
+    async fn send_attachment(
+        &self,
+        _client: &ImClient,
+        _connection: &Connection,
+        chat: &crate::store::ChatRef,
+        my_handle: &str,
+        path: String,
+        mime: String,
+        name: String,
+        guid: String,
+    ) -> Result<crate::store::IncomingMessage> {
+        Ok(crate::store::IncomingMessage {
+            guid,
+            chat: chat.clone(),
+            sender: Some(my_handle.to_string()),
+            is_from_me: true,
+            date: 0,
+            attachments: vec![crate::store::AttachmentRecord {
+                mime: Some(mime),
+                name: Some(name),
+                local_path: Some(path),
+                part_index: Some(0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    }
+
+    fn send_receipt(
+        &self,
+        _client: &ImClient,
+        _chat: &crate::store::ChatRef,
+        _my_handle: &str,
+        _read: bool,
+        _target_guid: String,
+    ) {
+    }
+}
+
+#[allow(dead_code)]
+fn stub_nonce() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }

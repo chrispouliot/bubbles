@@ -28,13 +28,14 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, Mutex};
 
 use rustpush::{
-    APSConnection, APSMessage, AppleAccount, ArcAnisetteClient, CircleClientSession,
-    DebugMutex, DefaultAnisetteProvider, IDSNGMIdentity, IDSUser, IMClient, IdmsAuthListener,
-    LoginState as RpLoginState, Message, MessageInst, MessageType, Reaction, ReactMessageType,
-    VerifyBody as RpVerifyBody,
+    APSConnection, APSMessage, AppleAccount, ArcAnisetteClient, Attachment,
+    CircleClientSession, ConversationData, DebugMutex, DefaultAnisetteProvider, IDSNGMIdentity,
+    IDSUser, IMClient, IdmsAuthListener, IndexedMessagePart, LoginState as RpLoginState, MMCSFile,
+    Message, MessageInst, MessagePart, MessageParts, MessageType, NormalMessage, Reaction,
+    ReactMessageType, VerifyBody as RpVerifyBody,
 };
 
-use crate::store::{ChatRef, IncomingMessage, Ingest, Receipt, Tapback};
+use crate::store::{AttachmentRecord, ChatRef, IncomingMessage, Ingest, Receipt, Store, Tapback};
 
 use crate::api;
 use crate::protocol::*;
@@ -393,7 +394,14 @@ impl Backend for RustpushBackend {
         }))
     }
 
-    fn start_receive_log(&self, connection: &Connection, c: &ImClient) {
+    fn start_receiving(
+        &self,
+        connection: &Connection,
+        c: &ImClient,
+        handles: Vec<String>,
+        store: Store,
+        notify: async_channel::Sender<()>,
+    ) {
         let conn = conn(connection).conn.clone();
         let imclient = client(c).clone();
         crate::runtime::runtime().spawn(async move {
@@ -402,7 +410,23 @@ impl Backend for RustpushBackend {
             loop {
                 match rx.recv().await {
                     Ok(msg) => match imclient.handle(msg).await {
-                        Ok(Some(inst)) => log_inst(&inst),
+                        Ok(Some(inst)) => {
+                            log_inst(&inst);
+                            let mut ingest = ingest_from(&inst, &handles);
+                            // Download any attachments and attach them to the record.
+                            if let Ingest::Message(im) = &mut ingest {
+                                im.attachments = download_inbound(&inst, &conn, &im.guid).await;
+                            }
+                            if let Err(e) = store.apply(ingest).await {
+                                log::warn!("store apply error: {e:#}");
+                            }
+                            // Acknowledge inbound content with a Delivered receipt.
+                            if SEND_DELIVERED_RECEIPTS && is_incoming_content(&inst, &handles) {
+                                send_receipt_for(&imclient, &inst, &handles, false).await;
+                            }
+                            // Pulse the UI; drop if no receiver is listening.
+                            let _ = notify.send(()).await;
+                        }
                         Ok(None) => {}
                         Err(e) => log::warn!("handle error: {e:?}"),
                     },
@@ -414,6 +438,126 @@ impl Backend for RustpushBackend {
                         break;
                     }
                 }
+            }
+        });
+    }
+
+    async fn send_text(
+        &self,
+        c: &ImClient,
+        chat: &ChatRef,
+        my_handle: &str,
+        text: String,
+        guid: String,
+    ) -> Result<IncomingMessage> {
+        let imclient = client(c).clone();
+        let conversation = conversation_from(chat);
+        let normal = NormalMessage::new(text.clone(), MessageType::IMessage);
+        let mut inst = MessageInst::new(conversation, my_handle, Message::Message(normal));
+        inst.id = guid.clone();
+        let date = now_ms();
+        imclient
+            .send(&mut inst)
+            .await
+            .map_err(|e| anyhow::anyhow!("send failed: {e:?}"))?;
+        Ok(IncomingMessage {
+            guid,
+            chat: chat.clone(),
+            sender: Some(my_handle.to_string()),
+            is_from_me: true,
+            text: Some(text),
+            service: Some("iMessage".into()),
+            date,
+            ..Default::default()
+        })
+    }
+
+    async fn send_attachment(
+        &self,
+        c: &ImClient,
+        connection: &Connection,
+        chat: &ChatRef,
+        my_handle: &str,
+        path: String,
+        mime: String,
+        name: String,
+        guid: String,
+    ) -> Result<IncomingMessage> {
+        use std::io::Seek;
+
+        let imclient = client(c).clone();
+        let aps = conn(connection).conn.clone();
+        let conversation = conversation_from(chat);
+        let uti = mime_to_uti(&mime);
+
+        // Upload to MMCS (the file is read twice: once to prepare, once to send).
+        let mut file = std::fs::File::open(&path)
+            .map_err(|e| anyhow::anyhow!("open {path}: {e}"))?;
+        let total = file.metadata().map(|m| m.len() as i64).ok();
+        let prepared = MMCSFile::prepare_put(&mut file)
+            .await
+            .map_err(|e| anyhow::anyhow!("prepare attachment: {e:?}"))?;
+        file.rewind().map_err(|e| anyhow::anyhow!("rewind: {e}"))?;
+        let attachment =
+            Attachment::new_mmcs(&aps, &prepared, file, &mime, &uti, &name, |_, _| {})
+                .await
+                .map_err(|e| anyhow::anyhow!("upload attachment: {e:?}"))?;
+
+        let mut normal = NormalMessage::new(String::new(), MessageType::IMessage);
+        normal.parts = MessageParts(vec![IndexedMessagePart {
+            part: MessagePart::Attachment(attachment),
+            idx: None,
+            ext: None,
+        }]);
+        let mut inst = MessageInst::new(conversation, my_handle, Message::Message(normal));
+        inst.id = guid.clone();
+        let date = now_ms();
+        imclient
+            .send(&mut inst)
+            .await
+            .map_err(|e| anyhow::anyhow!("send failed: {e:?}"))?;
+
+        // Cache a local copy so the UI can render the sent image right away.
+        let local_path = cache_copy(&path, &guid, 0, &name).map(|p| p.to_string_lossy().into_owned());
+
+        Ok(IncomingMessage {
+            guid,
+            chat: chat.clone(),
+            sender: Some(my_handle.to_string()),
+            is_from_me: true,
+            service: Some("iMessage".into()),
+            date,
+            attachments: vec![AttachmentRecord {
+                mime: Some(mime),
+                name: Some(name),
+                total_bytes: total,
+                local_path,
+                part_index: Some(0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    }
+
+    fn send_receipt(
+        &self,
+        c: &ImClient,
+        chat: &ChatRef,
+        my_handle: &str,
+        read: bool,
+        target_guid: String,
+    ) {
+        let imclient = client(c).clone();
+        let conversation = conversation_from(chat);
+        let my_handle = my_handle.to_string();
+        crate::runtime::runtime().spawn(async move {
+            let msg = if read { Message::Read } else { Message::Delivered };
+            let mut inst = MessageInst::new(conversation, &my_handle, msg);
+            inst.id = target_guid;
+            let kind = if read { "read" } else { "delivered" };
+            match imclient.send(&mut inst).await {
+                Ok(_) => log::info!("→ sent {kind} receipt for {}", inst.id),
+                Err(e) => log::warn!("{kind} receipt error: {e:?}"),
             }
         });
     }
@@ -516,6 +660,7 @@ pub fn ingest_from(inst: &MessageInst, my_handles: &[String]) -> Ingest {
                 reply_to_guid: n.reply_guid.clone(),
                 reply_part: n.reply_part.clone(),
                 item_type: 0,
+                attachments: Vec::new(),
             })
         }
         Message::React(r) => match tapback_type(&r.reaction) {
@@ -535,6 +680,120 @@ pub fn ingest_from(inst: &MessageInst, my_handles: &[String]) -> Ingest {
         Message::Delivered => Ingest::Receipt(Receipt::Delivered { guid, date }),
         other => Ingest::Ignored(variant_name(other)),
     }
+}
+
+/// Where downloaded/sent attachment files live (mirrors `glib::user_data_dir`).
+fn attachments_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default()
+                .join(".local/share")
+        });
+    base.join("openbubbles-gtk").join("attachments")
+}
+
+fn ext_for(mime: &str, name: &str) -> String {
+    if let Some(dot) = name.rfind('.') {
+        if dot + 1 < name.len() {
+            return name[dot..].to_string();
+        }
+    }
+    match mime {
+        "image/jpeg" => ".jpg",
+        "image/png" => ".png",
+        "image/gif" => ".gif",
+        "image/heic" | "image/heif" => ".heic",
+        "image/webp" => ".webp",
+        "video/mp4" | "video/quicktime" => ".mp4",
+        "application/pdf" => ".pdf",
+        _ => ".bin",
+    }
+    .to_string()
+}
+
+fn mime_to_uti(mime: &str) -> String {
+    match mime {
+        "image/jpeg" => "public.jpeg",
+        "image/png" => "public.png",
+        "image/gif" => "com.compuserve.gif",
+        "image/heic" | "image/heif" => "public.heic",
+        "image/webp" => "org.webmproject.webp",
+        "video/mp4" => "public.mpeg-4",
+        "video/quicktime" => "com.apple.quicktime-movie",
+        "application/pdf" => "com.adobe.pdf",
+        _ => "public.data",
+    }
+    .to_string()
+}
+
+/// Copy an outbound file into the attachment cache so the UI can render it from
+/// a stable path immediately after sending.
+fn cache_copy(src: &str, guid: &str, part: i64, name: &str) -> Option<std::path::PathBuf> {
+    let dir = attachments_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let dest = dir.join(format!("{guid}_{part}{}", ext_for("", name)));
+    std::fs::copy(src, &dest).ok()?;
+    Some(dest)
+}
+
+/// Download every attachment on an inbound message into the cache, returning the
+/// records to persist. Failures are logged and skipped, not fatal.
+async fn download_inbound(
+    inst: &MessageInst,
+    conn: &APSConnection,
+    guid: &str,
+) -> Vec<AttachmentRecord> {
+    use std::io::Write;
+    let Message::Message(n) = &inst.message else {
+        return Vec::new();
+    };
+    if !n.parts.has_attachments() {
+        return Vec::new();
+    }
+    let dir = attachments_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log::warn!("attachment dir: {e}");
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for (i, p) in n.parts.0.iter().enumerate() {
+        let MessagePart::Attachment(att) = &p.part else {
+            continue;
+        };
+        let part_index = p.idx.unwrap_or(i) as i64;
+        let path = dir.join(format!("{guid}_{part_index}{}", ext_for(&att.mime, &att.name)));
+        let mut file = match std::fs::File::create(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("create {}: {e}", path.display());
+                continue;
+            }
+        };
+        match att.get_attachment(conn, &mut file, |_, _| {}).await {
+            Ok(()) => {
+                let _ = file.flush();
+                log::info!("↓ saved attachment {} ({})", att.name, att.mime);
+                out.push(AttachmentRecord {
+                    guid: None,
+                    mime: Some(att.mime.clone()),
+                    name: Some(att.name.clone()),
+                    total_bytes: Some(att.get_size() as i64),
+                    local_path: Some(path.to_string_lossy().into_owned()),
+                    part_index: Some(part_index),
+                    is_sticker: false,
+                });
+            }
+            Err(e) => {
+                log::warn!("download attachment {}: {e:?}", att.name);
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    out
 }
 
 fn service_str(t: &MessageType) -> String {
@@ -560,4 +819,66 @@ fn tapback_type(t: &ReactMessageType) -> Option<i64> {
         _ => return None,
     };
     Some(if *enable { 2000 + idx } else { 3000 + idx })
+}
+
+/// Phase D default: acknowledge inbound messages with Delivered receipts.
+/// Becomes a user setting once a settings module exists.
+const SEND_DELIVERED_RECEIPTS: bool = true;
+
+fn conversation_from(chat: &ChatRef) -> ConversationData {
+    ConversationData {
+        participants: chat.participants.clone(),
+        cv_name: chat.display_name.clone(),
+        sender_guid: None,
+        after_guid: None,
+    }
+}
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn is_from_me(inst: &MessageInst, handles: &[String]) -> bool {
+    inst.sender
+        .as_deref()
+        .map(|s| handles.iter().any(|h| h.eq_ignore_ascii_case(s)))
+        .unwrap_or(false)
+}
+
+fn is_incoming_content(inst: &MessageInst, handles: &[String]) -> bool {
+    matches!(inst.message, Message::Message(_)) && !is_from_me(inst, handles)
+}
+
+/// Send a Delivered (`read=false`) or Read (`read=true`) receipt for `inst`,
+/// addressed from whichever of our `handles` is in the conversation.
+async fn send_receipt_for(
+    imclient: &Arc<IMClient>,
+    inst: &MessageInst,
+    handles: &[String],
+    read: bool,
+) {
+    let Some(conversation) = inst.conversation.clone() else {
+        return;
+    };
+    let my_handle = conversation
+        .participants
+        .iter()
+        .find(|p| handles.iter().any(|h| h.eq_ignore_ascii_case(p)))
+        .cloned()
+        .or_else(|| handles.first().cloned());
+    let Some(my_handle) = my_handle else {
+        return;
+    };
+    let msg = if read { Message::Read } else { Message::Delivered };
+    let mut receipt = MessageInst::new(conversation, &my_handle, msg);
+    receipt.id = inst.id.clone();
+    let kind = if read { "read" } else { "delivered" };
+    match imclient.send(&mut receipt).await {
+        Ok(_) => log::info!("→ sent {kind} receipt for {}", receipt.id),
+        Err(e) => log::warn!("{kind} receipt error: {e:?}"),
+    }
 }

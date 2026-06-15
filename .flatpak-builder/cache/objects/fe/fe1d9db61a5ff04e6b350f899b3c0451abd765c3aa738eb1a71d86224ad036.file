@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>app.openbubbles.Gtk.Devel</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>SSPL-1.0</project_license>
+  <name>OpenBubbles</name>
+  <summary>Native GTK4 iMessage client</summary>
+  <description>
+    <p>
+      A native GTK4/libadwaita client for OpenBubbles, talking iMessage over the
+      rustpush backend. Supports a self-hosted validation relay sidecar.
+    </p>
+  </description>
+  <launchable type="desktop-id">app.openbubbles.Gtk.Devel.desktop</launchable>
+  <provides>
+    <binary>openbubbles-gtk</binary>
+  </provides>
+  <categories>
+    <category>Network</category>
+    <category>InstantMessaging</category>
+  </categories>
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+  </content_rating>
+  <releases>
+    <release version="0.1.0" date="2026-06-14"/>
+  </releases>
+</component>

@@ -52,6 +52,20 @@ pub struct IncomingMessage {
     pub reply_part: Option<String>,
     /// 0 = normal text; non-zero reserved for rename/participant-change/etc.
     pub item_type: i64,
+    /// Files attached to this message (already downloaded to `local_path`).
+    pub attachments: Vec<AttachmentRecord>,
+}
+
+/// An attachment as ingested: metadata plus a local file we've already saved.
+#[derive(Clone, Debug, Default)]
+pub struct AttachmentRecord {
+    pub guid: Option<String>,
+    pub mime: Option<String>,
+    pub name: Option<String>,
+    pub total_bytes: Option<i64>,
+    pub local_path: Option<String>,
+    pub part_index: Option<i64>,
+    pub is_sticker: bool,
 }
 
 /// A delivery/read receipt updating an existing message (referenced by its guid).
@@ -98,6 +112,17 @@ pub struct ChatSummary {
     pub service: Option<String>,
     pub last_message_date: Option<i64>,
     pub participants: Vec<String>,
+    pub unread: i64,
+}
+
+/// A freshly-arrived inbound message, used to drive desktop notifications.
+#[derive(Clone, Debug)]
+pub struct NewMessage {
+    pub chat_id: i64,
+    pub sender: Option<String>,
+    pub text: Option<String>,
+    pub has_attachment: bool,
+    pub date: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -119,4 +144,22 @@ pub struct StoredMessage {
     pub associated_guid: Option<String>,
     pub associated_type: Option<i64>,
     pub item_type: i64,
+    pub attachments: Vec<StoredAttachment>,
+}
+
+/// An attachment as read back for display.
+#[derive(Clone, Debug)]
+pub struct StoredAttachment {
+    pub mime: Option<String>,
+    pub name: Option<String>,
+    pub local_path: Option<String>,
+    pub is_sticker: bool,
+}
+
+impl StoredAttachment {
+    pub fn is_image(&self) -> bool {
+        self.mime
+            .as_deref()
+            .map_or(false, |m| m.starts_with("image/"))
+    }
 }
