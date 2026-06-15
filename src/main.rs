@@ -3,6 +3,7 @@ mod protocol;
 mod runtime;
 mod setup;
 mod store;
+mod tray;
 mod ui;
 
 mod demo;
@@ -26,6 +27,11 @@ use protocol::Backend;
 const APP_ID: &str = "app.openbubbles.Gtk.Devel";
 
 fn main() -> glib::ExitCode {
+    // rustls 0.23 won't auto-pick a crypto provider when more than one is linked.
+    // reqwest's rustls-tls pulls aws-lc-rs; our IMD fetch (ureq) pulls ring. Select
+    // one explicitly before any TLS happens (session restore, Apple calls, IMD fetch).
+    
+    let _ = rustls::crypto::ring::default_provider().install_default();
     // NAC self-test: set NAC_SELFTEST=<path-to-base64-blob> (plus OPEN_ABSINTHE_IMD)
     // to generate validation data once from the command line and exit, skipping the
     // GUI and any Apple ID login. Lets you verify the emulator / a hardware identity.
@@ -46,6 +52,7 @@ fn main() -> glib::ExitCode {
             setup::view::build_window(app, make_backend(), make_store())
         };
         window.present();
+        tray::install(app, &window);
     });
 
     app.run()

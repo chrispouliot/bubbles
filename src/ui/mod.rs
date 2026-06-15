@@ -1478,6 +1478,7 @@ impl Ui {
         n.set_default_action_and_target_value("app.open-chat", Some(&chat_id.to_variant()));
         app.send_notification(Some(&format!("chat-{chat_id}")), &n);
         self.notified_chats.borrow_mut().insert(chat_id);
+        crate::tray::set_unread(true);
     }
 
     fn withdraw_chat_notification(&self, chat_id: i64) {
@@ -1485,6 +1486,7 @@ impl Ui {
             app.withdraw_notification(&format!("chat-{chat_id}"));
         }
         self.notified_chats.borrow_mut().remove(&chat_id);
+        crate::tray::set_unread(!self.notified_chats.borrow().is_empty());
     }
 
     /// Open the chat a clicked notification targets, raising the window first.
