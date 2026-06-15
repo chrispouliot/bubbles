@@ -14,7 +14,7 @@ use std::sync::{Arc, Once};
 use adw::prelude::*;
 
 use crate::gtk_bridge;
-use crate::protocol::{Backend, Connection, ImClient};
+use crate::protocol::{Backend, Connection, ImClient, RecvEvent};
 use crate::store::{
     AttachmentRecord, ChatRef, ChatSummary, IncomingMessage, Ingest, Store, StoredAttachment,
     StoredMessage,
@@ -76,6 +76,38 @@ const CSS: &str = "
   padding: 4px 14px;
   font-size: 0.9em;
 }
+.typing-dot {
+  min-width: 7px;
+  min-height: 7px;
+  border-radius: 99px;
+  background-color: #7c7c80;
+  animation: typing-pulse 1.3s infinite ease-in-out;
+}
+.typing-dot-2 {
+  animation-delay: 0.18s;
+}
+.typing-dot-3 {
+  animation-delay: 0.36s;
+}
+@keyframes typing-pulse {
+  0%, 65%, 100% {
+    opacity: 0.3;
+  }
+  32% {
+    opacity: 0.95;
+  }
+}
+@keyframes bubble-appear {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.bubble-appear {
+  animation: bubble-appear 0.2s ease-out;
+}
 ";
 
 /// Cheap-to-clone bundle the UI closures share.
@@ -85,6 +117,7 @@ struct Ui {
     backend: Arc<dyn Backend>,
     split: adw::NavigationSplitView,
     content_page: adw::NavigationPage,
+    rename_button: gtk::Button,
     chat_list: gtk::ListBox,
     chats: Rc<RefCell<Vec<ChatSummary>>>,
     msg_container: gtk::Box,
@@ -106,6 +139,21 @@ struct Ui {
     unread_marker: Rc<RefCell<Option<gtk::Widget>>>,
     unread_dismiss_gen: Rc<Cell<u64>>,
     unread_pill: gtk::Button,
+    // Compose entry, and outbound-typing bookkeeping: whether we currently have
+    // a typing=true outstanding, and a generation guard for the idle-stop timer.
+    entry: gtk::Entry,
+    typing_sent: Rc<Cell<bool>>,
+    typing_idle_gen: Rc<Cell<u64>>,
+    // Inbound typing indicator lives as the trailing item in the timeline. We
+    // track whether it's active (so it can be re-added after a rebuild clears the
+    // container) and hold a handle to the live row (so it can be removed without
+    // a rebuild). `typing_gen` guards the auto-expire timer.
+    typing_active: Rc<Cell<bool>>,
+    typing_row: Rc<RefCell<Option<gtk::Widget>>>,
+    typing_gen: Rc<Cell<u64>>,
+    // Set when a message supersedes the typing indicator, so the next rebuild
+    // fades the new bubble in (in place of the dots) instead of popping it.
+    morph_pending: Rc<Cell<bool>>,
     // Whether the window currently has focus. Messages that arrive while it
     // doesn't are held as unread until the user comes back.
     focused: Rc<Cell<bool>>,
@@ -148,7 +196,21 @@ pub fn enter_messaging(
     chat_list.add_css_class("navigation-sidebar");
     chat_list.set_selection_mode(gtk::SelectionMode::Single);
     chat_list.set_activate_on_single_click(true);
-    let sidebar = page("Messages", &scrolled(&chat_list), None);
+    // Hamburger menu at the end of the sidebar header.
+    let main_menu = gtk::gio::Menu::new();
+    main_menu.append(Some("Preferences"), Some("menu.preferences"));
+    main_menu.append(Some("About"), Some("menu.about"));
+    let menu_button = gtk::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .tooltip_text("Main Menu")
+        .menu_model(&main_menu)
+        .build();
+    let sidebar = page(
+        "Messages",
+        &scrolled(&chat_list),
+        None,
+        Some(menu_button.upcast_ref()),
+    );
 
     // --- content (persistent timeline + compose) ---
     let msg_container = gtk::Box::builder()
@@ -203,7 +265,18 @@ pub fn enter_messaging(
     compose.append(&entry);
     compose.append(&send);
 
-    let content_page = page("Select a chat", &msg_overlay, Some(compose.upcast_ref()));
+    // Rename action in the chat header; only meaningful with a chat open, so it
+    // starts insensitive and open_chat enables it.
+    let rename_button = gtk::Button::from_icon_name("document-edit-symbolic");
+    rename_button.set_tooltip_text(Some("Rename conversation"));
+    rename_button.set_sensitive(false);
+
+    let content_page = page(
+        "Select a chat",
+        &msg_overlay,
+        Some(compose.upcast_ref()),
+        Some(rename_button.upcast_ref()),
+    );
 
     // --- split view ---
     let split = adw::NavigationSplitView::new();
@@ -215,6 +288,7 @@ pub fn enter_messaging(
         backend: backend.clone(),
         split: split.clone(),
         content_page: content_page.clone(),
+        rename_button: rename_button.clone(),
         chat_list: chat_list.clone(),
         chats: Rc::new(RefCell::new(Vec::new())),
         msg_container: msg_container.clone(),
@@ -231,6 +305,13 @@ pub fn enter_messaging(
         unread_marker: Rc::new(RefCell::new(None)),
         unread_dismiss_gen: Rc::new(Cell::new(0)),
         unread_pill: unread_pill.clone(),
+        entry: entry.clone(),
+        typing_sent: Rc::new(Cell::new(false)),
+        typing_idle_gen: Rc::new(Cell::new(0)),
+        typing_active: Rc::new(Cell::new(false)),
+        typing_row: Rc::new(RefCell::new(None)),
+        typing_gen: Rc::new(Cell::new(0)),
+        morph_pending: Rc::new(Cell::new(false)),
         focused: Rc::new(Cell::new(true)),
         settling: Rc::new(Cell::new(false)),
         settle_gen: Rc::new(Cell::new(0)),
@@ -256,6 +337,30 @@ pub fn enter_messaging(
                 ui.open_chat(&chat);
             }
         });
+    }
+
+    // Rename the open conversation.
+    {
+        let ui = ui.clone();
+        rename_button.connect_clicked(move |_| ui.prompt_rename());
+    }
+
+    // Sidebar hamburger menu actions ("menu" group, resolved via the split).
+    {
+        let actions = gtk::gio::SimpleActionGroup::new();
+        let preferences = gtk::gio::SimpleAction::new("preferences", None);
+        preferences.connect_activate({
+            let ui = ui.clone();
+            move |_, _| ui.show_preferences()
+        });
+        actions.add_action(&preferences);
+        let about = gtk::gio::SimpleAction::new("about", None);
+        about.connect_activate({
+            let ui = ui.clone();
+            move |_, _| ui.show_about()
+        });
+        actions.add_action(&about);
+        split.insert_action_group("menu", Some(&actions));
     }
 
     // Load the previous page when the user scrolls near the top (ignoring the
@@ -291,6 +396,11 @@ pub fn enter_messaging(
         let ui = ui.clone();
         let entry2 = entry.clone();
         entry.connect_activate(move |_| ui.compose_send(&entry2));
+    }
+    // Drive the outbound typing indicator from edits to the compose entry.
+    {
+        let ui = ui.clone();
+        entry.connect_changed(move |e| ui.note_typing_activity(!e.text().trim().is_empty()));
     }
 
     // Attach: open the system file picker, then upload + send the chosen file.
@@ -354,7 +464,27 @@ pub fn enter_messaging(
     // overlay so we can layer an enlarged-image lightbox over everything.
     let overlay = gtk::Overlay::new();
     overlay.set_widget_name("lightbox-host");
-    overlay.set_child(Some(&split));
+
+    // Adaptive layout. Below the breakpoint the split collapses into a single
+    // pane: the sidebar is the visible page, activating a chat pushes the chat
+    // view over it, and the content header bar gets an automatic back button —
+    // the phone-style flow. Above it, the side-by-side split returns. We drive
+    // this from a BreakpointBin (rather than the window) so it works under both
+    // the real and demo windows without either needing to know about it.
+    let bp_bin = adw::BreakpointBin::builder()
+        .width_request(360)
+        .height_request(294)
+        .child(&split)
+        .build();
+    let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        500.0,
+        adw::LengthUnit::Sp,
+    ));
+    breakpoint.add_setter(&split, "collapsed", Some(&true.to_value()));
+    bp_bin.add_breakpoint(breakpoint);
+    overlay.set_child(Some(&bp_bin));
+
     let host = adw::NavigationPage::builder()
         .title("OpenBubbles")
         .child(&overlay)
@@ -364,10 +494,18 @@ pub fn enter_messaging(
     ui.reload_chats();
 
     // Receive loop -> persist -> pulse -> refresh.
-    let (tx, rx) = async_channel::unbounded::<()>();
+    let (tx, rx) = async_channel::unbounded::<RecvEvent>();
     backend.start_receiving(&connection, &client, handles, store, tx);
     let ui_refresh = ui.clone();
-    gtk_bridge::forward(rx, move |()| ui_refresh.schedule_refresh());
+    gtk_bridge::forward(rx, move |ev| match ev {
+        RecvEvent::Applied => ui_refresh.schedule_refresh(),
+        RecvEvent::Typing {
+            chat_key,
+            from,
+            typing,
+            superseded,
+        } => ui_refresh.handle_typing(&chat_key, from.as_deref(), typing, superseded),
+    });
 }
 
 impl Ui {
@@ -413,9 +551,271 @@ impl Ui {
         });
     }
 
+    /// A scaffold preferences dialog. The "Account" group hosts Sign Out; add
+    /// further settings as new groups/rows.
+    fn show_preferences(&self) {
+        let dialog = adw::PreferencesDialog::new();
+        let page = adw::PreferencesPage::new();
+
+        let account = adw::PreferencesGroup::builder().title("Account").build();
+        let sign_out = gtk::Button::builder()
+            .label("Sign Out")
+            .halign(gtk::Align::Center)
+            .margin_top(8)
+            .build();
+        sign_out.add_css_class("destructive-action");
+        sign_out.add_css_class("pill");
+        {
+            let ui = self.clone();
+            let dialog = dialog.clone();
+            sign_out.connect_clicked(move |_| ui.confirm_sign_out(&dialog));
+        }
+        account.add(&sign_out);
+        page.add(&account);
+
+        dialog.add(&page);
+        dialog.present(Some(&self.split));
+    }
+
+    fn confirm_sign_out(&self, prefs: &adw::PreferencesDialog) {
+        let confirm = adw::AlertDialog::new(
+            Some("Sign Out?"),
+            Some("This clears the saved login. The app will close — reopen it to sign in again."),
+        );
+        confirm.add_responses(&[("cancel", "Cancel"), ("signout", "Sign Out")]);
+        confirm.set_response_appearance("signout", adw::ResponseAppearance::Destructive);
+        confirm.set_default_response(Some("cancel"));
+        confirm.set_close_response("cancel");
+        let ui = self.clone();
+        let prefs = prefs.clone();
+        confirm.connect_response(None, move |_, resp| {
+            if resp != "signout" {
+                return;
+            }
+            // Clear persisted credentials, then quit so the live session (receive
+            // loop, APNs connection) tears down cleanly. Next launch onboards.
+            ui.backend.sign_out();
+            prefs.close();
+            if let Some(app) = gtk::gio::Application::default() {
+                app.quit();
+            }
+        });
+        confirm.present(Some(&self.split));
+    }
+
+    fn show_about(&self) {
+        let about = adw::AboutDialog::builder()
+            .application_name("OpenBubbles")
+            .version(env!("CARGO_PKG_VERSION"))
+            .build();
+        if let Some(id) = gtk::gio::Application::default().and_then(|a| a.application_id()) {
+            about.set_application_icon(id.as_str());
+        }
+        about.present(Some(&self.split));
+    }
+
+    /// Prompt for a user-given name for the open conversation. An empty field
+    /// clears the override and reverts to the derived title.
+    fn prompt_rename(&self) {
+        let Some(chat) = self.open_summary.borrow().clone() else {
+            return;
+        };
+        // Placeholder shows what an empty field falls back to (the derived name).
+        let derived = {
+            let mut c = chat.clone();
+            c.custom_name = None;
+            chat_title(&c, &self.handles)
+        };
+        let entry = gtk::Entry::builder()
+            .activates_default(true)
+            .text(chat.custom_name.clone().unwrap_or_default())
+            .build();
+        entry.set_placeholder_text(Some(&derived));
+
+        let dialog = adw::AlertDialog::new(Some("Rename Conversation"), None);
+        dialog.set_extra_child(Some(&entry));
+        dialog.add_responses(&[("cancel", "Cancel"), ("rename", "Rename")]);
+        dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("rename"));
+        dialog.set_close_response("cancel");
+
+        let ui = self.clone();
+        let chat_id = chat.id;
+        dialog.connect_response(None, move |_dlg, resp| {
+            if resp != "rename" {
+                return;
+            }
+            let trimmed = entry.text().trim().to_string();
+            let name = if trimmed.is_empty() { None } else { Some(trimmed) };
+            let store = ui.store.clone();
+            let ui2 = ui.clone();
+            let name_for_db = name.clone();
+            gtk_bridge::spawn(
+                async move { store.set_chat_custom_name(chat_id, name_for_db).await },
+                move |res| {
+                    if let Err(e) = res {
+                        eprintln!("rename error: {e:#}");
+                        return;
+                    }
+                    // Reflect in the open chat's header right away, then rebuild the
+                    // sidebar from the DB so its row picks up the new name too.
+                    {
+                        let mut g = ui2.open_summary.borrow_mut();
+                        if let Some(open) = g.as_mut().filter(|o| o.id == chat_id) {
+                            open.custom_name = name.clone();
+                            ui2.content_page
+                                .set_title(&chat_title(open, &ui2.handles));
+                        }
+                    }
+                    ui2.reload_chats();
+                },
+            );
+        });
+        dialog.present(Some(&self.split));
+    }
+
+    /// React to compose-entry edits: send a typing start when text first appears,
+    /// a stop when it's cleared, and re-arm an idle timer that stops after a pause
+    /// (so we don't leave the other side showing dots if the user walks away).
+    fn note_typing_activity(&self, typing_now: bool) {
+        let Some(chat) = self.open_summary.borrow().clone() else {
+            return;
+        };
+        if typing_now && !self.typing_sent.replace(true) {
+            self.send_typing(&chat, true);
+        } else if !typing_now && self.typing_sent.replace(false) {
+            self.send_typing(&chat, false);
+        }
+        if !typing_now {
+            return;
+        }
+        let gen = self.typing_idle_gen.get().wrapping_add(1);
+        self.typing_idle_gen.set(gen);
+        let ui = self.clone();
+        glib::timeout_add_seconds_local_once(6, move || {
+            if ui.typing_idle_gen.get() == gen && ui.typing_sent.replace(false) {
+                if let Some(chat) = ui.open_summary.borrow().clone() {
+                    ui.send_typing(&chat, false);
+                }
+            }
+        });
+    }
+
+    fn send_typing(&self, chat: &ChatSummary, typing: bool) {
+        let Some(my_handle) = self_handle(&chat.participants, &self.handles) else {
+            return;
+        };
+        self.backend
+            .send_typing(&self.client, &chat_ref_of(chat), &my_handle, typing);
+    }
+
+    /// An inbound typing event. Shown only for the open chat, matched by chat key
+    /// or — when the typing conversation's participant set differs from ours — by
+    /// the sender being one of the open chat's participants. The bubble lives at
+    /// the end of the timeline (so it scrolls with the messages); auto-hides after
+    /// a grace period since iMessage doesn't reliably send a matching stop.
+    fn handle_typing(&self, chat_key: &str, from: Option<&str>, typing: bool, superseded: bool) {
+        let Some(open) = self.open_summary.borrow().clone() else {
+            return;
+        };
+        let matched = open.key == chat_key
+            || from.is_some_and(|f| {
+                open.participants
+                    .iter()
+                    .any(|p| pretty_addr(p).eq_ignore_ascii_case(&pretty_addr(f)))
+            });
+        if !matched {
+            return;
+        }
+        if !typing {
+            self.typing_active.set(false);
+            let gen = self.typing_gen.get().wrapping_add(1);
+            self.typing_gen.set(gen);
+            if superseded {
+                // A message is arriving. Leave the dots in place and let the
+                // imminent rebuild swap them for the message in a single reflow
+                // (no remove-then-add bounce); tag the new bubble to fade in.
+                self.morph_pending.set(true);
+                let ui = self.clone();
+                glib::timeout_add_seconds_local_once(2, move || {
+                    // Backstop: if the rebuild somehow didn't clear the row, do it.
+                    if ui.typing_gen.get() == gen {
+                        ui.morph_pending.set(false);
+                        ui.remove_typing_row();
+                    }
+                });
+            } else {
+                self.remove_typing_row();
+            }
+            return;
+        }
+        self.typing_active.set(true);
+        let adj = self.scroller.vadjustment();
+        let at_bottom = adj.value() + adj.page_size() >= adj.upper() - 80.0;
+        let was_present = self.typing_row.borrow().is_some();
+        self.append_typing_row(open.is_group);
+        // Keep the dots visible when they first appear at the bottom.
+        if at_bottom && !was_present {
+            self.scroll_to(ScrollTo::Bottom);
+        }
+        let gen = self.typing_gen.get().wrapping_add(1);
+        self.typing_gen.set(gen);
+        let ui = self.clone();
+        glib::timeout_add_seconds_local_once(12, move || {
+            if ui.typing_gen.get() == gen {
+                ui.typing_active.set(false);
+                ui.remove_typing_row();
+            }
+        });
+    }
+
+    fn hide_typing_indicator(&self) {
+        self.typing_active.set(false);
+        self.morph_pending.set(false);
+        self.typing_gen.set(self.typing_gen.get().wrapping_add(1));
+        self.remove_typing_row();
+    }
+
+    /// Append the typing bubble as the trailing item in the timeline, if not
+    /// already present.
+    fn append_typing_row(&self, is_group: bool) {
+        if self.typing_row.borrow().is_some() {
+            return;
+        }
+        let row = typing_row(is_group);
+        self.msg_container.append(&row);
+        *self.typing_row.borrow_mut() = Some(row);
+    }
+
+    fn remove_typing_row(&self) {
+        if let Some(row) = self.typing_row.borrow_mut().take() {
+            self.msg_container.remove(&row);
+        }
+    }
+
+    /// A timeline rebuild clears the container (and our row with it); drop the
+    /// stale handle and re-append a fresh bubble if typing is still active, so a
+    /// refresh mid-typing doesn't drop the indicator.
+    fn refresh_typing_row(&self, is_group: bool) {
+        *self.typing_row.borrow_mut() = None;
+        if self.typing_active.get() {
+            self.append_typing_row(is_group);
+        }
+    }
+
     fn open_chat(&self, chat: &ChatSummary) {
+        // Switching away: stop any outbound typing on the previous chat, and clear
+        // the inbound indicator (it belongs to the chat we're leaving).
+        let prev = self.open_summary.borrow().clone();
+        if self.typing_sent.replace(false) {
+            if let Some(p) = prev.as_ref().filter(|p| p.id != chat.id) {
+                self.send_typing(p, false);
+            }
+        }
+        self.hide_typing_indicator();
         *self.open_summary.borrow_mut() = Some(chat.clone());
         self.content_page.set_title(&chat_title(chat, &self.handles));
+        self.rename_button.set_sensitive(true);
         self.split.set_show_content(true);
         // Opening the chat means reading it — clear any pending notification.
         self.withdraw_chat_notification(chat.id);
@@ -455,6 +855,7 @@ impl Ui {
                 *ui.unread_marker_shown.borrow_mut() = marker.is_some();
                 *ui.unread_marker.borrow_mut() = marker.clone();
                 ui.update_unread_pill();
+                ui.refresh_typing_row(is_group);
 
                 let to = match &marker {
                     Some(w) => ScrollTo::Widget(w.clone()),
@@ -521,6 +922,14 @@ impl Ui {
                 *ui.unread_marker_shown.borrow_mut() = marker.is_some();
                 *ui.unread_marker.borrow_mut() = marker.clone();
                 ui.update_unread_pill();
+                ui.refresh_typing_row(is_group);
+                // If this rebuild is the message that superseded the typing dots,
+                // fade the newly-arrived bubble in where the dots were.
+                if ui.morph_pending.replace(false) {
+                    if let Some(last) = ui.msg_container.last_child() {
+                        last.add_css_class("bubble-appear");
+                    }
+                }
                 let to = if at_bottom {
                     ScrollTo::Bottom
                 } else {
@@ -579,8 +988,30 @@ impl Ui {
                 // before the async load, since the user may have scrolled while
                 // it was in flight.
                 let adj = ui.scroller.vadjustment();
-                let old_upper = adj.upper();
                 let old_value = adj.value();
+                // Anchor on the *actual* position of the current top message rather
+                // than a measured height. measure() returns natural sizes, and a
+                // GtkPicture's natural height is the image's intrinsic (unscaled)
+                // height — so with photos in the batch the measured delta overshot
+                // and, accumulating across batches, flung the view downward.
+                // compute_bounds gives the true post-layout shift instead.
+                let anchor_widget = ui.msg_container.first_child();
+                let anchor_old_y = anchor_widget
+                    .as_ref()
+                    .and_then(|w| w.compute_bounds(&ui.msg_container))
+                    .map(|b| b.y() as f64)
+                    .unwrap_or(0.0);
+                // Minimum-size baseline for the pre-layout estimate below. Minimum
+                // sizes track actual allocation (a photo's minimum is its scaled
+                // size, not its huge intrinsic natural size), unlike natural sizes.
+                let anchor_width = ui.msg_container.width();
+                let old_min_h = if anchor_width > 0 {
+                    ui.msg_container
+                        .measure(gtk::Orientation::Vertical, anchor_width)
+                        .0 as f64
+                } else {
+                    adj.upper()
+                };
 
                 // Prepend in reverse so the batch keeps its order at the top. If
                 // this page contains the first unread, the divider slots in here
@@ -596,38 +1027,80 @@ impl Ui {
                     ui.update_unread_pill();
                 }
 
-                // Re-anchor before the frame paints, instead of after a timeout.
-                // The tick runs in the update phase and container.measure() already
-                // reflects the prepended batch, so we shift the view down by exactly
-                // the height we added in the same frame — and stop as soon as it's
-                // applied, so we don't fight the user's scroll. The old 50ms timeout
-                // let the scrolledwindow paint a few frames at the stale offset
-                // first: that was the "above batch" flash on scroll-up.
+                // Anchor *synchronously*, before returning to the main loop, so no
+                // frame can paint the prepended batch at the old scroll value. The
+                // async callback may run after this frame's update phase, in which
+                // case the tick below wouldn't fire until the next frame — leaving
+                // one painted flash. The minimum-size measurement is available now
+                // (it forces a re-measure including the new rows), and minimum sizes
+                // match actual allocation, so this first anchor is already correct.
+                {
+                    let width = ui.msg_container.width();
+                    let new_min = if width > 0 {
+                        ui.msg_container
+                            .measure(gtk::Orientation::Vertical, width)
+                            .0 as f64
+                    } else {
+                        adj.upper()
+                    };
+                    if new_min > adj.upper() {
+                        adj.set_upper(new_min);
+                    }
+                    adj.set_value(old_value + (new_min - old_min_h).max(0.0));
+                }
+
+                // Re-anchor before the frame paints. We can't predict the height
+                // with container.measure() — it returns natural sizes, and a
+                // GtkPicture's natural height is the photo's intrinsic (unscaled)
+                // height, so any batch with images overshot and (compounding across
+                // batches) flung the view down. Instead we watch the anchor message's
+                // real position and shift by exactly how far it moved once layout
+                // reflects the prepend.
                 let scroller = ui.scroller.clone();
                 let container = ui.msg_container.clone();
                 let loading = ui.page_loading.clone();
                 let frames = Cell::new(0u32);
+                let stable = Cell::new(0u32);
+                let last_shift = Cell::new(f64::NAN);
                 ui.scroller.add_tick_callback(move |_w, _clock| {
                     let adj = scroller.vadjustment();
-                    let width = container.width();
-                    let content_h = if width > 0 {
-                        container.measure(gtk::Orientation::Vertical, width).1 as f64
-                    } else {
-                        adj.upper()
+                    let actual = anchor_widget
+                        .as_ref()
+                        .and_then(|w| w.compute_bounds(&container))
+                        .map(|b| (b.y() as f64 - anchor_old_y).max(0.0));
+                    // Once layout reflects the prepend, compute_bounds is exact.
+                    // Until then it still reads the old position (shift ~0), which
+                    // would paint one unanchored frame — the flash. Fall back to a
+                    // minimum-size measurement of the added height so that first
+                    // frame is already anchored.
+                    let shift = match actual {
+                        Some(s) if s > 0.5 => s,
+                        _ => {
+                            let width = container.width();
+                            let new_min = if width > 0 {
+                                container.measure(gtk::Orientation::Vertical, width).0 as f64
+                            } else {
+                                adj.upper()
+                            };
+                            (new_min - old_min_h).max(0.0)
+                        }
                     };
-                    let added = content_h - old_upper;
+                    adj.set_value(old_value + shift);
+                    // Re-assert until the shift settles (layout done), so a pre-layout
+                    // frame can't leave us anchored short.
+                    if (shift - last_shift.get()).abs() < 0.5 {
+                        stable.set(stable.get() + 1);
+                    } else {
+                        stable.set(0);
+                    }
+                    last_shift.set(shift);
                     frames.set(frames.get() + 1);
-                    // Wait until the prepended batch is reflected in the measure
-                    // (or give up after a few frames), then apply the shift once.
-                    if added <= 0.5 && frames.get() < 8 {
-                        return glib::ControlFlow::Continue;
+                    if stable.get() >= 4 || frames.get() >= 24 {
+                        *loading.borrow_mut() = false;
+                        glib::ControlFlow::Break
+                    } else {
+                        glib::ControlFlow::Continue
                     }
-                    if content_h > adj.upper() {
-                        adj.set_upper(content_h);
-                    }
-                    adj.set_value(old_value + added.max(0.0));
-                    *loading.borrow_mut() = false;
-                    glib::ControlFlow::Break
                 });
             },
         );
@@ -669,6 +1142,7 @@ impl Ui {
                 *ui.unread_marker_shown.borrow_mut() = marker.is_some();
                 *ui.unread_marker.borrow_mut() = marker.clone();
                 ui.update_unread_pill();
+                ui.refresh_typing_row(is_group);
                 let to = match &marker {
                     Some(w) => ScrollTo::Widget(w.clone()),
                     None => ScrollTo::Bottom,
@@ -1580,14 +2054,20 @@ fn time_label(m: &StoredMessage) -> gtk::Label {
 
 // --- scaffolding helpers ---
 
-/// A toolbar-view page: header with `title`, `body` as content, optional bottom bar.
+/// A toolbar-view page: header with `title`, `body` as content, optional bottom
+/// bar, and an optional widget packed at the end of the header.
 fn page(
     title: &str,
     body: &impl IsA<gtk::Widget>,
     bottom: Option<&gtk::Widget>,
+    header_end: Option<&gtk::Widget>,
 ) -> adw::NavigationPage {
     let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&adw::HeaderBar::new());
+    let header = adw::HeaderBar::new();
+    if let Some(w) = header_end {
+        header.pack_end(w);
+    }
+    toolbar.add_top_bar(&header);
     toolbar.set_content(Some(body));
     if let Some(b) = bottom {
         toolbar.add_bottom_bar(b);
@@ -1643,7 +2123,60 @@ fn install_css() {
 
 // --- formatting helpers ---
 
+/// A timeline row holding the typing bubble, inset to match an incoming message
+/// (same left margin, and the 28px avatar-column spacer in group chats).
+fn typing_row(is_group: bool) -> gtk::Widget {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .margin_start(14)
+        .margin_end(56)
+        .margin_top(8)
+        .margin_bottom(2)
+        .halign(gtk::Align::Start)
+        .build();
+    if is_group {
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        spacer.set_size_request(28, -1);
+        row.append(&spacer);
+    }
+    row.append(&typing_bubble());
+    row.upcast()
+}
+
+/// The grey "three animated dots" bubble shown while the other party types. The
+/// pulse is driven by CSS keyframes on the `.typing-dot` class.
+fn typing_bubble() -> gtk::Widget {
+    let bubble = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Center)
+        .build();
+    bubble.add_css_class("bubble");
+    bubble.add_css_class("bubble-in");
+    bubble.add_css_class("typing-bubble");
+    for i in 0..3 {
+        let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        dot.add_css_class("typing-dot");
+        match i {
+            1 => dot.add_css_class("typing-dot-2"),
+            2 => dot.add_css_class("typing-dot-3"),
+            _ => {}
+        }
+        dot.set_valign(gtk::Align::Center);
+        bubble.append(&dot);
+    }
+    bubble.upcast()
+}
+
 fn chat_title(c: &ChatSummary, handles: &[String]) -> String {
+    // A user-set name wins over everything.
+    if let Some(n) = &c.custom_name {
+        if !n.trim().is_empty() {
+            return n.clone();
+        }
+    }
     if let Some(n) = &c.display_name {
         if !n.is_empty() {
             return n.clone();

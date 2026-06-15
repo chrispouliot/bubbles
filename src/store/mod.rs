@@ -89,6 +89,13 @@ pub fn migrate(c: &Connection) -> rusqlite::Result<()> {
         c.execute_batch("ALTER TABLE message ADD COLUMN read_sent INTEGER NOT NULL DEFAULT 0;")?;
         v = 2;
     }
+    if v < 3 {
+        // A user-set name for a conversation, overriding the derived title. Kept
+        // separate from `display_name` (Apple's group name), which the chat
+        // upsert overwrites; this one is local and survives sync.
+        c.execute_batch("ALTER TABLE chat ADD COLUMN custom_name TEXT;")?;
+        v = 3;
+    }
     c.pragma_update(None, "user_version", v)?;
     Ok(())
 }
@@ -334,7 +341,8 @@ pub fn query_chats(c: &Connection) -> rusqlite::Result<Vec<ChatSummary>> {
         "SELECT c.id, c.key, c.display_name, c.is_group, c.service, c.last_message_date,
                 COALESCE(GROUP_CONCAT(h.address, ';'), ''),
                 (SELECT COUNT(*) FROM message m
-                   WHERE m.chat_id = c.id AND m.is_from_me = 0 AND m.read_sent = 0)
+                   WHERE m.chat_id = c.id AND m.is_from_me = 0 AND m.read_sent = 0),
+                c.custom_name
          FROM chat c
          LEFT JOIN chat_participant cp ON cp.chat_id = c.id
          LEFT JOIN handle h            ON h.id = cp.handle_id
@@ -356,6 +364,7 @@ pub fn query_chats(c: &Connection) -> rusqlite::Result<Vec<ChatSummary>> {
                 parts.split(';').map(String::from).collect()
             },
             unread: r.get(7)?,
+            custom_name: r.get(8)?,
         })
     })?;
     rows.collect()
@@ -550,6 +559,21 @@ impl Store {
 
     pub async fn chats(&self) -> Result<Vec<ChatSummary>> {
         Ok(self.conn.call(|c| Ok(query_chats(c)?)).await?)
+    }
+
+    /// Set (or, with `None`/empty, clear) a conversation's user-given name.
+    pub async fn set_chat_custom_name(&self, chat_id: i64, name: Option<String>) -> Result<()> {
+        let name = name.filter(|n| !n.trim().is_empty());
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE chat SET custom_name = ?1 WHERE id = ?2",
+                    params![name, chat_id],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
     }
 
     /// Inbound messages newer than `date`, for desktop notifications.

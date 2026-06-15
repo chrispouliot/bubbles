@@ -155,6 +155,27 @@ impl Default for LoginState {
 ///
 /// Methods take `&Handle` and return owned handles; callers clone the cheap
 /// `Arc`-backed handles before moving them onto the tokio runtime.
+/// What the receive loop pulses to the UI. Stored events collapse to `Applied`
+/// (the UI re-queries); typing is ephemeral and carried inline.
+#[derive(Clone, Debug)]
+pub enum RecvEvent {
+    /// One or more stored events were applied — refresh.
+    Applied,
+    /// A conversation's typing state changed. `chat_key` matches
+    /// [`ChatRef::key`]; `from` is the sender's handle (for membership-based
+    /// matching when the conversation's participant set differs from ours).
+    Typing {
+        chat_key: String,
+        from: Option<String>,
+        typing: bool,
+        /// True when a stop (`typing == false`) was triggered by an incoming
+        /// message arriving rather than an explicit typing-stop. Lets the UI keep
+        /// the indicator until the rebuild swaps in the message (one reflow, no
+        /// remove-then-add bounce) and animate the new bubble in.
+        superseded: bool,
+    },
+}
+
 #[async_trait]
 pub trait Backend: Send + Sync {
     // --- 1. hardware token / validation data -> Config ---
@@ -267,14 +288,15 @@ pub trait Backend: Send + Sync {
 
     /// Spawn the detached receive loop: decode inbound pushes, persist each to
     /// `store`, and pulse `notify` after every applied event so the UI can
-    /// refresh. No-op on backends without a live connection.
+    /// refresh. Ephemeral signals (typing) are forwarded without being stored.
+    /// No-op on backends without a live connection.
     fn start_receiving(
         &self,
         connection: &Connection,
         client: &ImClient,
         handles: Vec<String>,
         store: Store,
-        notify: async_channel::Sender<()>,
+        notify: async_channel::Sender<RecvEvent>,
     );
 
     // --- 7. send (Phase D) ---
@@ -314,4 +336,11 @@ pub trait Backend: Send + Sync {
         read: bool,
         target_guid: String,
     );
+
+    /// Fire-and-forget a typing indicator (start with `typing = true`, stop with
+    /// `false`) to `chat`'s participants. Ephemeral; never stored.
+    fn send_typing(&self, client: &ImClient, chat: &ChatRef, my_handle: &str, typing: bool);
+
+    /// Wipe the persisted login so the next launch starts at onboarding.
+    fn sign_out(&self);
 }

@@ -30,6 +30,11 @@
           toolchain
           rust-analyzer
           pkg-config
+          
+          # Needed for absinthe apple nac emulator (rust + C code)
+          rustPlatform.bindgenHook
+          cmake
+          gnumake
 
           # Build-time deps needed once the rustpush submodule is linked.
           perl # vendored OpenSSL (rustpush pins openssl/vendored)

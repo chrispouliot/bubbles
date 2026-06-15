@@ -400,7 +400,7 @@ impl Backend for RustpushBackend {
         c: &ImClient,
         handles: Vec<String>,
         store: Store,
-        notify: async_channel::Sender<()>,
+        notify: async_channel::Sender<RecvEvent>,
     ) {
         let conn = conn(connection).conn.clone();
         let imclient = client(c).clone();
@@ -412,6 +412,35 @@ impl Backend for RustpushBackend {
                     Ok(msg) => match imclient.handle(msg).await {
                         Ok(Some(inst)) => {
                             log_inst(&inst);
+                            // Typing is ephemeral: forward it straight to the UI
+                            // (keyed like the store's chat key) and don't persist
+                            // or acknowledge it.
+                            if let Message::Typing(typing, _) = &inst.message {
+                                let from_me = is_from_me(&inst, &handles);
+                                log::debug!(
+                                    "typing recv from={:?} from_me={from_me} typing={typing}",
+                                    inst.sender
+                                );
+                                if !from_me {
+                                    if let Some(conv) = &inst.conversation {
+                                        let chat_key = ChatRef {
+                                            participants: conv.participants.clone(),
+                                            display_name: conv.cv_name.clone(),
+                                            service: None,
+                                        }
+                                        .key();
+                                        let _ = notify
+                                            .send(RecvEvent::Typing {
+                                                chat_key,
+                                                from: inst.sender.clone(),
+                                                typing: *typing,
+                                                superseded: false,
+                                            })
+                                            .await;
+                                    }
+                                }
+                                continue;
+                            }
                             let mut ingest = ingest_from(&inst, &handles);
                             // Download any attachments and attach them to the record.
                             if let Ingest::Message(im) = &mut ingest {
@@ -425,7 +454,28 @@ impl Backend for RustpushBackend {
                                 send_receipt_for(&imclient, &inst, &handles, false).await;
                             }
                             // Pulse the UI; drop if no receiver is listening.
-                            let _ = notify.send(()).await;
+                            let _ = notify.send(RecvEvent::Applied).await;
+                            // A real inbound message means they've stopped typing:
+                            // clear the indicator now rather than waiting for a
+                            // typing-stop that iMessage doesn't always send.
+                            if is_incoming_content(&inst, &handles) {
+                                if let Some(conv) = &inst.conversation {
+                                    let chat_key = ChatRef {
+                                        participants: conv.participants.clone(),
+                                        display_name: conv.cv_name.clone(),
+                                        service: None,
+                                    }
+                                    .key();
+                                    let _ = notify
+                                        .send(RecvEvent::Typing {
+                                            chat_key,
+                                            from: inst.sender.clone(),
+                                            typing: false,
+                                            superseded: true,
+                                        })
+                                        .await;
+                                }
+                            }
                         }
                         Ok(None) => {}
                         Err(e) => log::warn!("handle error: {e:?}"),
@@ -560,6 +610,24 @@ impl Backend for RustpushBackend {
                 Err(e) => log::warn!("{kind} receipt error: {e:?}"),
             }
         });
+    }
+
+    fn send_typing(&self, c: &ImClient, chat: &ChatRef, my_handle: &str, typing: bool) {
+        let imclient = client(c).clone();
+        let conversation = conversation_from(chat);
+        let my_handle = my_handle.to_string();
+        crate::runtime::runtime().spawn(async move {
+            let mut inst =
+                MessageInst::new(conversation, &my_handle, Message::Typing(typing, None));
+            match imclient.send(&mut inst).await {
+                Ok(_) => log::debug!("→ sent typing={typing}"),
+                Err(e) => log::warn!("typing send error: {e:?}"),
+            }
+        });
+    }
+
+    fn sign_out(&self) {
+        api::clear_session(&self.state_path);
     }
 }
 

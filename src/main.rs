@@ -26,6 +26,15 @@ use protocol::Backend;
 const APP_ID: &str = "app.openbubbles.Gtk.Devel";
 
 fn main() -> glib::ExitCode {
+    // NAC self-test: set NAC_SELFTEST=<path-to-base64-blob> (plus OPEN_ABSINTHE_IMD)
+    // to generate validation data once from the command line and exit, skipping the
+    // GUI and any Apple ID login. Lets you verify the emulator / a hardware identity.
+    #[cfg(feature = "rustpush")]
+    if let Ok(path) = std::env::var("NAC_SELFTEST") {
+        nac_selftest(&path);
+        return glib::ExitCode::SUCCESS;
+    }
+
     let app = adw::Application::builder()
         .application_id(APP_ID)
         .build();
@@ -40,6 +49,48 @@ fn main() -> glib::ExitCode {
     });
 
     app.run()
+}
+
+/// Generate validation data once from a hardware blob and print it, then exit.
+/// Exercises the full native NAC path — cert fetch, `nacInit`, Apple's
+/// `initializeValidation` round-trip, key establishment, and `nacSign` — with no
+/// GUI and no Apple ID login. Set `OPEN_ABSINTHE_IMD` so the emulator can find
+/// `IMDAppleServices`. `NAC_SELFTEST` is a path to a file containing the base64
+/// hardware blob (the same string you'd paste into "Local Mac Hardware").
+#[cfg(feature = "rustpush")]
+fn nac_selftest(blob_path: &str) {
+    let raw = match std::fs::read_to_string(blob_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("NAC selftest: cannot read {blob_path}: {e}");
+            std::process::exit(2);
+        }
+    };
+    let decoded = glib::base64_decode(raw.trim());
+    // Strip the OABS magic (4) + flag (1) if present, same as the sign-in path.
+    let inner = if decoded.len() > 5 && decoded.starts_with(b"OABS") {
+        decoded[5..].to_vec()
+    } else {
+        decoded.to_vec()
+    };
+    let config = match api::config_from_encoded(inner) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("NAC selftest: failed to decode hardware blob: {e}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!("NAC selftest: decoded identity; requesting validation data from Apple...");
+    match runtime::runtime().block_on(config.generate_validation_data()) {
+        Ok(data) => {
+            println!("NAC OK: {} bytes of validation data", data.len());
+            println!("{}", glib::base64_encode(&data));
+        }
+        Err(e) => {
+            eprintln!("NAC FAILED: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Open (creating if needed) the message store under the app data dir.

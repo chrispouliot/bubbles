@@ -113,6 +113,9 @@ pub struct ChatSummary {
     pub last_message_date: Option<i64>,
     pub participants: Vec<String>,
     pub unread: i64,
+    /// User-set name overriding the derived title; `None` falls back to the
+    /// Apple group name or the participants.
+    pub custom_name: Option<String>,
 }
 
 /// A freshly-arrived inbound message, used to drive desktop notifications.

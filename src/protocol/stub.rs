@@ -150,7 +150,7 @@ impl Backend for StubBackend {
         _client: &ImClient,
         _handles: Vec<String>,
         _store: crate::store::Store,
-        _notify: async_channel::Sender<()>,
+        _notify: async_channel::Sender<crate::protocol::RecvEvent>,
     ) {
         // No live connection in the stub; nothing to receive.
     }
@@ -210,6 +210,17 @@ impl Backend for StubBackend {
         _target_guid: String,
     ) {
     }
+
+    fn send_typing(
+        &self,
+        _client: &ImClient,
+        _chat: &crate::store::ChatRef,
+        _my_handle: &str,
+        _typing: bool,
+    ) {
+    }
+
+    fn sign_out(&self) {}
 }
 
 #[allow(dead_code)]

@@ -653,6 +653,29 @@ fn reset_user(path: &str) {
     }).unwrap()).unwrap();
 }
 
+/// Wipe the persisted login so the next launch goes through onboarding.
+/// `restore_session` gates on `hw_info.plist` + `id.plist`; the rest is cleared
+/// so a fresh sign-in doesn't reuse stale Apple-account/anisette state.
+pub fn clear_session(path: &str) {
+    let dir = PathBuf::from_str(path).unwrap_or_default();
+    for f in [
+        "hw_info.plist",
+        "id.plist",
+        "gsa.plist",
+        "keystore.plist",
+        "keychain.plist",
+        "statuskit.plist",
+        "findmy.plist",
+        "facetime.plist",
+        "cloudkit.plist",
+        "sharedstreams.plist",
+        "passwords.plist",
+    ] {
+        let _ = std::fs::remove_file(dir.join(f));
+    }
+    let _ = std::fs::remove_dir_all(dir.join("anisette_test"));
+}
+
 pub async fn register_ids(path: String, config: &JoinedOSConfig, aps: &APSConnection, identity: &IDSNGMIdentity, mut users: Vec<IDSUser>) -> anyhow::Result<(Option<Vec<IDSUser>>, Option<SupportAlert>)> {
     let dir = PathBuf::from_str(&path).unwrap();
 
