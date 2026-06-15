@@ -85,13 +85,16 @@ pub fn build_window(
         }
     });
 
-    adw::ApplicationWindow::builder()
+   let (width, height) = crate::window_state::read().unwrap_or((460i32, 560i32));
+    let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("OpenBubbles")
-        .default_width(460)
-        .default_height(560)
+        .default_width(width)
+        .default_height(height)
         .content(&nav)
-        .build()
+        .build();
+    crate::window_state::install(&window);
+    window
 }
 
 /// Hand off to the messaging UI, pulling the live session out of `state`.
@@ -107,7 +110,7 @@ fn go_messaging(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Bac
     };
     crate::ui::enter_messaging(nav, backend, store, connection, client, handles);
 }
-
+/// Brief placeholder shown while [`flow::restore`] checks for a saved session (spinner only, no text)
 /// Brief placeholder shown while [`flow::restore`] checks for a saved session.
 fn restoring_page() -> adw::NavigationPage {
     let content = column();
@@ -118,11 +121,6 @@ fn restoring_page() -> adw::NavigationPage {
     spinner.start();
     content.append(&spinner);
 
-    let label = gtk::Label::builder()
-        .label("Restoring session…")
-        .wrap(true)
-        .build();
-    content.append(&label);
 
     nav_page("OpenBubbles", &content)
 }

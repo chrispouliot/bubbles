@@ -5,7 +5,7 @@ mod setup;
 mod store;
 mod tray;
 mod ui;
-
+mod window_state;
 mod demo;
 
 #[cfg(feature = "rustpush")]
