@@ -10,3 +10,5 @@ result-*
 
 # editor
 *.swp
+
+.flatpak-builder
