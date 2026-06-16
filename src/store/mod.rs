@@ -74,6 +74,41 @@ CREATE TABLE attachment(
 );
 ";
 
+// Added in v4: sender-generated link previews (iMessage rich links). The
+// thumbnail is stored as a file on disk under `$XDG_CACHE_HOME/.../previews/`,
+// and this table holds the path plus the textual metadata.
+//
+// `link_preview` is the URL-keyed cache the fetcher writes to (Phases 4-5 of
+// the plan). For now it's empty, but the table ships in the same migration so
+// a Phase 5 install doesn't need a second migration.
+const DDL_V4: &str = "
+CREATE TABLE message_link_preview(
+  message_guid   TEXT NOT NULL,
+  part_idx       INTEGER NOT NULL,
+  url            TEXT,
+  original_url   TEXT,
+  title          TEXT,
+  summary        TEXT,
+  image_path     TEXT,
+  image_width    INTEGER,
+  image_height   INTEGER,
+  is_placeholder INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(message_guid, part_idx)
+);
+CREATE INDEX idx_message_link_preview_msg
+  ON message_link_preview(message_guid);
+CREATE TABLE link_preview(
+  url          TEXT PRIMARY KEY,
+  title        TEXT,
+  description  TEXT,
+  site_name    TEXT,
+  image_path   TEXT,
+  fetched_at   INTEGER NOT NULL,
+  status       INTEGER NOT NULL,
+  error        TEXT
+);
+";
+
 // --- sync core (all logic; unit-tested) ---
 
 /// Apply pending migrations and enable FK enforcement on this connection.
@@ -95,6 +130,13 @@ pub fn migrate(c: &Connection) -> rusqlite::Result<()> {
         // upsert overwrites; this one is local and survives sync.
         c.execute_batch("ALTER TABLE chat ADD COLUMN custom_name TEXT;")?;
         v = 3;
+    }
+    if v < 4 {
+        // Sender-generated link previews (Phase 1-3) and the URL-keyed cache
+        // the Phase 5 fetcher writes to. Shipped in the same migration so the
+        // schema bump is a single user_version step.
+        c.execute_batch(DDL_V4)?;
+        v = 4;
     }
     c.pragma_update(None, "user_version", v)?;
     Ok(())
@@ -271,12 +313,108 @@ fn insert_tapback(c: &Connection, t: &Tapback) -> rusqlite::Result<()> {
     bump_chat_date(c, chat_id, t.date)
 }
 
+// --- message-scoped link previews (Phase 1-3) ---
+
+/// Directory where thumbnail files for [`MessageLinkPreview::image_path`] are
+/// written. Created on demand by the receiver; the store does not manage it.
+pub fn preview_image_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default()
+                .join(".cache")
+        });
+    base.join("openbubbles-gtk").join("previews")
+}
+
+/// Upsert a sender-generated link preview. The PK is `(message_guid, part_idx)`
+/// so a placeholder can be replaced by its fill-in (same key, different row) and
+/// a duplicate ingest of the same preview is a no-op.
+///
+/// Image dimensions are stored best-effort so the renderer can size the card
+/// without re-decoding the thumbnail (which is async/expensive on a worker).
+fn upsert_message_link_preview(c: &Connection, p: &MessageLinkPreview) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO message_link_preview
+           (message_guid, part_idx, url, original_url, title, summary,
+            image_path, image_width, image_height, is_placeholder)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+         ON CONFLICT(message_guid, part_idx) DO UPDATE SET
+            url            = excluded.url,
+            original_url   = excluded.original_url,
+            title          = excluded.title,
+            summary        = excluded.summary,
+            image_path     = excluded.image_path,
+            image_width    = excluded.image_width,
+            image_height   = excluded.image_height,
+            is_placeholder = excluded.is_placeholder",
+        params![
+            p.message_guid,
+            p.part_idx,
+            p.url,
+            p.original_url,
+            p.title,
+            p.summary,
+            p.image_path,
+            p.image_width,
+            p.image_height,
+            p.is_placeholder as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Load every link preview whose message is in `guids`. Returns a map keyed by
+/// `(guid, part_idx)` so a renderer can look up in O(1) per message part. Used
+/// by the UI to batch-fetch the previews for the currently-loaded window in a
+/// single round-trip, so per-card blocking reads never happen on the GTK main
+/// thread.
+pub fn message_link_previews_for(
+    c: &Connection,
+    guids: &[String],
+) -> rusqlite::Result<std::collections::HashMap<(String, i64), MessageLinkPreview>> {
+    let mut out = std::collections::HashMap::new();
+    if guids.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = guids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT message_guid, part_idx, url, original_url, title, summary,
+                image_path, image_width, image_height, is_placeholder
+         FROM message_link_preview
+         WHERE message_guid IN ({placeholders})"
+    );
+    let mut stmt = c.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(guids.iter()), |r| {
+        Ok(MessageLinkPreview {
+            message_guid: r.get(0)?,
+            part_idx: r.get(1)?,
+            url: r.get(2)?,
+            original_url: r.get(3)?,
+            title: r.get(4)?,
+            summary: r.get(5)?,
+            image_path: r.get(6)?,
+            image_width: r.get(7)?,
+            image_height: r.get(8)?,
+            is_placeholder: r.get::<_, i64>(9)? != 0,
+        })
+    })?;
+    for row in rows {
+        let p = row?;
+        out.insert((p.message_guid.clone(), p.part_idx), p);
+    }
+    Ok(out)
+}
+
 /// Apply one inbound event in a transaction.
 pub fn apply_blocking(c: &mut Connection, ingest: Ingest) -> rusqlite::Result<()> {
     let tx = c.transaction()?;
     match ingest {
         Ingest::Message(m) => insert_message(&tx, &m)?,
         Ingest::Tapback(t) => insert_tapback(&tx, &t)?,
+        Ingest::LinkPreview(p) => upsert_message_link_preview(&tx, &p)?,
         Ingest::Receipt(Receipt::Delivered { guid, date }) => {
             tx.execute(
                 "UPDATE message SET date_delivered = ?1
@@ -634,6 +772,19 @@ impl Store {
             })
             .await?;
         Ok(())
+    }
+
+    /// Batch-load link previews for a window of messages. The UI calls this
+    /// alongside `messages_page` / `messages_from` so per-card blocking reads
+    /// never happen on the GTK main thread.
+    pub async fn message_link_previews_for(
+        &self,
+        guids: Vec<String>,
+    ) -> Result<std::collections::HashMap<(String, i64), MessageLinkPreview>> {
+        Ok(self
+            .conn
+            .call(move |c| Ok(message_link_previews_for(c, &guids)?))
+            .await?)
     }
 }
 
@@ -1030,5 +1181,121 @@ mod tests {
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].attachments.len(), 1);
         assert_eq!(page[0].attachments[0].name.as_deref(), Some("cat.jpg"));
+    }
+
+    // --- link preview tests (Phase 1) ---
+
+    fn preview(guid: &str, part: i64) -> MessageLinkPreview {
+        MessageLinkPreview {
+            message_guid: guid.into(),
+            part_idx: part,
+            url: Some("https://example.com/".into()),
+            original_url: Some("https://example.com".into()),
+            title: Some("Example".into()),
+            summary: Some("The example page.".into()),
+            image_path: Some("/tmp/example.jpg".into()),
+            image_width: Some(400),
+            image_height: Some(300),
+            is_placeholder: false,
+        }
+    }
+
+    #[test]
+    fn message_link_preview_round_trip() {
+        let mut c = db();
+        let p = preview("G-PREVIEW", 0);
+        apply_blocking(&mut c, Ingest::LinkPreview(p.clone())).unwrap();
+        let out = message_link_previews_for(&c, &["G-PREVIEW".into()]).unwrap();
+        let got = out.get(&("G-PREVIEW".into(), 0)).expect("row present");
+        assert_eq!(got.url.as_deref(), Some("https://example.com/"));
+        assert_eq!(got.title.as_deref(), Some("Example"));
+        assert_eq!(got.summary.as_deref(), Some("The example page."));
+        assert_eq!(got.image_path.as_deref(), Some("/tmp/example.jpg"));
+        assert_eq!(got.image_width, Some(400));
+        assert_eq!(got.image_height, Some(300));
+        assert!(!got.is_placeholder);
+        assert!(!got.is_sparse());
+    }
+
+    #[test]
+    fn message_link_preview_batches_across_guids() {
+        let mut c = db();
+        // Two messages, each with two parts; only the requested guids come back.
+        for g in ["G-A", "G-B", "G-C"] {
+            apply_blocking(&mut c, Ingest::LinkPreview(preview(g, 0))).unwrap();
+            apply_blocking(&mut c, Ingest::LinkPreview(preview(g, 1))).unwrap();
+        }
+        let guids = vec!["G-A".into(), "G-C".into()];
+        let out = message_link_previews_for(&c, &guids).unwrap();
+        assert_eq!(out.len(), 4, "two parts for each of the two requested guids");
+        assert!(out.contains_key(&("G-A".into(), 0)));
+        assert!(out.contains_key(&("G-A".into(), 1)));
+        assert!(out.contains_key(&("G-C".into(), 0)));
+        assert!(out.contains_key(&("G-C".into(), 1)));
+        // G-B was not requested; nothing for it in the result.
+        assert!(!out.keys().any(|(g, _)| g == "G-B"));
+    }
+
+    #[test]
+    fn message_link_preview_empty_guids_yields_empty_map() {
+        let c = db();
+        let out = message_link_previews_for(&c, &[]).unwrap();
+        assert!(out.is_empty(), "no guids, no rows");
+    }
+
+    #[test]
+    fn message_link_preview_placeholder_to_fillin() {
+        let mut c = db();
+        // Placeholder first.
+        let mut p = preview("G-PH", 0);
+        p.title = None;
+        p.summary = None;
+        p.is_placeholder = true;
+        apply_blocking(&mut c, Ingest::LinkPreview(p)).unwrap();
+        let placeholder =
+            message_link_previews_for(&c, &["G-PH".into()])
+                .unwrap()
+                .remove(&("G-PH".into(), 0))
+                .unwrap();
+        assert!(placeholder.is_placeholder);
+        assert!(placeholder.is_sparse(), "no title, no summary -> sparse");
+
+        // Fill-in upserts on the same (guid, part_idx), replacing the row.
+        let fill = MessageLinkPreview {
+            title: Some("Real Title".into()),
+            summary: Some("Real description.".into()),
+            is_placeholder: false,
+            ..preview("G-PH", 0)
+        };
+        apply_blocking(&mut c, Ingest::LinkPreview(fill)).unwrap();
+        let updated =
+            message_link_previews_for(&c, &["G-PH".into()])
+                .unwrap()
+                .remove(&("G-PH".into(), 0))
+                .unwrap();
+        assert!(!updated.is_placeholder, "fill-in cleared the placeholder flag");
+        assert_eq!(updated.title.as_deref(), Some("Real Title"));
+        assert_eq!(updated.summary.as_deref(), Some("Real description."));
+        assert!(!updated.is_sparse());
+    }
+
+    #[test]
+    fn message_link_preview_distinct_part_indices() {
+        let mut c = db();
+        apply_blocking(&mut c, Ingest::LinkPreview(preview("G-MULTI", 0))).unwrap();
+        let mut p1 = preview("G-MULTI", 1);
+        p1.url = Some("https://example.com/2".into());
+        p1.title = Some("Second".into());
+        apply_blocking(&mut c, Ingest::LinkPreview(p1)).unwrap();
+        let out = message_link_previews_for(&c, &["G-MULTI".into()]).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[&("G-MULTI".into(), 0)].title.as_deref(),
+            Some("Example")
+        );
+        assert_eq!(
+            out[&("G-MULTI".into(), 1)].title.as_deref(),
+            Some("Second")
+        );
     }
 }

@@ -17,8 +17,8 @@ use regex::Regex;
 use crate::gtk_bridge;
 use crate::protocol::{Backend, Connection, ImClient, RecvEvent};
 use crate::store::{
-    AttachmentRecord, ChatRef, ChatSummary, IncomingMessage, Ingest, Store, StoredAttachment,
-    StoredMessage,
+    AttachmentRecord, ChatRef, ChatSummary, IncomingMessage, Ingest, MessageLinkPreview, Store,
+    StoredAttachment, StoredMessage,
 };
 
 /// Phase D default: send read receipts when a chat is viewed. Becomes a user
@@ -108,6 +108,46 @@ const CSS: &str = "
 }
 .bubble-appear {
   animation: bubble-appear 0.2s ease-out;
+}
+
+/* iMessage rich link (sender-generated preview) card. */
+.link-preview {
+  padding: 8px;
+  border-radius: 12px;
+  border: 1px solid alpha(currentColor, 0.08);
+  background-color: alpha(currentColor, 0.03);
+  min-width: 220px;
+  max-width: 360px;
+}
+.link-preview:hover {
+  background-color: alpha(currentColor, 0.06);
+}
+.link-preview-thumb {
+  border-radius: 8px;
+  min-width: 72px;
+  min-height: 72px;
+  background-color: alpha(currentColor, 0.08);
+}
+.link-preview-title {
+  font-weight: 600;
+}
+.link-preview-desc {
+  color: alpha(currentColor, 0.65);
+}
+.link-preview-host {
+  color: alpha(currentColor, 0.55);
+  font-size: 0.85em;
+}
+.link-preview-placeholder {
+  color: alpha(currentColor, 0.55);
+  font-style: italic;
+}
+.link-preview-thumb-fallback {
+  border-radius: 8px;
+  min-width: 72px;
+  min-height: 72px;
+  background-color: alpha(currentColor, 0.08);
+  color: alpha(currentColor, 0.5);
 }
 ";
 
@@ -243,6 +283,11 @@ struct Ui {
     // Cleared once on the first chat load, to sweep stale notifications left in
     // the center by a previous session (read elsewhere while we were closed).
     notify_swept: Rc<Cell<bool>>,
+    // Live link preview cards currently shown in the open chat, keyed by
+    // `(guid, part_idx)`. Lets the in-place `refresh_link_card` find the card
+    // and replace it on a placeholder→fillin without rebuilding the whole
+    // timeline. Cleared on every `populate_messages` rebuild.
+    preview_cards: Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
 }
 
 /// Swap the window over to the messaging UI and start receiving. Called once a
@@ -389,6 +434,7 @@ pub fn enter_messaging(
         window: Rc::new(RefCell::new(None)),
         notified_chats: Rc::new(RefCell::new(HashSet::new())),
         notify_swept: Rc::new(Cell::new(false)),
+        preview_cards: Rc::new(RefCell::new(std::collections::HashMap::new())),
     };
 
     // Open a chat when its row is activated.
@@ -566,6 +612,9 @@ pub fn enter_messaging(
     let ui_refresh = ui.clone();
     gtk_bridge::forward(rx, move |ev| match ev {
         RecvEvent::Applied => ui_refresh.schedule_refresh(),
+        RecvEvent::LinkPreviewUpdated { guid, part_idx } => {
+            ui_refresh.refresh_link_card(&guid, part_idx)
+        }
         RecvEvent::Typing {
             chat_key,
             from,
@@ -910,6 +959,56 @@ impl Ui {
         }
     }
 
+    /// Replace a single link preview card in place. Driven by the
+    /// `RecvEvent::LinkPreviewUpdated` event from the receive loop. The full
+    /// `reload_messages` path is forbidden on this event (it would flicker and
+    /// jump scroll); we walk the tracked card map, find the live widget, and
+    /// swap in a freshly-built one built from the new store row. No-op when the
+    /// chat is closed or the message isn't currently on screen.
+    fn refresh_link_card(&self, guid: &str, part_idx: i64) {
+        let key = (guid.to_string(), part_idx);
+        let Some(old) = self.preview_cards.borrow().get(&key).cloned() else {
+            return;
+        };
+        // The card's parent is the inner `col` `gtk::Box` from `message_body`.
+        // `Widget::parent()` returns a generic `Widget`; downcast to Box for
+        // remove/append. If the parent isn't a Box (shouldn't happen with our
+        // own builders), the registration is stale — drop it and bail.
+        let Some(parent_box) = old.parent().and_then(|p| p.downcast::<gtk::Box>().ok()) else {
+            self.preview_cards.borrow_mut().remove(&key);
+            return;
+        };
+        let store = self.store.clone();
+        let guid_for_async = guid.to_string();
+        let guid_for_lookup = guid.to_string();
+        let key_for_async = key.clone();
+        let ui = self.clone();
+        gtk_bridge::spawn(
+            async move {
+                store
+                    .message_link_previews_for(vec![guid_for_async])
+                    .await
+            },
+            move |res| {
+                let previews = res.unwrap_or_default();
+                let Some(p) = previews.get(&(guid_for_lookup, part_idx)).cloned() else {
+                    // The row was deleted between the receive and the read; the
+                    // card is still on screen with stale data. Just drop the
+                    // registration; a later refresh will sort it out.
+                    ui.preview_cards.borrow_mut().remove(&key_for_async);
+                    return;
+                };
+                let new_card = link_preview_card(&p);
+                // Replace: drop the old widget, register the new one. GTK will
+                // dispose the old widget when we remove it from its parent.
+                parent_box.remove(&old);
+                parent_box.append(&new_card);
+                ui.preview_cards
+                    .borrow_mut()
+                    .insert((p.message_guid.clone(), part_idx), new_card);
+            },
+        );
+    }
     fn open_chat(&self, chat: &ChatSummary) {
         // Switching away: stop any outbound typing on the previous chat, and clear
         // the inbound indicator (it belongs to the chat we're leaving).
@@ -945,12 +1044,19 @@ impl Ui {
                     .messages_page(chat_id, None, PAGE_SIZE)
                     .await
                     .unwrap_or_default();
+                // Batch-load previews with the messages (single round-trip,
+                // off the GTK main thread). The renderer reads from this map
+                // synchronously so it never blocks on a store call.
+                let previews = store
+                    .message_link_previews_for(msgs.iter().map(|m| m.guid.clone()).collect())
+                    .await
+                    .unwrap_or_default();
                 if let Some((_, date)) = &latest {
                     let _ = store.mark_read_through(chat_id, *date).await;
                 }
-                (msgs, first, latest.map(|(g, _)| g))
+                (msgs, previews, first, latest.map(|(g, _)| g))
             },
-            move |(msgs, first, receipt_guid)| {
+            move |(msgs, previews, first, receipt_guid)| {
                 // Reset pagination for the newly opened chat.
                 *ui.page_oldest.borrow_mut() = msgs.first().map(|m| (m.date, m.id));
                 *ui.page_has_more.borrow_mut() = msgs.len() as i64 >= PAGE_SIZE;
@@ -958,7 +1064,7 @@ impl Ui {
                 *ui.unread.borrow_mut() = first.clone();
 
                 let anchor = first.as_ref().map(|(g, _)| g.as_str());
-                let marker = populate_messages(&ui.msg_container, &msgs, is_group, anchor);
+                let marker = populate_messages(&ui.msg_container, &msgs, is_group, anchor, &previews, &ui.preview_cards);
                 *ui.unread_marker_shown.borrow_mut() = marker.is_some();
                 *ui.unread_marker.borrow_mut() = marker.clone();
                 ui.update_unread_pill();
@@ -1001,14 +1107,22 @@ impl Ui {
         gtk_bridge::spawn(
             async move {
                 let msgs = store.messages_from(chat_id, since).await;
+                let previews = if let Ok(msgs) = &msgs {
+                    store
+                        .message_link_previews_for(msgs.iter().map(|m| m.guid.clone()).collect())
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    Default::default()
+                };
                 let first = if recompute_unread {
                     Some(store.first_unread_incoming(chat_id).await.ok().flatten())
                 } else {
                     None
                 };
-                (msgs, first)
+                (msgs, previews, first)
             },
-            move |(res, first)| {
+            move |(res, previews, first)| {
                 let msgs = res.unwrap_or_else(|e| {
                     eprintln!("messages load error: {e:#}");
                     Vec::new()
@@ -1025,6 +1139,8 @@ impl Ui {
                     &msgs,
                     is_group,
                     anchor.as_deref(),
+                    &previews,
+                    &ui.preview_cards,
                 );
                 *ui.unread_marker_shown.borrow_mut() = marker.is_some();
                 *ui.unread_marker.borrow_mut() = marker.clone();
@@ -1069,8 +1185,19 @@ impl Ui {
         let is_group = chat.is_group;
 
         gtk_bridge::spawn(
-            async move { store.messages_page(chat_id, Some(cursor), PAGE_SIZE).await },
-            move |res| {
+            async move {
+                let older = store.messages_page(chat_id, Some(cursor), PAGE_SIZE).await;
+                let previews = if let Ok(older) = &older {
+                    store
+                        .message_link_previews_for(older.iter().map(|m| m.guid.clone()).collect())
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    Default::default()
+                };
+                (older, previews)
+            },
+            move |(res, previews)| {
                 let older = res.unwrap_or_default();
                 // Bail if the user switched chats while we were loading.
                 let still_open = ui
@@ -1125,7 +1252,7 @@ impl Ui {
                 // and the floating pill is dismissed.
                 let anchor = ui.unread.borrow().as_ref().map(|(g, _)| g.clone());
                 let (widgets, marker) =
-                    build_message_widgets(&older, is_group, anchor.as_deref());
+                    build_message_widgets(&older, is_group, anchor.as_deref(), &previews, &ui.preview_cards);
                 for w in widgets.into_iter().rev() {
                     ui.msg_container.prepend(&w);
                 }
@@ -1229,8 +1356,19 @@ impl Ui {
         let chat_id = chat.id;
         let is_group = chat.is_group;
         gtk_bridge::spawn(
-            async move { store.messages_from(chat_id, Some((date, 0))).await },
-            move |res| {
+            async move {
+                let msgs = store.messages_from(chat_id, Some((date, 0))).await;
+                let previews = if let Ok(msgs) = &msgs {
+                    store
+                        .message_link_previews_for(msgs.iter().map(|m| m.guid.clone()).collect())
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    Default::default()
+                };
+                (msgs, previews)
+            },
+            move |(res, previews)| {
                 let msgs = res.unwrap_or_default();
                 let still_open = ui
                     .open_summary
@@ -1244,8 +1382,14 @@ impl Ui {
                 // Read history still sits above the first unread.
                 *ui.page_has_more.borrow_mut() = true;
                 *ui.page_loading.borrow_mut() = false;
-                let marker =
-                    populate_messages(&ui.msg_container, &msgs, is_group, Some(guid.as_str()));
+                let marker = populate_messages(
+                    &ui.msg_container,
+                    &msgs,
+                    is_group,
+                    Some(guid.as_str()),
+                    &previews,
+                    &ui.preview_cards,
+                );
                 *ui.unread_marker_shown.borrow_mut() = marker.is_some();
                 *ui.unread_marker.borrow_mut() = marker.clone();
                 ui.update_unread_pill();
@@ -1717,6 +1861,8 @@ fn build_message_widgets(
     msgs: &[StoredMessage],
     is_group: bool,
     unread_anchor: Option<&str>,
+    previews: &std::collections::HashMap<(String, i64), MessageLinkPreview>,
+    preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
 ) -> (Vec<gtk::Widget>, Option<gtk::Widget>) {
     let mut out = Vec::with_capacity(msgs.len());
     let mut marker: Option<gtk::Widget> = None;
@@ -1744,7 +1890,7 @@ fn build_message_widgets(
         } else {
             2
         };
-        out.push(message_widget(m, show_header, is_group, top));
+        out.push(message_widget(m, show_header, is_group, top, previews, preview_cards));
         last_key = Some(key);
         last_date = m.date;
         last_from_me = Some(m.is_from_me);
@@ -1757,8 +1903,14 @@ fn populate_messages(
     msgs: &[StoredMessage],
     is_group: bool,
     unread_anchor: Option<&str>,
+    previews: &std::collections::HashMap<(String, i64), MessageLinkPreview>,
+    preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
 ) -> Option<gtk::Widget> {
     clear_box(container);
+    // Stale card handles from the previous render are about to be destroyed
+    // when their old container is cleared. Drop them so `refresh_link_card`
+    // doesn't try to swap into a detached widget.
+    preview_cards.borrow_mut().clear();
     let mut last_key: Option<String> = None;
     let mut last_date = 0i64;
     let mut last_from_me: Option<bool> = None;
@@ -1794,7 +1946,7 @@ fn populate_messages(
         } else {
             2
         };
-        container.append(&message_widget(m, show_header, is_group, top));
+        container.append(&message_widget(m, show_header, is_group, top, previews, preview_cards));
 
         // Delivered/Read indicator: only under the most recent sent message, so
         // it moves forward as new messages are sent and never lingers on older ones.
@@ -1930,17 +2082,34 @@ fn chat_row(c: &ChatSummary, handles: &[String]) -> gtk::ListBoxRow {
 
 /// One message in the timeline. Incoming messages are grey bubbles on the left
 /// (with an avatar, and a sender name in group chats); our own messages are blue
-/// bubbles on the right.
-fn message_widget(m: &StoredMessage, show_header: bool, is_group: bool, top: i32) -> gtk::Widget {
+/// bubbles on the right. `previews` is the in-memory map loaded alongside the
+/// messages; the renderer reads synchronously from it, so we never hit the
+/// store on the GTK main thread. `preview_cards` is the live-widget registry
+/// that `refresh_link_card` uses to swap a card in place without rebuilding.
+fn message_widget(
+    m: &StoredMessage,
+    show_header: bool,
+    is_group: bool,
+    top: i32,
+    previews: &std::collections::HashMap<(String, i64), MessageLinkPreview>,
+    preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
+) -> gtk::Widget {
     if m.is_from_me {
-        own_message(m, show_header, top)
+        own_message(m, show_header, top, previews, preview_cards)
     } else {
-        incoming_message(m, show_header, is_group, top)
+        incoming_message(m, show_header, is_group, top, previews, preview_cards)
     }
 }
 
 /// Left: grey bubble, with an avatar + sender name in group chats only.
-fn incoming_message(m: &StoredMessage, show_header: bool, is_group: bool, top: i32) -> gtk::Widget {
+fn incoming_message(
+    m: &StoredMessage,
+    show_header: bool,
+    is_group: bool,
+    top: i32,
+    previews: &std::collections::HashMap<(String, i64), MessageLinkPreview>,
+    preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
+) -> gtk::Widget {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -1983,7 +2152,7 @@ fn incoming_message(m: &StoredMessage, show_header: bool, is_group: bool, top: i
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
         .build();
-    line.append(&message_body(m, false));
+    line.append(&message_body(m, false, previews, preview_cards));
     if show_header {
         line.append(&time_label(m));
     }
@@ -1994,7 +2163,13 @@ fn incoming_message(m: &StoredMessage, show_header: bool, is_group: bool, top: i
 }
 
 /// Right: blue bubble, time to its left on the first bubble of a group.
-fn own_message(m: &StoredMessage, show_header: bool, top: i32) -> gtk::Widget {
+fn own_message(
+    m: &StoredMessage,
+    show_header: bool,
+    top: i32,
+    previews: &std::collections::HashMap<(String, i64), MessageLinkPreview>,
+    preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
+) -> gtk::Widget {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .margin_start(56)
@@ -2011,15 +2186,23 @@ fn own_message(m: &StoredMessage, show_header: bool, top: i32) -> gtk::Widget {
     if show_header {
         line.append(&time_label(m));
     }
-    line.append(&message_body(m, true));
+    line.append(&message_body(m, true, previews, preview_cards));
 
     row.append(&line);
     row.upcast()
 }
 
 /// The visual content of a message: image attachments stacked above an optional
-/// text bubble, aligned to the sender's side.
-fn message_body(m: &StoredMessage, own: bool) -> gtk::Widget {
+/// text bubble, aligned to the sender's side. A sender-generated link preview
+/// (iMessage rich link) is appended below the bubble when the renderer has one
+/// in its in-memory map; the card is registered in `preview_cards` so
+/// `refresh_link_card` can swap it in place on a placeholder→fillin.
+fn message_body(
+    m: &StoredMessage,
+    own: bool,
+    previews: &std::collections::HashMap<(String, i64), MessageLinkPreview>,
+    preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
+) -> gtk::Widget {
     let col = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(3)
@@ -2055,6 +2238,19 @@ fn message_body(m: &StoredMessage, own: bool) -> gtk::Widget {
         let bubble = bubble_box(own);
         bubble.append(&bubble_label("(no text)"));
         col.append(&bubble);
+    }
+
+    // Sender-generated link preview (iMessage rich link). The store already
+    // cached the thumbnail on disk; the renderer loads it from `image_path`
+    // asynchronously to avoid a sync decode on the main thread. Register the
+    // card in `preview_cards` so `refresh_link_card` can swap it in place on
+    // a placeholder→fillin without rebuilding the timeline.
+    if let Some(preview) = previews.get(&(m.guid.clone(), 0)) {
+        let card = link_preview_card(preview);
+        preview_cards
+            .borrow_mut()
+            .insert((m.guid.clone(), 0), card.clone());
+        col.append(&card);
     }
 
     col.upcast()
@@ -2158,6 +2354,184 @@ fn show_lightbox(host: &gtk::Overlay, path: &str) {
 
     host.add_overlay(&dim);
     dim.grab_focus();
+}
+
+// --- link preview card (Phase 2-3) ---
+
+/// Best-effort extraction of a host label from a URL for the small "example.com"
+/// caption at the bottom of the card. We try to render something readable even
+/// when the URL is malformed or uses a non-default scheme.
+fn host_caption(url: &str) -> String {
+    // Strip the scheme.
+    let after_scheme = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url);
+    // Drop the path, query, and fragment; keep the host (and optional :port).
+    let host_port = after_scheme
+        .split(|c: char| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or(after_scheme);
+    if host_port.is_empty() {
+        url.to_string()
+    } else {
+        host_port.to_string()
+    }
+}
+
+/// The sender's preview is sparse (`is_placeholder == true` or both title and
+/// summary are empty). Render a compact "loading preview…" state instead of an
+/// empty card — it's what the user actually sees while waiting for the fill-in
+/// or for a sender that ships only a thumbnail + URL.
+fn link_preview_placeholder_card(p: &MessageLinkPreview) -> gtk::Widget {
+    let card = gtk::Button::builder()
+        .has_frame(false)
+        .halign(gtk::Align::Start)
+        .build();
+    card.add_css_class("link-preview");
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    row.append(&link_preview_thumb(p));
+    let text_col = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .valign(gtk::Align::Center)
+        .hexpand(true)
+        .build();
+    let label = gtk::Label::builder()
+        .label("Loading preview…")
+        .xalign(0.0)
+        .build();
+    label.add_css_class("link-preview-placeholder");
+    text_col.append(&label);
+    if let Some(u) = p.url.as_deref().or(p.original_url.as_deref()) {
+        let host = gtk::Label::builder().label(host_caption(u)).xalign(0.0).build();
+        host.add_css_class("link-preview-host");
+        text_col.append(&host);
+    }
+    row.append(&text_col);
+    card.set_child(Some(&row));
+    // Clicking the placeholder opens the URL too (best UX while we wait).
+    if let Some(u) = p.url.as_deref().or(p.original_url.as_deref()) {
+        let url = u.to_string();
+        card.connect_clicked(move |_| open_uri(&url));
+        card.set_cursor_from_name(Some("pointer"));
+    }
+    card.upcast()
+}
+
+/// A 72×72 rounded thumbnail. If the cached image can't be decoded (HEIC on a
+/// system without gdk-pixbuf HEIC, or the file was deleted), the cell is filled
+/// with a neutral chain-link icon. Decoding the image bytes inline avoids a
+/// synchronous file load on the main thread if the bytes are already in hand;
+/// for now we still go via the path (the bytes were just written to disk, so
+/// they're guaranteed fresh and small).
+fn link_preview_thumb(p: &MessageLinkPreview) -> gtk::Widget {
+    if let Some(path) = p.image_path.as_deref() {
+        if let Some(texture) = gtk::gdk::Texture::from_filename(path).ok() {
+            let pic = gtk::Picture::new();
+            pic.set_paintable(Some(&texture));
+            // Cover-fit: thumbnail may be a different aspect ratio than the box.
+            pic.set_content_fit(gtk::ContentFit::Cover);
+            pic.set_size_request(72, 72);
+            pic.set_can_shrink(true);
+            pic.set_overflow(gtk::Overflow::Hidden);
+            pic.add_css_class("link-preview-thumb");
+            return pic.upcast();
+        }
+    }
+    // Fallback: neutral chain icon in a rounded box the same size as the thumb.
+    let box_ = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
+    box_.set_size_request(72, 72);
+    box_.add_css_class("link-preview-thumb-fallback");
+    let icon = gtk::Image::from_icon_name("insert-link-symbolic");
+    icon.set_pixel_size(32);
+    box_.append(&icon);
+    box_.upcast()
+}
+
+/// A link-preview card for an inbound `MessageLinkPreview` — the sender's static
+/// snapshot, already downloaded. Clicking opens the URL via the system browser.
+fn link_preview_card(p: &MessageLinkPreview) -> gtk::Widget {
+    // Sparse (placeholder, or title+summary both empty): render the compact
+    // loading state, not an empty card shell.
+    if p.is_sparse() {
+        return link_preview_placeholder_card(p);
+    }
+    let card = gtk::Button::builder()
+        .has_frame(false)
+        .halign(gtk::Align::Start)
+        .build();
+    card.add_css_class("link-preview");
+
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(10)
+        .build();
+    row.append(&link_preview_thumb(p));
+
+    let text_col = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .valign(gtk::Align::Center)
+        .hexpand(true)
+        .build();
+
+    let title_text = p.title.clone().unwrap_or_default();
+    if !title_text.is_empty() {
+        let title = gtk::Label::builder()
+            .label(&title_text)
+            .xalign(0.0)
+            .max_width_chars(40)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .single_line_mode(true)
+            .build();
+        title.add_css_class("link-preview-title");
+        apply_text_scale(&title, 13.0);
+        text_col.append(&title);
+    }
+    let summary_text = p.summary.clone().unwrap_or_default();
+    if !summary_text.is_empty() {
+        let summary = gtk::Label::builder()
+            .label(&summary_text)
+            .xalign(0.0)
+            .max_width_chars(60)
+            .wrap(true)
+            .lines(2)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        summary.add_css_class("link-preview-desc");
+        apply_text_scale(&summary, 11.0);
+        text_col.append(&summary);
+    }
+    if let Some(u) = p.url.as_deref().or(p.original_url.as_deref()) {
+        let host = gtk::Label::builder()
+            .label(host_caption(u))
+            .xalign(0.0)
+            .build();
+        host.add_css_class("link-preview-host");
+        apply_text_scale(&host, 10.0);
+        text_col.append(&host);
+    }
+    row.append(&text_col);
+    card.set_child(Some(&row));
+
+    // Open the URL when clicked. Use the original URL (what the sender typed)
+    // when it differs from the canonical one — that's the link the sender
+    // intended the user to follow.
+    if let Some(u) = p.original_url.as_deref().or(p.url.as_deref()) {
+        let url = u.to_string();
+        card.connect_clicked(move |_| open_uri(&url));
+        card.set_cursor_from_name(Some("pointer"));
+    }
+
+    card.upcast()
 }
 
 /// A bubble with a file icon + name, for non-image (or undecodable) attachments.

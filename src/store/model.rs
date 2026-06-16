@@ -97,6 +97,9 @@ pub enum Ingest {
     Message(IncomingMessage),
     Receipt(Receipt),
     Tapback(Tapback),
+    /// A sender-supplied link preview (iMessage rich link). Persisted in
+    /// `message_link_preview`, upserted on `(message_guid, part_idx)`.
+    LinkPreview(MessageLinkPreview),
     /// A recognized-but-unstored control event; the &str names the variant.
     Ignored(&'static str),
 }
@@ -165,4 +168,73 @@ impl StoredAttachment {
             .as_deref()
             .map_or(false, |m| m.starts_with("image/"))
     }
+}
+
+/// A sender-generated URL preview, attached to a specific message. This is the
+/// iMessage rich-link / LinkPresentation data the sender's device shipped to us:
+/// title, summary, URL, and the inline thumbnail bytes rustpush already pulled
+/// from the balloon body. We do not fetch incoming URLs; this is the sender's
+/// static snapshot, keyed by message.
+///
+/// `part_idx` distinguishes multiple links on the same message (rare; iMessage
+/// typically carries one URL per message, but the schema allows more). The
+/// `(message_guid, part_idx)` pair is the primary key so a placeholder can be
+/// upserted in place when the fill-in arrives.
+#[derive(Clone, Debug)]
+pub struct MessageLinkPreview {
+    pub message_guid: String,
+    pub part_idx: i64,
+    /// Canonical (post-redirect) URL the sender's device resolved to.
+    pub url: Option<String>,
+    /// Whatever the sender actually typed; preserved when it differs from `url`.
+    pub original_url: Option<String>,
+    pub title: Option<String>,
+    pub summary: Option<String>,
+    /// Local cache path of the thumbnail (`$XDG_CACHE_HOME/.../previews/...`).
+    /// `None` when the sender didn't include one.
+    pub image_path: Option<String>,
+    /// Width/height of `image_path` (best-effort, used for sizing).
+    pub image_width: Option<i64>,
+    pub image_height: Option<i64>,
+    /// `is_incomplete == true` from the LPLinkMetadata — Apple sent a
+    /// placeholder balloon, the real preview is on its way. Render the
+    /// compact "loading…" state and replace in place when the fill-in arrives.
+    pub is_placeholder: bool,
+}
+
+impl MessageLinkPreview {
+    /// True when the title *and* summary are both empty (placeholder preview or
+    /// a sender-supplied empty card). The renderer collapses such cards into a
+    /// compact "loading preview…" state instead of an empty shell.
+    pub fn is_sparse(&self) -> bool {
+        let title_blank = self
+            .title
+            .as_deref()
+            .map_or(true, |s| s.trim().is_empty());
+        let summary_blank = self
+            .summary
+            .as_deref()
+            .map_or(true, |s| s.trim().is_empty());
+        title_blank && summary_blank
+    }
+}
+
+/// A URL-keyed, fetched preview. Distinct from [`MessageLinkPreview`]: that one
+/// is message-scoped, sender-supplied, and immutable. This one is keyed by URL
+/// (so re-opening the same link reuses the result), TTL'd, and the result of
+/// *us* fetching the page (Phase 5+). For now Phase 1-3 doesn't write to this
+/// table, but the schema lives alongside `message_link_preview` in the same
+/// migration so the rollout is one atomic bump.
+#[derive(Clone, Debug)]
+pub struct LinkPreview {
+    pub url: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub site_name: Option<String>,
+    pub image_path: Option<String>,
+    /// Unix epoch ms when the row was last refreshed.
+    pub fetched_at: i64,
+    /// 0 = ok, 1 = failed (so a 404 isn't re-hit every render).
+    pub status: i64,
+    pub error: Option<String>,
 }

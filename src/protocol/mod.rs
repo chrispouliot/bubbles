@@ -161,6 +161,11 @@ impl Default for LoginState {
 pub enum RecvEvent {
     /// One or more stored events were applied — refresh.
     Applied,
+    /// A link preview row was upserted in the store. Carries the `(guid, part_idx)`
+    /// key the UI uses to find the message and replace its preview card in
+    /// place — the spec is explicit that a full `reload_messages` on this event
+    /// flickers and jumps scroll, so this is its own event with its own handler.
+    LinkPreviewUpdated { guid: String, part_idx: i64 },
     /// A conversation's typing state changed. `chat_key` matches
     /// [`ChatRef::key`]; `from` is the sender's handle (for membership-based
     /// matching when the conversation's participant set differs from ours).

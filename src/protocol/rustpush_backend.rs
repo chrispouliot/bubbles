@@ -30,12 +30,15 @@ use tokio::sync::{broadcast, Mutex};
 use rustpush::{
     APSConnection, APSMessage, AppleAccount, ArcAnisetteClient, Attachment,
     CircleClientSession, ConversationData, DebugMutex, DefaultAnisetteProvider, IDSNGMIdentity,
-    IDSUser, IMClient, IdmsAuthListener, IndexedMessagePart, LoginState as RpLoginState, MMCSFile,
-    Message, MessageInst, MessagePart, MessageParts, MessageType, NormalMessage, Reaction,
-    ReactMessageType, VerifyBody as RpVerifyBody,
+    IDSUser, IMClient, IdmsAuthListener, IndexedMessagePart, LPLinkMetadata, LinkMeta,
+    LoginState as RpLoginState, MMCSFile, Message, MessageInst, MessagePart, MessageParts,
+    MessageType, NormalMessage, Reaction, ReactMessageType, VerifyBody as RpVerifyBody,
 };
 
-use crate::store::{AttachmentRecord, ChatRef, IncomingMessage, Ingest, Receipt, Store, Tapback};
+use crate::store::{
+    AttachmentRecord, ChatRef, IncomingMessage, Ingest, MessageLinkPreview, Receipt, Store,
+    Tapback,
+};
 
 use crate::api;
 use crate::protocol::*;
@@ -448,6 +451,41 @@ impl Backend for RustpushBackend {
                             }
                             if let Err(e) = store.apply(ingest).await {
                                 log::warn!("store apply error: {e:#}");
+                            }
+                            // Sender-generated link preview (iMessage rich link):
+                            // rustpush already pulled the balloon body and gave us
+                            // the inline thumbnail bytes; we cache them to disk and
+                            // upsert the row. Same guid as the message so a
+                            // placeholder is replaced in place by its fill-in.
+                            // MUST NOT fetch the URL — that would leak the
+                            // recipient's IP to the sender's hosting (a tracking
+                            // beacon). The sender already shipped us the snapshot.
+                            //
+                            // We do NOT pulse RecvEvent::Applied here: a full
+                            // `reload_messages` on a preview-only update flickers
+                            // and can jump scroll (per the plan). Instead we send
+                            // RecvEvent::LinkPreviewUpdated, which the UI handles
+                            // as an in-place card replacement.
+                            if let Message::Message(nm) = &inst.message {
+                                if let Some(lm) = &nm.link_meta {
+                                    match extract_link_preview(&inst.id, lm) {
+                                        Some(p) => {
+                                            if let Err(e) =
+                                                store.apply(Ingest::LinkPreview(p)).await
+                                            {
+                                                log::warn!("store apply link preview: {e:#}");
+                                            } else {
+                                                let _ = notify
+                                                    .send(RecvEvent::LinkPreviewUpdated {
+                                                        guid: inst.id.clone(),
+                                                        part_idx: 0,
+                                                    })
+                                                    .await;
+                                            }
+                                        }
+                                        None => log::debug!("link_meta present but no preview extracted for {}", inst.id),
+                                    }
+                                }
                             }
                             // Acknowledge inbound content with a Delivered receipt.
                             if SEND_DELIVERED_RECEIPTS && is_incoming_content(&inst, &handles) {
@@ -887,6 +925,149 @@ fn tapback_type(t: &ReactMessageType) -> Option<i64> {
         _ => return None,
     };
     Some(if *enable { 2000 + idx } else { 3000 + idx })
+}
+
+// --- link preview extraction (Phase 1-3) ---
+
+/// Pick the primary thumbnail blob out of a `LinkMeta`. The image is *not* a
+/// normal MMCS attachment on the message — rustpush decodes the balloon body
+/// and keeps its inline attachments here, indexed by the
+/// `RichLinkImageAttachmentSubstitute` that the `LPLinkMetadata` carries.
+/// `None` if the sender didn't include one.
+fn preview_image_bytes(lm: &LinkMeta) -> Option<&[u8]> {
+    let idx = lm.data.image.as_ref()?.rich_link_image_attachment_substitute_index as usize;
+    lm.attachments.get(idx).map(|v| v.as_slice())
+}
+
+/// Pick a file extension for the thumbnail blob. Prefer the substitute's
+/// `mime_type` (set by most modern iOS/macOS senders) and fall back to sniffing
+/// the magic bytes. The renderer only cares that the file is the kind of image
+/// the loader can decode; an unrecognised blob falls back to the neutral icon.
+fn preview_image_ext(bytes: &[u8], mime: Option<&str>) -> &'static str {
+    if let Some(m) = mime {
+        let m = m.split(';').next().unwrap_or("").trim();
+        match m {
+            "image/png" => return "png",
+            "image/jpeg" | "image/jpg" => return "jpg",
+            "image/gif" => return "gif",
+            "image/webp" => return "webp",
+            "image/heic" | "image/heif" => return "heic",
+            _ => {}
+        }
+    }
+    if bytes.len() >= 8 && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        "png"
+    } else if bytes.len() >= 3 && bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "jpg"
+    } else if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        "gif"
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        "webp"
+    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        // ISO base media: HEIC/HEIF/MP4 all share this. Default to .heic for
+        // the common Apple case; the renderer can ignore what it can't decode.
+        "heic"
+    } else {
+        "bin"
+    }
+}
+
+/// Persist the thumbnail bytes to the cache and return the path. Errors are
+/// logged and treated as "no image": a card with no thumbnail still renders
+/// (using the neutral-icon fallback), so a flaky disk must not drop the link.
+fn write_preview_image(guid: &str, part_idx: i64, bytes: &[u8], mime: Option<&str>) -> Option<String> {
+    let dir = crate::store::preview_image_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log::warn!("preview dir {dir:?}: {e}");
+        return None;
+    }
+    let ext = preview_image_ext(bytes, mime);
+    let path = dir.join(format!("{guid}_{part_idx}.{ext}"));
+    match std::fs::write(&path, bytes) {
+        Ok(()) => Some(path.to_string_lossy().into_owned()),
+        Err(e) => {
+            log::warn!("write preview {path:?}: {e}");
+            None
+        }
+    }
+}
+
+/// URL the receiver should display / open. The `original_url` (what the sender
+/// actually typed) wins when present and not blank — clicking the card opens
+/// the *intended* link, not whatever redirect chain the sender's previewer
+/// followed. We fall back to `url` (the post-redirect canonical) when the
+/// original is missing, and to `None` when both are absent (degenerate).
+fn preview_url(data: &LPLinkMetadata) -> Option<String> {
+    if let Some(s) = original_url(data) {
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    canonical_url(data).filter(|s| !s.is_empty())
+}
+
+fn canonical_url(data: &LPLinkMetadata) -> Option<String> {
+    data.url.as_ref().map(|u| u.clone().into())
+}
+
+fn original_url(data: &LPLinkMetadata) -> Option<String> {
+    data.original_url.as_ref().map(|u| u.clone().into())
+}
+
+/// Pull the (rare) `image_metadata` size string into our i64 width/height
+/// fields. The size is "{w}x{h}" or "{w}×{h}" — best-effort, no fallback to
+/// decoding the image (we don't want a synchronous decode on the receive path).
+fn preview_dimensions(data: &LPLinkMetadata) -> (Option<i64>, Option<i64>) {
+    let Some(s) = data.image_metadata.as_ref().map(|m| m.size.clone()) else {
+        return (None, None);
+    };
+    parse_size_string(&s)
+}
+
+fn parse_size_string(s: &str) -> (Option<i64>, Option<i64>) {
+    // Common separators: "1200x630", "1200×630", "1200 X 630".
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c == '\u{00D7}' || c == 'x' || c == 'X' { 'x' } else { c })
+        .collect();
+    let mut parts = cleaned.split('x');
+    let w = parts.next().and_then(|p| p.trim().parse::<i64>().ok());
+    let h = parts.next().and_then(|p| p.trim().parse::<i64>().ok());
+    (w, h)
+}
+
+/// Build the `MessageLinkPreview` to persist for an inbound message, or `None`
+/// if the message carries no `link_meta`. The thumbnail blob is written to the
+/// cache here so the UI can read straight from disk later.
+fn extract_link_preview(guid: &str, lm: &LinkMeta) -> Option<MessageLinkPreview> {
+    let data = &lm.data;
+    let url = preview_url(data);
+    let original_url = original_url(data);
+    let title = data.title.clone();
+    let summary = data.summary.clone();
+    let is_placeholder = data.is_incomplete.unwrap_or(false);
+    let (image_width, image_height) = preview_dimensions(data);
+    // Use the substitute's mime when the sender gave us one; fall through to
+    // magic-byte sniffing for older senders / stripped payloads.
+    let mime = data
+        .image
+        .as_ref()
+        .map(|s| s.mime_type.as_str())
+        .filter(|m| !m.is_empty());
+    let image_path = preview_image_bytes(lm)
+        .and_then(|bytes| write_preview_image(guid, 0, bytes, mime));
+    Some(MessageLinkPreview {
+        message_guid: guid.to_string(),
+        part_idx: 0,
+        url,
+        original_url,
+        title,
+        summary,
+        image_path,
+        image_width,
+        image_height,
+        is_placeholder,
+    })
 }
 
 /// Phase D default: acknowledge inbound messages with Delivered receipts.

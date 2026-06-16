@@ -1,358 +1,432 @@
-# Plan: Inline link previews (rich URL cards) in the message timeline
+# Implementation spec: inline link previews (rich URL cards) in openbubbles-gtk
 
-## Goal
+> **For the implementing agent:** this is a complete, self-contained spec. Read all of it
+> before writing code. The architecture here is **deliberately different** from a naive
+> "fetch the URL and parse Open Graph tags" approach — for an iMessage client most of the
+> work is already done for you by rustpush, and fetching incoming links is a privacy bug,
+> not a feature. Sections marked **MUST** and **MUST NOT** are hard constraints; do not
+> "simplify" them away. Where a signature is uncertain, the spec says *verify against the
+> actual code* — do that, don't guess.
 
-When a message contains a URL, render a compact preview card directly under
-(or attached to) the bubble instead of a bare clickable link. The card shows
-the page's `og:title` / `og:description`, the site name, and the
-`og:image` thumbnail. Clicking the card (or the URL) opens the original
-link in the system browser. If we have no preview yet, show a
-"Loading…" placeholder and fill it in once the fetch returns.
+---
 
-## Why this is the right place to add it
+## 0. TL;DR
 
-* The URL→preview pipeline runs **on the tokio runtime** and writes to the
-  existing SQLite store. No new state has to live in the UI; the same
-  `populate_messages` / `reload_messages` path that already reacts to DB
-  changes picks the new card up for free.
-* Preview state is keyed by URL, not by message, so the same link shared
-  in five different chats is fetched and stored once. The fan-out dedup we
-  already do on `message.guid` (see `store/mod.rs::insert_message`) means
-  re-arrival of the same message doesn't re-fetch.
-* Keeping previews in the DB means the next launch (or scroll-back through
-  history) renders the card immediately from cache without going to the
-  network — same model as iMessage/Signal/Telegram link previews.
+There are two completely separate paths, and they share almost nothing:
 
-## Current state (recap)
+1. **Incoming links (do this first, it's the big win).** rustpush already fetches, decodes,
+   and hands you the sender-generated preview (title, summary, URL, and the thumbnail bytes)
+   on every received message via `NormalMessage.link_meta`. **You do not fetch anything.**
+   You persist what rustpush gave you and render a card. No network, no SSRF surface, no
+   privacy leak, no main-thread blocking.
 
-* `src/ui/mod.rs::bubble_label` already detects URLs and renders them as
-  Pango `<a>` markup via `text_to_markup` (the clickable-links change
-  just landed).
-* `message_body` builds a `gtk::Box` column: attachments → bubble
-  containing the text label.
-* `populate_messages` (and `build_message_widgets`) iterate over
-  `Vec<StoredMessage>` and append one `message_widget` per row into
-  `msg_container`.
-* Reloads happen through `Ui::reload_messages` (window-only, via
-  `messages_from`) and `populate_messages` rebuilds the whole window.
+2. **Outgoing links (do this second).** When the *local user* composes a message containing
+   a URL, generate the preview at send time: fetch the page once, populate an
+   `LPLinkMetadata`, attach it via `NormalMessage.link_meta`, and let rustpush ship it so
+   real iMessage peers also see a card. A real HTTP fetch belongs **only** here (plus an
+   optional fallback in §6).
 
-## Design
+The standalone HTTP fetcher + Open Graph parser is scoped to path 2 only. It is **not** the
+core mechanism.
 
-### 1. Data model — new table `link_preview`
+---
 
-Add to the `DDL` block in `src/store/mod.rs`, with a migration (`migrate`):
+## 1. Background: how iMessage link previews actually work
+
+iMessage rich links are generated **on the sender's device** (Apple's LinkPresentation
+framework produces an `LPLinkMetadata`: title, summary, image), and that metadata + the
+thumbnail are **transmitted as part of the message**. The recipient renders the embedded
+preview and **never fetches the URL itself**. Signal and WhatsApp do the same. Only naive
+clients fetch incoming links — doing so leaks the recipient's IP and read-timing to a
+sender-controlled server (a tracking-beacon / deanonymization primitive). We will not do that.
+
+rustpush implements the full Apple wire format for this — both decode (incoming) and encode
+(outgoing). Everything in §3 is already in the dependency; we are consuming it, not building it.
+
+---
+
+## 2. Non-negotiable constraints (read before coding)
+
+- **MUST NOT** auto-fetch URLs that arrive in *incoming* messages. Incoming previews come
+  from `link_meta` only. (Privacy. See §1.)
+- **MUST NOT** perform synchronous/blocking store reads on the GTK main thread during
+  render. The store is `tokio_rusqlite` (a channel hop to a worker). Per-card blocking
+  lookups during `populate_messages` cause jank and can deadlock the glib loop. Load preview
+  data **with the message**, in the existing async load, into an in-memory structure the
+  renderer reads synchronously. (See §5.3.)
+- **MUST NOT** call a blocking HTTP client (e.g. `ureq`) from inside a plain
+  `tokio::task::spawn` — that blocks a runtime worker. Use an async client (`reqwest`, which
+  is already a transitive dep) or `tokio::task::spawn_blocking`. Prefer `reqwest`. (See §6.)
+- **MUST** validate the SSRF guard at *connection* time and on *every redirect hop*, not once
+  up front. Resolve → reject private/loopback/link-local/CGNAT → connect to the validated IP.
+  A "resolve once then let the client reconnect" guard is TOCTOU and is bypassed by redirects.
+  (See §6.)
+- **MUST** treat an incoming embedded preview as the **sender's static snapshot**, keyed by
+  message, with no TTL and no re-fetch. Only *fetched* previews (path 2) get a URL-keyed TTL
+  cache. (See §4.)
+
+---
+
+## 3. What rustpush already gives you (the API surface)
+
+All types are re-exported from the crate root (`rustpush::...`); see `third_party/rustpush/src/lib.rs:47`.
+
+### 3.1 The message shape
+
+```rust
+// third_party/rustpush/src/imessage/messages.rs
+pub enum Message {
+    Message(NormalMessage),         // normal text/attachment/preview message
+    UpdateExtension(UpdateExtensionMessage), // balloon fill-in / update (see §5.4)
+    // ... reactions, edits, typing, etc.
+}
+
+pub struct NormalMessage {
+    pub parts: MessageParts,
+    pub service: MessageType,
+    pub app: Option<ExtensionApp>,
+    pub link_meta: Option<LinkMeta>,   // <-- THE URL PREVIEW LIVES HERE
+    // ... effect, reply_guid, subject, voice, scheduled, embedded_profile
+}
+
+pub struct LinkMeta {
+    pub data: LPLinkMetadata,
+    pub attachments: Vec<Vec<u8>>,     // raw image blobs, INLINE (already downloaded)
+}
+```
+
+### 3.2 The metadata
+
+```rust
+// third_party/rustpush/src/imessage/rawmessages.rs
+pub struct LPLinkMetadata {
+    pub title: Option<String>,
+    pub summary: Option<String>,                 // the "description"
+    pub url: Option<NSURL>,                       // canonical (post-redirect) URL
+    pub original_url: Option<NSURL>,             // what the sender typed
+    pub image: Option<RichLinkImageAttachmentSubstitute>,  // index into LinkMeta.attachments
+    pub icon:  Option<RichLinkImageAttachmentSubstitute>,
+    pub image_metadata: Option<LPImageMetadata>, // dimensions/type, NOT the bytes
+    pub icon_metadata:  Option<LPIconMetadata>,
+    pub is_incomplete: Option<bool>,             // placeholder marker (see §5.4)
+    pub specialization2: Option<LPSpecializationMetadata>, // tweet/Mastodon/Threads special-casing
+    // ... images, icons, version, flags
+}
+
+pub struct RichLinkImageAttachmentSubstitute {
+    pub rich_link_image_attachment_substitute_index: u64, // index into LinkMeta.attachments
+}
+```
+
+### 3.3 The critical gotcha: the thumbnail is inline bytes, indexed
+
+The preview image is **not** a normal MMCS attachment on the message. It is a raw blob inside
+`LinkMeta.attachments`, and `LPLinkMetadata.image` is a *substitute* that holds the index into
+that vec. rustpush already pulled the balloon body (via MMCS if it was large — that async step
+happens inside `MessageInst::from_raw`) so by the time you see the message the bytes are in hand.
+
+```rust
+fn preview_image_bytes(lm: &LinkMeta) -> Option<&[u8]> {
+    let idx = lm.data.image.as_ref()?.rich_link_image_attachment_substitute_index as usize;
+    lm.attachments.get(idx).map(|v| v.as_slice())   // PNG/JPEG bytes
+}
+```
+
+`NSURL` is a wrapper — **verify** how it exposes the string (likely a public field or a
+`Display`/`as_str`); extract the `String` for storage and for the open-on-click action.
+
+### 3.4 Decode is automatic
+
+Every received message passes through `MessageInst::from_raw`
+(`third_party/rustpush/src/imessage/aps_client.rs:300`). The URL-balloon branch
+(`messages.rs:2851`, bundle id `com.apple.messages.URLBalloonProvider`) ungzips the balloon,
+NSKeyed-unarchives it into a `RichLink`, and populates `link_meta`. **You do not call any of
+this.** You just read `nm.link_meta` on the message you already receive. The decode path emits
+`debug!("a".."e")` breadcrumbs and `error!("Error parsing url preview! {e}")` on failure — if a
+real link renders blank, those tell you which step failed.
+
+---
+
+## 4. Data model
+
+Two distinct stores. Do not conflate them.
+
+### 4.1 Embedded previews (incoming) — message-scoped, no TTL
+
+An embedded preview is the sender's snapshot, tied to a specific message. Store it next to the
+message, keyed by message id, **not** by URL. No expiry, no refetch.
+
+Simplest option — fold into the message store as a sidecar table (DDL in `src/store/mod.rs`,
+migration via `user_version`, matching the existing pattern):
+
+```sql
+CREATE TABLE message_link_preview(
+  message_guid TEXT NOT NULL,     -- FK to messages
+  part_idx     INTEGER NOT NULL,  -- which part/URL, if a message can have >1
+  url          TEXT,              -- LPLinkMetadata.url (or original_url)
+  title        TEXT,
+  summary      TEXT,
+  image_path   TEXT,              -- cached thumbnail file, or NULL
+  is_placeholder INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (message_guid, part_idx)
+);
+```
+
+Write the thumbnail bytes from `LinkMeta.attachments[idx]` into
+`$XDG_CACHE_HOME/openbubbles-gtk/previews/<message_guid>-<part_idx>.<ext>` and store the path.
+(You may instead store the bytes inline as a BLOB — fine for small thumbnails — but a file keeps
+the row small and matches how attachments are likely already handled. Match the existing pattern.)
+
+### 4.2 Fetched previews (outgoing + fallback) — URL-keyed, TTL
+
+This is the only place the original URL-keyed cache from the earlier plan survives:
 
 ```sql
 CREATE TABLE link_preview(
-  url          TEXT PRIMARY KEY,    -- normalized (lowercased scheme+host, no fragment)
+  url          TEXT PRIMARY KEY,  -- normalized
   title        TEXT,
   description  TEXT,
   site_name    TEXT,
-  image_path   TEXT,                -- local cached thumbnail (or NULL)
-  fetched_at   INTEGER NOT NULL,    -- unix ms; used for TTL
-  status       INTEGER NOT NULL,    -- 0 = ok, 1 = fetch failed, 2 = still pending
-  error        TEXT                 -- short reason, e.g. "timeout", "no title"
+  image_path   TEXT,
+  fetched_at   INTEGER NOT NULL,  -- unix ms; TTL
+  status       INTEGER NOT NULL,  -- 0 ok, 1 failed
+  error        TEXT
 );
-CREATE INDEX idx_link_preview_fetched ON link_preview(fetched_at);
 ```
 
-* `url` is the dedupe key. A second message sharing the same URL reuses
-  the same row.
-* `status` is what lets the UI distinguish "not tried yet" from "tried
-  and failed" — without it, on a cold start every URL would look like
-  "loading" again.
-* `image_path` points into a new cache directory under
-  `$XDG_CACHE_HOME/openbubbles-gtk/previews/<sha256(url)>` so the same
-  thumbnail is reused across messages and the DB holds only the
-  relative path. The store opens with that dir and exposes a helper
-  `preview_image_path_for(url) -> PathBuf`.
-* `fetched_at` carries a TTL (default 7 days) so a still-stale card can
-  be silently refreshed in the background; cards older than the TTL
-  also re-fetch the first time we render them.
+Bump `user_version` once (e.g. v4) and create both tables in the migration.
 
-Add `pub async fn get_link_preview(&self, url) -> Option<LinkPreview>`
-and `pub async fn upsert_link_preview(&self, &LinkPreview)` to
-`Store`. The async wrapper just calls a new sync `query_link_preview` /
-`upsert_link_preview` on the connection, matching the existing pattern.
+---
 
-In `model.rs`, add:
+## 5. Part A — Incoming previews (primary path)
+
+### 5.1 Ingest: rustpush message → store
+
+At the boundary where a rustpush `MessageInst` is converted into your `StoredMessage`
+(in `src/protocol/` — find the real rustpush-backed handler, not `stub.rs`), extract `link_meta`:
 
 ```rust
-pub struct LinkPreview {
-    pub url: String,
-    pub title: Option<String>,
-    pub description: Option<String>,
-    pub site_name: Option<String>,
-    pub image_path: Option<String>,
-    pub fetched_at: i64,
-    pub status: i64,
-    pub error: Option<String>,
+if let Message::Message(nm) = &inst.message {
+    if let Some(lm) = &nm.link_meta {
+        let url     = lm.data.url.as_ref().or(lm.data.original_url.as_ref())
+                         .map(/* NSURL -> String, verify accessor */);
+        let title   = lm.data.title.clone();
+        let summary = lm.data.summary.clone();
+        let is_placeholder = lm.data.is_incomplete.unwrap_or(false);
+
+        // thumbnail: inline bytes, indexed (see §3.3)
+        let image_path = preview_image_bytes(lm).map(|bytes| {
+            write_preview_image(&message_guid, part_idx, bytes) // -> cache path; sniff ext
+        });
+
+        store.upsert_message_link_preview(MessageLinkPreview {
+            message_guid, part_idx, url, title, summary, image_path, is_placeholder,
+        }).await?;
+    }
 }
 ```
 
-### 2. Fetcher — new module `src/preview.rs`
+Do this during the **async** receive/ingest, alongside however attachments and message rows are
+already persisted. Nothing here touches the GTK thread.
 
-A self-contained async module the tokio runtime can call from a
-`tokio::task::spawn`. Responsibilities:
+### 5.2 Load: batch, with the messages
 
-* **Normalize the URL.** Lowercase scheme + host, drop fragment, trim
-  trailing punctuation, drop default ports (`:80`, `:443`),
-  drop a trailing `?utm_*=…` set so tracking doesn't break dedupe.
-  The same canonical form is the DB key.
-* **HTML fetch (ureq).** `ureq` is already in `Cargo.lock` transitively
-  (pulled by `ksni`'s config tooling, see `Cargo.lock`). Use it directly:
-  * `GET` with a desktop `User-Agent` (stable, identifying the client
-    only by name + version — no user identifiers).
-  * 10 s connect timeout, 10 s read timeout.
-  * `Accept: text/html,application/xhtml+xml` and a hard cap of
-    **1 MiB** on the response body (drop the connection after).
-  * Follow up to **3 redirects**; on the next redirect to a different
-    host, follow it too. After that, stop.
-  * Treat anything outside `2xx` as a failure (`status=1`).
-  * Refuse to fetch non-HTTP(S) schemes and refuse to fetch hosts that
-    resolve to private/loopback/link-local IPs — small SSRF guard.
-    Cheap implementation: resolve with `std::net::ToSocketAddrs` once
-    on first hit and remember the verdict in a process-local `HashSet`;
-    bail if every address is in a private range.
-* **Parse `<meta>` and OG tags.** Hand-rolled — the OG spec is a few
-  dozen tags and a real HTML parser is a heavy dep. Use one `regex` to
-  pull every `<meta …>` and `<title>…</title>`, then look up by
-  `property` / `name`:
-  * `og:title`  → title
-  * `og:description` (or `description` / `twitter:description`)
-  * `og:site_name` (or derive from host)
-  * `og:image` / `og:image:url` / `twitter:image` → image URL
-  * `<title>…</title>` as a fallback
-  All values are HTML-entity-decoded (a small `decode_entities` fn
-  covering `&amp; &lt; &gt; &quot; &#39;` and `&#NNN;` / `&#xHH;`).
-  Truncate `title` to 200 chars and `description` to 400 chars.
-* **Image download.** If we have an image URL and it resolves
-  relative to the page (e.g. `/og.png`), resolve to absolute. Same
-  fetch caps as the page, plus: only accept `image/*` content-types
-  and only if the body is ≤ 4 MiB. Save to
-  `$XDG_CACHE_HOME/openbubbles-gtk/previews/<sha256(image_url)>` and
-  record the relative path in `image_path`. If the image fails, set
-  `image_path = NULL` but keep the text fields (so we still show a
-  card without a thumbnail).
-* **Result.** On success, `LinkPreview { status: 0, … }`. On any
-  failure, `status: 1` with `error: "timeout" | "no title" | "private
-  host" | …`. A row with `status: 1` is still cached — re-trying on
-  every render would hammer sites that 404'd once.
+When the UI loads a window of messages (the existing async `messages_from` / whatever feeds
+`populate_messages`), load their previews **in the same async pass** and hand the renderer an
+in-memory map:
 
-Add `pub async fn fetch(url: String) -> LinkPreview` and a single
-shared `pub static IN_FLIGHT: Lazy<Mutex<HashMap<String, …>>>` that
-keys on the normalized URL. Two renders of the same URL at the same
-time share one in-flight task instead of racing.
+```rust
+// async, off the GTK thread:
+let msgs = store.messages_from(...).await?;
+let guids: Vec<_> = msgs.iter().map(|m| m.guid.clone()).collect();
+let previews: HashMap<(String, i64), MessageLinkPreview> =
+    store.message_link_previews_for(&guids).await?;   // one query, WHERE message_guid IN (...)
+// pass `previews` into populate_messages
+```
 
-### 3. Wiring it into the render path
+The renderer then reads from `previews` synchronously — **no store call on the main thread.**
 
-`message_body` currently loops `m.attachments` then adds a text
-bubble. Extend it so that, **after** the text label, it appends a
-`link_preview_card(m, url)` widget per URL found in `body_text(m)`.
-The URL is the only thing we extract at render time — re-using the
-existing `URL_RE` (in `src/ui/mod.rs`) keeps regex construction cheap
-(`OnceLock<Regex>`), and we run it on `body_text(m)`, not the raw
-text, so the U+FFFC strip happens first.
+### 5.3 Render: the card widget
+
+Extend `message_body` in `src/ui/mod.rs`. After the existing text bubble, for each preview the
+message has, append a `link_preview_card(...)` built from the **already-loaded** `MessageLinkPreview`:
 
 ```text
-message_body(m, own)
-├── for each attachment: pic | file_chip
-├── bubble
-│   └── bubble_label(body_text(m))   // existing clickable links
-└── for each url in body_text(m):
-    └── link_preview_card(m, url)    // new
+message_body(m, own, &previews)
+├── (existing) attachments
+├── (existing) bubble -> bubble_label(body_text(m))   // clickable links already work
+└── for each preview of m:
+    └── link_preview_card(preview)                      // new; reads from in-memory data only
 ```
 
-`link_preview_card(url)` is a thin wrapper:
+`link_preview_card`:
+- A `gtk::Button` with a flat `.link-preview` CSS class; clicking opens `url` via the same
+  `open_uri` helper `bubble_label` already uses. Cursor `pointer`.
+- Layout: thumbnail on the left (rounded ~8px, ~72–80px, cover), then title (semibold, 1 line,
+  ellipsize end), summary (dim, ≤2 lines), and a host caption derived from `url`.
+- Thumbnail: decode the cached image to a texture. Prefer bytes/texture over `Texture::from_file`
+  to avoid a synchronous file decode on the main thread; if you store a path, load it on a worker
+  and set it when ready. **Verify** the exact gtk4-rs call:
+  ```rust
+  // from inline bytes (preferred if you kept them):
+  let texture = gdk::Texture::from_bytes(&glib::Bytes::from(bytes)).ok();
+  // or from a path via a background decode + gdk_pixbuf::Pixbuf, then Texture::for_pixbuf
+  ```
+- If `title`/`summary` are both absent (placeholder, §5.4) show a compact "loading preview…"
+  state instead of an empty card.
 
-1. Synchronously call `Store::get_link_preview(url)`. We are on the
-   GTK main thread, but the store is async; use the existing
-   `gtk_bridge::spawn` shape: fire-and-forget with an `on_done` that
-   updates the card. **However** that would re-render too late for a
-   scroll-into-view — so do it more directly: add a `Store::peek` /
-   `Store::get_cached` that reads via a `std::sync::mpsc::sync_channel`
-   inside the existing `tokio_rusqlite` connection, OR — simpler —
-   use the same `conn.call(|c| query_link_preview_blocking(c, url))`
-   pattern and run it inline on the main thread. The lookup is a
-   primary-key `SELECT` against SQLite; that's microseconds. Do that.
-2. Build the card widget:
-   * **Cached + success (status 0):** Title label (1 line, ellipsize
-     end, semibold), description label (≤ 2 lines, dim), site name
-     (`<sitename> · <host>`) in a caption style, thumbnail on the
-     left (rounded 8 px, 80×80 cover) if `image_path` resolves. The
-     whole card is a `gtk::Button` with the `flat`/`link-preview`
-     CSS class — clicking it opens the URL via the same `open_uri`
-     helper that `bubble_label` already uses. Cursor: `pointer`.
-   * **Cached + failure (status 1):** show the URL itself in dim
-     mono, no card chrome (or a "Couldn't load preview" footer).
-     Actually, the bubble already shows the URL clickably. Show a
-     *one-line* `caption` below it: `Couldn't load preview` (the
-     `error` string truncated). Don't take up card space.
-   * **Not cached (no row):** show a `gtk::Spinner` (16×16) in a
-     80×80 placeholder + a grey "Loading preview…" caption, with
-     the bubble's URL still the only clickable thing. As soon as
-     the fetch returns and `upsert_link_preview` runs, we want the
-     card to update.
-3. **Scheduling the fetch.** When we hit the "not cached" branch:
-   * Call `crate::preview::fetch(url.clone())` from inside
-     `gtk_bridge::spawn` — the fetch is `Send` and goes to the tokio
-     runtime.
-   * In the `on_done` closure, call `store.upsert_link_preview(p)`.
-     If `image_path` is `Some`, also `notify_preview_ready(url)` so
-     the in-flight widget can re-render itself.
-
-### 4. Live updates — turning a spinner into a card
-
-The naive way (`reload_messages`) flickers the scroll. Instead, hold
-a `HashMap<String, gtk::Widget>` of "card for this URL" on the
-`Ui` struct (next to the other `borrow` cells). When the fetch
-returns:
-
-* `upsert_link_preview` writes the DB row.
-* The on_done closure emits a `glib::Idle` task that walks
-  `msg_container` looking for cards whose `url` matches, removes
-  them, and re-runs `link_preview_card` against the just-inserted
-  row. The actual `link_preview_card` is cheap and reads the same
-  data we just wrote, so it can't race itself.
-
-This is a small extra method, `Ui::refresh_link_card(url: &str)`,
-called from the on_done. It walks `msg_container` once per URL, so
-the cost is bounded by `O(messages_loaded)`, not `O(visible_cards)`.
-
-### 5. Configurability
-
-Togglable via a `Settings` flag (Schemas/TBD), but for v1 we hardcode
-sensible defaults in `src/preview.rs` `const`s and read them from
-`crate::config` later. Defaults:
-
-| setting              | default | meaning                               |
-|----------------------|---------|---------------------------------------|
-| `max_body_bytes`     | 1 MiB   | HTML fetch cap                        |
-| `max_image_bytes`    | 4 MiB   | og:image cap                          |
-| `timeout`            | 10 s    | per request                           |
-| `max_concurrent`     | 8       | bounded by a `tokio::Semaphore`       |
-| `ttl_days`           | 7       | re-fetch rows older than this         |
-| `enabled`            | true    | user-visible toggle later             |
-
-`max_concurrent` is enforced by a `Semaphore::new(8)` in the spawn
-wrapper. With the typical chat volume (a few URLs in a message
-burst), we never hit it, but it bounds memory if a user opens a
-chat with hundreds of historical links.
-
-### 6. CSS additions to `CSS` in `src/ui/mod.rs`
+CSS to add to the `CSS` const in `src/ui/mod.rs` (theme-aware via `currentColor`):
 
 ```css
-.link-preview {
-  padding: 8px;
-  border-radius: 12px;
+.link-preview { padding: 8px; border-radius: 12px;
   border: 1px solid alpha(currentColor, 0.08);
-  background-color: alpha(currentColor, 0.03);
-}
+  background-color: alpha(currentColor, 0.03); }
 .link-preview:hover { background-color: alpha(currentColor, 0.06); }
-.link-preview-thumb {
-  border-radius: 8px;
-  background-color: alpha(currentColor, 0.08);
-  min-width: 72px; min-height: 72px;
-}
+.link-preview-thumb { border-radius: 8px; min-width: 72px; min-height: 72px;
+  background-color: alpha(currentColor, 0.08); }
 .link-preview-title { font-weight: 600; }
 .link-preview-desc  { color: alpha(currentColor, 0.65); }
 .link-preview-host  { color: alpha(currentColor, 0.55); font-size: 0.85em; }
-.link-preview-spinner { color: alpha(currentColor, 0.55); }
 ```
 
-The card itself is theme-aware because everything is `currentColor`
-relative.
+### 5.4 Lifecycle: placeholder → fill-in
 
-### 7. Test plan (parallel to the existing `#[cfg(test)]` blocks)
+iMessage often sends the balloon in **two stages**: a placeholder first
+(`LPLinkMetadata.is_incomplete == true` / `rich_link_is_placeholder`), then a fill-in once the
+sender's device finishes generating the real preview. The fill-in arrives as a separate message —
+likely `Message::UpdateExtension(UpdateExtensionMessage)` (`messages.rs:1614`) or a follow-up with
+the same guid. **Verify the exact mechanism** by logging received messages while you send yourself
+a test link.
 
-* `store::tests::link_preview_round_trip` — insert a preview, look it
-  up, confirm image_path normalization. Assert second insert with
-  same `url` overwrites, second insert with different `url` doesn't.
-* `preview::tests::normalize_url` — `https://Example.com/foo?utm_x=1`
-  and `HTTPS://example.com/foo` collapse; `https://example.com/foo#x`
-  loses the fragment.
-* `preview::tests::parse_meta` — feed a fixed HTML string with mixed
-  `og:*` / `twitter:*` / `<title>` / no-og and assert the right
-  fields get picked, the order is right, and HTML entities are
-  decoded.
-* `preview::tests::rejects_private_host` — point at `127.0.0.1` and
-  `192.168.0.1`, expect `status: 1` with `error: "private host"`.
-  Tests can use a stub resolver via a small trait indirection.
-* `preview::tests::truncates_title` — 10 000 char `og:title` is
-  clipped to 200.
-* `ui::tests::link_preview_card_renders_loading` (if we add a UI
-  test harness) — otherwise manual: send a message containing
-  `https://example.com`, confirm a spinner card appears, then a
-  populated card.
+Handle it:
+- Persist the placeholder (store `is_placeholder = 1`); render the compact loading state.
+- On the update, upsert the same `(message_guid, part_idx)` row with the real fields and refresh
+  the card **in place** (walk `msg_container`, find the card for that message/part, rebuild it from
+  the new stored row) — same in-place refresh the earlier plan wanted, now driven by a protocol
+  event instead of a fetch completing. Do **not** `reload_messages` (it flickers/jumps scroll).
 
-### 8. File-by-file change list
+---
 
-| file                   | change                                                     |
-|------------------------|------------------------------------------------------------|
-| `Cargo.toml`           | add `ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }` (already in lock as transitive — promote to direct). No new transitive deps if we hand-roll the meta parser. |
-| `src/store/mod.rs`     | new `link_preview` table + migration v4; new `query_link_preview_blocking` / `upsert_link_preview_blocking`; new `Store::get_link_preview` / `upsert_link_preview`; new `Store::preview_image_dir` returning the cache dir. |
-| `src/store/model.rs`   | add `pub struct LinkPreview`. |
-| `src/preview.rs` (new) | fetcher: `normalize_url`, `fetch`, `parse_meta`, `decode_entities`, `in_flight: Mutex<HashMap<...>>`, `Semaphore::new(8)`. |
-| `src/main.rs`          | `mod preview;`. |
-| `src/ui/mod.rs`        | (a) new `link_preview_card(url, &Store)` widget builder. (b) call it from `message_body` for each URL in `body_text(m)`. (c) `Ui::refresh_link_card(url)` to live-update after a fetch lands. (d) add the new CSS classes to the `CSS` const. (e) `Ui::link_cards: RefCell<HashMap<String, gtk::Widget>>` for the live-update map. |
-| `src/preview/tests.rs` (new) | the unit tests above; runs under `cargo test` without touching GTK. |
+## 6. Part B/C — Outgoing previews and the fetcher
 
-### 9. Migration safety
+### 6.1 When to fetch
 
-The store's `migrate` function runs `user_version` checks. New
-migration v4 just adds the table and the index. Existing DB files
-auto-upgrade on first open; no user action.
+Fetch **only** for (a) a URL the local user is sending, at send time, and (b) optionally, as an
+**opt-in** fallback for incoming messages that have *no* `link_meta` (e.g. SMS/RCS/stripped). The
+fallback must be off by default and clearly a user setting, because it reintroduces the incoming
+fetch/privacy exposure §1 warns about.
 
-### 10. Privacy / safety review
+### 6.2 Fetcher module `src/preview.rs`
 
-* HTML body and image bytes are written to the per-app cache dir
-  only; never re-served, never sent back to the protocol layer.
-* `User-Agent` identifies the app (`openbubbles-gtk/0.1`) but
-  carries no user identifiers. We do **not** add `Referer` headers.
-* Private IP guard means an attacker pasting `http://10.0.0.1/…`
-  in chat doesn't get used as an SSRF pivot when someone clicks
-  the message.
-* 1 MiB HTML / 4 MiB image caps + timeouts = a stuck `og:image`
-  download can never block a render or fill the disk.
-* A failed preview is cached as `status: 1`; we don't re-hit the
-  network on every scroll. The TTL refreshes it after 7 days so
-  transient outages self-heal.
-* We don't fetch from `localhost` even via redirect — the resolver
-  guard rejects loopback, link-local, and the CGNAT range
-  (`100.64.0.0/10`).
+- HTTP: **`reqwest`** (async; already in `Cargo.lock` transitively — promote to a direct dep).
+  Do **not** use `ureq` in a `tokio::spawn`.
+- Parse: extract `og:title` / `og:description` (fallback `twitter:*`, `<title>`, meta description),
+  `og:site_name` (fallback URL host), `og:image`. Use a real parser, not hand-rolled regex —
+  e.g. the `webpage` or `link-preview` crate (run their fetch on the tokio runtime or via
+  `spawn_blocking`), or `reqwest` + a lightweight HTML parser (`tl`) and pull the meta tags
+  yourself. Decode HTML entities properly (the parser handles this; a 5-entity hand-rolled
+  decoder is insufficient).
+- Caps: 1 MiB HTML body, 4 MiB image, 10s timeouts, follow ≤3 redirects **manually**.
+- **SSRF (MUST, see §2):** disable automatic redirects (`redirect::Policy::none()`); for each hop
+  resolve the host (`tokio::net::lookup_host`), reject if **any** resolved address is private,
+  loopback, link-local, or CGNAT (`100.64.0.0/10`), then pin the connection to a validated address
+  (`reqwest::ClientBuilder::resolve(host, validated_addr)`), set the `Host` header, and only then
+  GET. Re-run this on every redirect target. Also reject non-`http(s)` schemes.
+- Headers: a `User-Agent` that names the app only (`openbubbles-gtk/<version>`); **no** `Referer`,
+  no user identifiers.
+- Dedup: an in-flight `Lazy<Mutex<HashMap<String, ...>>>` keyed on the normalized URL; a
+  `tokio::Semaphore` to bound concurrency (~8).
+- Cache: write results to the §4.2 `link_preview` table; cache failures as `status = 1` so a
+  404 isn't re-hit every render; TTL-refresh after ~7 days.
+- Normalize URLs for the cache key: lowercase scheme+host, drop fragment, drop default ports,
+  strip `utm_*`.
 
-### 11. Rollout
+### 6.3 Sending the generated preview
 
-1. Land the `link_preview` table and `Store` accessors first — no
-   behaviour change. (`cargo test` covers the round-trip.)
-2. Land the fetcher behind a `preview::fetch` that's unused.
-   (`cargo test` covers parsing, normalization, private-host guard.)
-3. Wire `message_body` → `link_preview_card` reading from the cache
-   only. Nothing fetches yet, so behaviour is "show the URL
-   inline as before". (Manual smoke test: existing chats look the
-   same.)
-4. Wire the scheduler: cards with no cached row show the spinner
-   and spawn the fetch. (Manual: open a chat with a
-   never-seen-before URL; spinner → card in ~1 s. Old chats with
-   previously-rendered URLs render immediately because their rows
-   are already cached.)
-5. Wire live updates (`Ui::refresh_link_card`) so the spinner
-   becomes the card in place. (Manual: a chat with 5 fresh URLs
-   in one message — all 5 cards materialise in place, no scroll
-   jump.)
-6. Add the CSS, polish the layout, ship.
+Build the metadata yourself and let rustpush own the wire format (it archives a `RichLink` into the
+`URLBalloonProvider` balloon — `messages.rs:2236-2241`):
 
-### 12. Out of scope (deliberately)
+```rust
+let mut md = LPLinkMetadata::default(); // verify constructibility / required fields
+md.title = Some(fetched.title);
+md.summary = Some(fetched.description);
+md.url = Some(/* NSURL from the user's URL */);
+md.image = Some(RichLinkImageAttachmentSubstitute { rich_link_image_attachment_substitute_index: 0 });
+nm.link_meta = Some(LinkMeta { data: md, attachments: vec![image_bytes] });
+// send nm via the normal send path
+```
 
-* Per-domain rate limits / robots.txt (low signal, easy to add
-  later if abused).
-* YouTube/Twitter-specific embeds (the OG meta we get back is good
-  enough — no special-casing in v1).
-* Server-side previews (we don't have a server; we fetch from the
-  sender's link like every other client).
-* Card re-render on `text-scale` change. The current `apply_text_scale`
-  is per-widget; we'd re-run `link_preview_card` once per scale
-  change. Easy follow-up.
-* Caching previews across DB resets. Cache dir lives under
-  `XDG_CACHE_HOME` and survives an app uninstall — useful, not
-  dangerous.
+The `image` substitute index must point into the `attachments` vec you supply (symmetric to the
+decode in §3.3). If constructing `LPLinkMetadata` directly is awkward (many fields), **verify**
+whether rustpush exposes a higher-level helper; otherwise fill the fields you have and leave the
+rest `None`/default.
+
+---
+
+## 7. Tests
+
+- `store`: round-trip `message_link_preview` (insert, batch-load by guids, placeholder→fill-in
+  overwrite). Round-trip `link_preview` (URL-keyed, failure cached).
+- `preview` (pure, no network): URL normalization; OG/meta extraction from a fixed HTML fixture
+  (og / twitter / `<title>` / missing); **SSRF guard rejects** `127.0.0.1`, `10.0.0.1`,
+  `192.168.1.1`, `169.254.x`, `100.64.x` — inject a stub resolver so it's deterministic and offline;
+  title/summary truncation.
+- Incoming render: a synthetic `MessageLinkPreview` produces a card; a placeholder produces the
+  loading state; the fill-in replaces it in place.
+- Manual smoke: send yourself (from a real Messages client) a `https://github.com` link; confirm a
+  card with title + thumbnail appears with **no outbound HTTP** from the app (watch the network /
+  the absence of a `preview::fetch` call). Then compose a link locally and confirm a peer on real
+  iMessage sees a card.
+
+---
+
+## 8. Phased rollout (each phase independently shippable)
+
+1. **Schema + ingest, no UI.** Add both tables + migration; persist `link_meta` on receive. No
+   behaviour change. (`cargo test` covers store round-trips.)
+2. **Render incoming cards** from stored data via the batch-loaded map. Biggest visible win, zero
+   network. (Manual: existing chats with links now show cards; old chats too, once re-ingested.)
+3. **Placeholder/update refresh** in place (§5.4).
+4. **Outgoing generation** at send (§6.3) — links you send now carry previews to peers.
+5. **Fetcher + opt-in incoming fallback** (§6.2), behind a setting, default off.
+
+Stop after phase 3 and you already have a feature that matches macOS Messages for received links.
+
+---
+
+## 9. File-by-file change list
+
+| file | change |
+|------|--------|
+| `Cargo.toml` | promote `reqwest` to a direct dep (async, already transitive); add an OG/HTML parser (`webpage` / `link-preview` / `tl`) only when implementing §6. |
+| `src/store/mod.rs` | `message_link_preview` + `link_preview` tables; `user_version` migration; async accessors: `upsert_message_link_preview`, `message_link_previews_for(&[guid])` (batched), `get_link_preview`, `upsert_link_preview`; a `preview_image_dir()` helper. |
+| `src/store/model.rs` | `MessageLinkPreview` and `LinkPreview` structs. |
+| `src/protocol/<real backend>.rs` | extract `nm.link_meta` on receive, write thumbnail bytes to cache, upsert the message-scoped preview; handle the §5.4 update message. |
+| `src/ui/mod.rs` | `link_preview_card(&MessageLinkPreview)`; call it from `message_body` per preview using the batch-loaded map; in-place `refresh_link_card(message_guid, part_idx)`; new CSS in the `CSS` const; thread the `previews` map through `populate_messages`. |
+| `src/preview.rs` (new, phase 5/4) | async fetcher: normalize, fetch (`reqwest`, manual redirects), SSRF guard (resolve+validate+pin per hop), OG parse, image download, in-flight dedup, semaphore, TTL cache writes. |
+| `src/main.rs` | `mod preview;` (when added). |
+
+---
+
+## 10. Out of scope (v1)
+
+- robots.txt / per-domain rate limiting (add later if abused).
+- Special embeds for YouTube/Twitter/etc. beyond what `LPLinkMetadata.specialization2` already
+  carries.
+- Re-rendering cards on text-scale change (follow-up; current scaling is per-widget).
+- Server-side unfurling (there is no server in this path).
+
+---
+
+## 11. Acceptance criteria
+
+- A received iMessage containing a URL renders a card with the sender's title/summary/thumbnail,
+  and the app makes **zero** outbound HTTP requests to display it.
+- Scrolling a long history of link messages does not jank; there are **no** synchronous store
+  reads on the GTK main thread (previews are batch-loaded with the messages).
+- A placeholder preview upgrades to the full card in place without a scroll jump.
+- A URL composed and sent locally appears as a rich card to a recipient on real iMessage.
+- The SSRF unit tests pass offline, rejecting all private/loopback/link-local/CGNAT targets,
+  including via a redirect hop.
+- No code path fetches a URL that originated in an incoming message unless the user has explicitly
+  enabled the fallback setting.
