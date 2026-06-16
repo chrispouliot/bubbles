@@ -610,8 +610,9 @@ impl Ui {
         dialog.present(Some(&self.split));
     }
 
-    /// Reload the open chat messages so the new text scale takes effect.
+    /// Reload the open chat messages and sidebar so the new text scale takes effect.
     fn reload_open_chat_scaled(&self) {
+        self.reload_chats();
         if let Some(chat) = self.open_summary.borrow().as_ref() {
             self.reload_messages(chat.id, chat.is_group);
         }
@@ -1826,20 +1827,38 @@ fn apply_text_scale(w: &impl IsA<gtk::Widget>, base_pt: f64) {
 }
 
 /// A sidebar row: avatar + chat name + unread badge.
-fn chat_row(c: &ChatSummary, handles: &[String]) -> adw::ActionRow {
+fn chat_row(c: &ChatSummary, handles: &[String]) -> gtk::ListBoxRow {
     let title = chat_title(c, handles);
-    let row = adw::ActionRow::builder().title(&title).build();
-    row.set_activatable(true);
+    let row = gtk::ListBoxRow::new();
+    row.add_css_class("navigation-sidebar-row");
+
+    let box_ = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .margin_start(8)
+        .margin_end(16)
+        .margin_top(8)
+        .margin_bottom(8)
+        .build();
 
     let avatar = adw::Avatar::new(36, Some(&title), true);
-    row.add_prefix(&avatar);
+    avatar.set_hexpand(false);
+    box_.append(&avatar);
+
+    let title_label = gtk::Label::new(Some(&title));
+    title_label.set_hexpand(true);
+    title_label.set_xalign(0.0);
+    apply_text_scale(&title_label, 13.0);
+    box_.append(&title_label);
 
     if c.unread > 0 {
         let badge = gtk::Label::new(Some(&c.unread.to_string()));
         badge.add_css_class("unread-badge");
-        badge.set_valign(gtk::Align::Center);
-        row.add_suffix(&badge);
+        badge.set_hexpand(false);
+        box_.append(&badge);
     }
+
+    row.set_child(Some(&box_));
     row
 }
 
