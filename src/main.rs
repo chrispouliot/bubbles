@@ -3,6 +3,7 @@ mod protocol;
 mod runtime;
 mod setup;
 mod store;
+mod text_scale;
 mod tray;
 mod ui;
 mod window_state;

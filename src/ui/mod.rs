@@ -230,6 +230,7 @@ pub fn enter_messaging(
         .margin_top(10)
         .visible(false)
         .build();
+    apply_text_scale(&unread_pill, 11.0);
     unread_pill.add_css_class("osd");
     unread_pill.add_css_class("pill");
     unread_pill.add_css_class("unread-pill");
@@ -557,6 +558,38 @@ impl Ui {
         let dialog = adw::PreferencesDialog::new();
         let page = adw::PreferencesPage::new();
 
+        // --- Display: chat text size slider ---
+        let display = adw::PreferencesGroup::builder().title("Display").build();
+        let scale_row = adw::ActionRow::builder()
+            .title("Chat text size")
+            .build();
+        let slider = gtk::Scale::builder()
+            .adjustment(
+                &gtk::Adjustment::builder()
+                    .lower(0.5)
+                    .upper(2.0)
+                    .step_increment(0.1)
+                    .page_increment(0.5)
+                    .value(crate::text_scale::get())
+                    .build(),
+            )
+            .draw_value(true)
+            .digits(1)
+            .hexpand(true)
+            .build();
+        scale_row.add_prefix(&slider);
+        {
+            let ui = self.clone();
+            slider.connect_value_changed(move |s| {
+                let val = s.value();
+                crate::text_scale::set(val);
+                ui.reload_open_chat_scaled();
+            });
+        }
+        display.add(&scale_row);
+        page.add(&display);
+
+        // --- Account ---
         let account = adw::PreferencesGroup::builder().title("Account").build();
         let sign_out = gtk::Button::builder()
             .label("Sign Out")
@@ -575,6 +608,13 @@ impl Ui {
 
         dialog.add(&page);
         dialog.present(Some(&self.split));
+    }
+
+    /// Reload the open chat messages so the new text scale takes effect.
+    fn reload_open_chat_scaled(&self) {
+        if let Some(chat) = self.open_summary.borrow().as_ref() {
+            self.reload_messages(chat.id, chat.is_group);
+        }
     }
 
     fn confirm_sign_out(&self, prefs: &adw::PreferencesDialog) {
@@ -1732,6 +1772,7 @@ fn receipt_label(text: &str) -> gtk::Widget {
         .build();
     l.add_css_class("dim-label");
     l.add_css_class("caption");
+    apply_text_scale(&l, 9.0);
     l.upcast()
 }
 
@@ -1748,8 +1789,9 @@ fn unread_marker() -> gtk::Widget {
     let left = gtk::Separator::new(gtk::Orientation::Horizontal);
     left.set_hexpand(true);
     left.set_valign(gtk::Align::Center);
-    let lbl = gtk::Label::new(Some("New messages"));
+    let lbl = gtk::Label::builder().label("New messages").build();
     lbl.add_css_class("unread-marker");
+    apply_text_scale(&lbl, 10.0);
     let right = gtk::Separator::new(gtk::Orientation::Horizontal);
     right.set_hexpand(true);
     right.set_valign(gtk::Align::Center);
@@ -1764,6 +1806,25 @@ enum ScrollTo {
     Bottom,
     Value(f64),
     Widget(gtk::Widget),
+}
+
+/// Apply the current text scale to a widget's font via a per-widget CSS provider,
+/// if the scale differs from 1.0. No-op at scale 1.0 (avoids any overhead).
+fn apply_text_scale(w: &impl IsA<gtk::Widget>, base_pt: f64) {
+    let scale = crate::text_scale::get();
+    if (scale - 1.0).abs() <= f64::EPSILON {
+        return;
+    }
+    use gtk::prelude::*;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let class = format!("text-scale-{id}");
+    let css = format!(".{} {{ font-size: {}pt; }}", class, (base_pt * scale).round() * 10.0 / 10.0);
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(&css);
+    w.style_context()
+        .add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    w.add_css_class(&class);
 }
 
 /// A sidebar row: avatar + chat name + unread badge.
@@ -1831,6 +1892,7 @@ fn incoming_message(m: &StoredMessage, show_header: bool, is_group: bool, top: i
             .xalign(0.0)
             .build();
         name.add_css_class("sender-name");
+        apply_text_scale(&name, 11.0);
         col.append(&name);
     }
 
@@ -2036,13 +2098,15 @@ fn bubble_box(own: bool) -> gtk::Box {
 
 /// The wrapped, width-capped, left-justified text inside a bubble.
 fn bubble_label(text: &str) -> gtk::Label {
-    gtk::Label::builder()
+    let label = gtk::Label::builder()
         .label(text)
         .wrap(true)
         .xalign(0.0)
         .selectable(true)
         .max_width_chars(40)
-        .build()
+        .build();
+    apply_text_scale(&label, 12.0);
+    label
 }
 
 /// A small dim timestamp aligned to the bottom of a bubble.
@@ -2051,6 +2115,7 @@ fn time_label(m: &StoredMessage) -> gtk::Label {
     l.add_css_class("dim-label");
     l.add_css_class("caption");
     l.set_valign(gtk::Align::End);
+    apply_text_scale(&l, 9.0);
     l
 }
 
