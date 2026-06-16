@@ -59,6 +59,7 @@ pretty_env_logger = { version = "0.5", optional = true }
 rustls = { version = "0.23", features = ["ring"] }
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 log = "0.4"
+regex = "1"
 
 [build-dependencies]
 # build.rs only compiles the proto when CARGO_FEATURE_RUSTPUSH is set, so this

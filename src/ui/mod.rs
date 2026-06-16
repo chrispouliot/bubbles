@@ -9,9 +9,10 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Once, OnceLock};
 
 use adw::prelude::*;
+use regex::Regex;
 
 use crate::gtk_bridge;
 use crate::protocol::{Backend, Connection, ImClient, RecvEvent};
@@ -109,6 +110,71 @@ const CSS: &str = "
   animation: bubble-appear 0.2s ease-out;
 }
 ";
+
+/// Regex that matches URLs at word boundaries.
+static URL_RE: OnceLock<Regex> = OnceLock::new();
+
+fn url_re() -> &'static Regex {
+    URL_RE.get_or_init(|| {
+        Regex::new(r#"(?i)\b(?:https?://|www\.)[^\s<>'"{}\[\]()]+[^\s<>'"{}\[\]()\.,:;!?)]"#).unwrap()
+    })
+}
+
+/// Convert plain text containing URLs into Pango markup with clickable <a> tags.
+/// Non-URL text is escaped for markup safety.
+fn text_to_markup(text: &str) -> String {
+    let re = url_re();
+    let mut result = String::with_capacity(text.len() + 64);
+    let mut last_end = 0;
+    for m in re.find_iter(text) {
+        // Escape and append text before this URL
+        if m.start() > last_end {
+            result.push_str(&escape_markup(&text[last_end..m.start()]));
+        }
+        // Append the URL as a clickable link
+        let url = m.as_str();
+        result.push_str(&format!(
+            r#"<a href="{}">{}</a>"#,
+            escape_markup_attr(url),
+            escape_markup(url)
+        ));
+        last_end = m.end();
+    }
+    // Append any remaining text
+    if last_end < text.len() {
+        result.push_str(&escape_markup(&text[last_end..]));
+    }
+    result
+}
+
+/// Escape a string for safe inclusion inside Pango markup.
+fn escape_markup(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Escape a string for safe inclusion inside an XML attribute value.
+fn escape_markup_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Open a URI in the system browser.
+fn open_uri(uri: &str) {
+    use std::process::Command;
+    // Normalize www. prefixes to https:// so xdg-open handles them correctly.
+    let uri = if uri.starts_with("www.") && !uri.starts_with("http") {
+        format!("https://{uri}")
+    } else {
+        uri.to_string()
+    };
+    if let Err(e) = Command::new("xdg-open").arg(&uri).status() {
+        eprintln!("failed to open URI {}: {e}", uri);
+    }
+}
 
 /// Cheap-to-clone bundle the UI closures share.
 #[derive(Clone)]
@@ -2114,15 +2180,22 @@ fn bubble_box(own: bool) -> gtk::Box {
 }
 
 /// The wrapped, width-capped, left-justified text inside a bubble.
+/// URLs in the text are rendered as clickable links that open in the system browser.
 fn bubble_label(text: &str) -> gtk::Label {
+    let markup = text_to_markup(text);
     let label = gtk::Label::builder()
-        .label(text)
+        .label(&markup)
+        .use_markup(true)
         .wrap(true)
         .xalign(0.0)
         .selectable(true)
         .max_width_chars(40)
         .build();
     apply_text_scale(&label, 13.0);
+    label.connect_activate_link(|_, uri| {
+        open_uri(uri);
+        glib::Propagation::Stop // prevent default handler
+    });
     label
 }
 
