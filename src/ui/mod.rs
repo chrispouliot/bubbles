@@ -757,7 +757,7 @@ impl Ui {
                 inc_btn.set_sensitive(new_val < max);
                 // Apply the new size to the open chat (if any) so messages
                 // pick it up on the next render.
-                ui.reload_open_chat_scaled();
+                ui.reload_open_chat();
             }
         };
         dec_btn.connect_clicked({
@@ -773,6 +773,37 @@ impl Ui {
 
         display.add(&size_row);
         display.add(&preview_row);
+
+        // --- 24-hour clock switch ---
+        //
+        // A single Switch in the Display group. When on, chat-message timestamps
+        // render as "13:30"; when off (the default), "01:30 PM". Writes through
+        // to time_format::set on every toggle so the open chat (if any) picks
+        // up the new format on its next render via reload_open_chat.
+        let time_row = adw::ActionRow::builder()
+            .title("24-hour time")
+            .subtitle("Show message times as 13:30 instead of 01:30 PM")
+            .build();
+        let time_switch = gtk::Switch::builder()
+            .valign(gtk::Align::Center)
+            .active(matches!(crate::time_format::get(), crate::time_format::TimeFormat::H24))
+            .build();
+        time_row.add_suffix(&time_switch);
+        time_switch.connect_state_set({
+            let ui = self.clone();
+            move |_, active| {
+                let mode = if active {
+                    crate::time_format::TimeFormat::H24
+                } else {
+                    crate::time_format::TimeFormat::AmPm
+                };
+                crate::time_format::set(mode);
+                ui.reload_open_chat();
+                glib::Propagation::Proceed
+            }
+        });
+        display.add(&time_row);
+
         page.add(&display);
 
         // --- Account ---
@@ -796,8 +827,8 @@ impl Ui {
         dialog.present(Some(&self.split));
     }
 
-    /// Reload the open chat messages and sidebar so the new text scale takes effect.
-    fn reload_open_chat_scaled(&self) {
+    /// Reload the open chat messages and sidebar so the new preference takes effect.
+    fn reload_open_chat(&self) {
         self.reload_chats();
         if let Some(chat) = self.open_summary.borrow().as_ref() {
             self.reload_messages(chat.id, chat.is_group);
@@ -2925,10 +2956,7 @@ fn body_text(m: &StoredMessage) -> String {
 }
 
 fn fmt_time(ms: i64) -> String {
-    glib::DateTime::from_unix_local(ms / 1000)
-        .and_then(|dt| dt.format("%H:%M"))
-        .map(|s| s.to_string())
-        .unwrap_or_default()
+    crate::time_format::format_time(ms, crate::time_format::get())
 }
 
 fn pretty_addr(a: &str) -> String {
