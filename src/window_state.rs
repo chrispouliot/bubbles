@@ -53,53 +53,107 @@ pub fn install(win: &adw::ApplicationWindow) {
 
     let win = win.clone();
 
-    // --- resize handler (debounced) ---
     use std::cell::Cell;
     use std::rc::Rc;
 
+    // Last known client size, refreshed whenever the surface reports a resize.
     let state = Rc::new(Cell::new((0i32, 0i32)));
+    // Pending debounce timer id, so a drag coalesces into a single write.
+    let timer = Rc::new(Cell::new(None::<glib::SourceId>));
 
-    let st1 = state.clone();
-    win.connect_notify_local(Some("width"), move |win, _| {
-        let w = win.width();
-        let h = win.height();
-        if w <= 0 || h <= 0 {
-            return;
-        }
-        st1.set((w.max(300), h.max(300)));
-        let st = st1.clone();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
-            let (sw, sh) = st.get();
-            if read().as_ref().map(|(rw, rh)| (*rw, *rh)) != Some((sw, sh)) {
-                let _ = save(sw, sh);
+    // Record the current size and schedule a debounced save (300 ms).
+    let schedule: Rc<dyn Fn(i32, i32)> = {
+        let state = state.clone();
+        let timer = timer.clone();
+        Rc::new(move |w, h| {
+            if w < 300 || h < 300 {
+                return;
             }
-        });
-    });
-
-    let st2 = state.clone();
-    win.connect_notify_local(Some("height"), move |win, _| {
-        let w = win.width();
-        let h = win.height();
-        if w <= 0 || h <= 0 {
-            return;
-        }
-        st2.set((w.max(300), h.max(300)));
-        let st = st2.clone();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
-            let (sw, sh) = st.get();
-            if read().as_ref().map(|(rw, rh)| (*rw, *rh)) != Some((sw, sh)) {
-                let _ = save(sw, sh);
+            state.set((w, h));
+            // Cancel any pending write and reschedule, so only the final size
+            // of a drag burst is persisted.
+            if let Some(id) = timer.take() {
+                id.remove();
             }
-        });
-    });
+            let state = state.clone();
+            let timer_inner = timer.clone();
+            let id = glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+                timer_inner.set(None);
+                let (sw, sh) = state.get();
+                if read().as_ref().map(|(rw, rh)| (*rw, *rh)) != Some((sw, sh)) {
+                    save(sw, sh);
+                }
+            });
+            timer.set(Some(id));
+        })
+    };
 
-    // --- close handler (fires when tray hides the window, and on real quit) ---
-    win.connect_close_request(move |win| {
-        let (w, h) = (win.width().max(300), win.height().max(300));
-        if read().as_ref().map(|(rw, rh)| (*rw, *rh)) != Some((w, h)) {
-            let _ = save(w, h);
+    // --- resize handler (debounced 300 ms) ---
+    //
+    // `notify::width` / `notify::height` are *not* properties of GtkWindow, and
+    // `size-allocate` is a vfunc, not a GObject signal in GTK4 — so neither of
+    // the old approaches fired. The reliable hook is the toplevel `GdkSurface`'s
+    // `width`/`height` properties, which update on every step of a user drag.
+    // The surface exists only after the window is realized, so bind it on
+    // `realize` (or immediately if already realized).
+    let bind_surface: Rc<dyn Fn()> = {
+        let win = win.clone();
+        let schedule = schedule.clone();
+        Rc::new(move || {
+            let Some(surface) = win.surface() else { return; };
+            let sched1 = schedule.clone();
+            let win1 = win.clone();
+            surface.connect_notify_local(Some("width"), move |_, _| {
+                sched1(win1.width(), win1.height());
+            });
+            let sched2 = schedule.clone();
+            let win2 = win.clone();
+            surface.connect_notify_local(Some("height"), move |_, _| {
+                sched2(win2.width(), win2.height());
+            });
+        })
+    };
+    if win.is_realized() {
+        bind_surface();
+    } else {
+        let bind = bind_surface.clone();
+        win.connect_realize(move |_| {
+            bind();
+        });
+    }
+
+    // --- close handler (fires on tray-hide and user close; NOT on quit) ---
+    let st = state.clone();
+    let w1 = win.clone();
+    win.connect_close_request(move |_| {
+        // Prefer the live size; fall back to the last reported size.
+        let (cw, ch) = (w1.width(), w1.height());
+        let (w, h) = if cw >= 300 && ch >= 300 { (cw, ch) } else { st.get() };
+        if w >= 300
+            && h >= 300
+            && read().as_ref().map(|(rw, rh)| (*rw, *rh)) != Some((w, h))
+        {
+            save(w, h);
         }
         // Don't stop propagation — let tray.rs handle the hide.
         glib::Propagation::Proceed
     });
+
+    // --- quit handler (fires when the app exits, incl. app.quit()) ---
+    //
+    // `close-request` is NOT emitted on `app.quit()` (tray "Quit", session
+    // logout), so without this the size would be lost whenever the app quits
+    // instead of being hidden to the tray.
+    if let Some(app) = win.application() {
+        let st = state.clone();
+        app.connect_shutdown(move |_| {
+            let (w, h) = st.get();
+            if w >= 300
+                && h >= 300
+                && read().as_ref().map(|(rw, rh)| (*rw, *rh)) != Some((w, h))
+            {
+                save(w, h);
+            }
+        });
+    }
 }
