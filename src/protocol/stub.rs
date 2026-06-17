@@ -230,3 +230,99 @@ fn stub_nonce() -> u128 {
         .map(|d| d.as_nanos())
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_chat_ref() -> crate::store::ChatRef {
+        crate::store::ChatRef {
+            participants: vec!["mailto:a@icloud.com".into(), "mailto:b@icloud.com".into()],
+            display_name: None,
+            service: Some("iMessage".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_attachment_without_caption() {
+        let backend = StubBackend;
+        let client = ImClient::new(());
+        let connection = Connection::new(());
+        let chat = sample_chat_ref();
+        let my_handle = "tel:+15555550123";
+        let path = "/tmp/test.jpg".to_string();
+        let mime = "image/jpeg".to_string();
+        let name = "photo.jpg".to_string();
+        let guid = "guid-no-caption".to_string();
+
+        let result = backend
+            .send_attachment(
+                &client,
+                &connection,
+                &chat,
+                my_handle,
+                path,
+                mime,
+                name,
+                None,
+                guid.clone(),
+            )
+            .await
+            .expect("send_attachment should succeed");
+
+        assert_eq!(result.text, None, "text should be None when no caption is provided");
+        assert_eq!(result.attachments.len(), 1, "should have exactly one attachment");
+    }
+
+    #[tokio::test]
+    async fn send_attachment_with_caption() {
+        let backend = StubBackend;
+        let client = ImClient::new(());
+        let connection = Connection::new(());
+        let chat = sample_chat_ref();
+        let my_handle = "tel:+15555550123";
+        let path = "/tmp/document.pdf".to_string();
+        let mime = "application/pdf".to_string();
+        let name = "report.pdf".to_string();
+        let caption = "caption text".to_string();
+        let guid = "guid-with-caption".to_string();
+
+        let result = backend
+            .send_attachment(
+                &client,
+                &connection,
+                &chat,
+                my_handle,
+                path.clone(),
+                mime.clone(),
+                name.clone(),
+                Some(caption.clone()),
+                guid.clone(),
+            )
+            .await
+            .expect("send_attachment should succeed");
+
+        assert_eq!(
+            result.text, Some(caption),
+            "text should be Some(caption) when a caption is provided"
+        );
+        assert_eq!(result.attachments.len(), 1, "should have exactly one attachment");
+
+        let attachment = &result.attachments[0];
+        assert_eq!(
+            attachment.mime.as_ref(),
+            Some(&mime),
+            "attachment mime should match the passed mime"
+        );
+        assert_eq!(
+            attachment.name.as_ref(),
+            Some(&name),
+            "attachment name should match the passed name"
+        );
+        assert_eq!(
+            attachment.local_path.as_ref(),
+            Some(&path),
+            "attachment local_path should match the passed path"
+        );
+    }
+}
