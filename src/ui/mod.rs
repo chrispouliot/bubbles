@@ -315,6 +315,34 @@ pub fn enter_messaging(
     chat_list.add_css_class("navigation-sidebar");
     chat_list.set_selection_mode(gtk::SelectionMode::Single);
     chat_list.set_activate_on_single_click(true);
+
+    // Compose entry is hoisted out of the `compose` box so the chat-list and
+    // message-container click handlers can capture it and clear its own text
+    // selection when the user clicks elsewhere.
+    let entry = gtk::Entry::builder()
+        .hexpand(true)
+        .placeholder_text("Message")
+        .build();
+    // GTK's built-in emoji picker: a dim emoji glyph inside the entry (right
+    // side) that opens the chooser and inserts into the text — functional.
+    entry.set_show_emoji_icon(true);
+    // Gaining focus on the compose box is the reliable signal that the user
+    // just clicked into it (the entry's own GestureClick swallows the event
+    // for cursor placement, so a Bubble-phase gesture never sees it). Drop
+    // any in-progress text selection/cursor in the open message at that point.
+    let entry_focus = gtk::EventControllerFocus::new();
+    entry_focus.connect_enter(move |_ctrl| deselect_all_labels());
+    entry.add_controller(entry_focus);
+
+    // Clicking a chat row must drop any in-progress text selection/cursor in
+    // the open message, otherwise the highlight lingers while the user is
+    // jumping between chats. Also clear any text selection in the compose
+    // entry itself.
+    let entry_for_chat_list = entry.clone();
+    chat_list.connect_row_activated(move |_, _row| {
+        deselect_all_labels();
+        defocus_entry(&entry_for_chat_list);
+    });
     // Hamburger menu at the end of the sidebar header.
     let main_menu = gtk::gio::Menu::new();
     main_menu.append(Some("Preferences"), Some("menu.preferences"));
@@ -338,7 +366,36 @@ pub fn enter_messaging(
         .margin_top(8)
         .margin_bottom(8)
         .build();
+    // Click anywhere in the message area that ISN'T a selectable label's
+    // text — i.e. the bubble background, an attachment, empty timeline
+    // space — should drop the in-progress text selection and cursor. The
+    // label's internal textview consumes clicks on the text itself, so
+    // those clicks never reach this gesture and don't get spuriously cleared.
+    // Also clear any text selection the user has made inside the compose
+    // entry — they're now interacting with messages, not drafting one.
+    let entry_for_msg = entry.clone();
+    let msg_container_click = gtk::GestureClick::new();
+    msg_container_click.set_propagation_phase(gtk::PropagationPhase::Bubble);
+    msg_container_click.connect_released(move |_gesture, _n, _x, _y| {
+        deselect_all_labels();
+        defocus_entry(&entry_for_msg);
+    });
+    msg_container.add_controller(msg_container_click);
     let msg_scroller = scrolled(&msg_container);
+    // The container gesture above only sees clicks that hit the container
+    // or bubble up from its children. Clicks on the scrolled window's empty
+    // viewport (the chat-view background below all messages) target the
+    // viewport, not the container, so they never reach that gesture. This
+    // one catches them — same bubble phase, same handlers — so the entry
+    // selection clears no matter where in the chat view the user clicks.
+    let entry_for_scroller = entry.clone();
+    let msg_scroller_click = gtk::GestureClick::new();
+    msg_scroller_click.set_propagation_phase(gtk::PropagationPhase::Bubble);
+    msg_scroller_click.connect_released(move |_gesture, _n, _x, _y| {
+        deselect_all_labels();
+        defocus_entry(&entry_for_scroller);
+    });
+    msg_scroller.add_controller(msg_scroller_click);
 
     // Floating "more unread above" pill, layered over the timeline. Hidden until
     // a chat with not-yet-loaded unread messages is opened.
@@ -361,13 +418,8 @@ pub fn enter_messaging(
     let attach = gtk::Button::from_icon_name("text-x-generic-symbolic");
     attach.add_css_class("flat");
     attach.set_tooltip_text(Some("Attach a file"));
-    let entry = gtk::Entry::builder()
-        .hexpand(true)
-        .placeholder_text("Message")
-        .build();
-    // GTK's built-in emoji picker: a dim emoji glyph inside the entry (right
-    // side) that opens the chooser and inserts into the text — functional.
-    entry.set_show_emoji_icon(true);
+    // `entry` is created up top (right after `chat_list`) so the chat-list
+    // and message-container click handlers can reach it.
     let send = gtk::Button::from_icon_name("ob-send-symbolic");
     send.add_css_class("circular");
     send.add_css_class("suggested-action");
@@ -2291,6 +2343,127 @@ fn refresh_preview_css() {
     }
 }
 
+// All selectable text labels currently in the message timeline. Held as
+// weak refs so labels destroyed on a `populate_messages` rebuild are
+// silently skipped. Drives the "click outside the textbox clears the
+// highlight/cursor" behavior — the per-label `notify::cursor-position`
+// hook clears the *others* when the user clicks into a new label, and the
+// click handlers on the message container, chat list, and compose entry
+// clear *all* of them when the user clicks anywhere else.
+thread_local! {
+    static SELECTABLE_LABELS: RefCell<Vec<glib::WeakRef<gtk::Label>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Deselect every registered label. Sets the selection bounds to a single
+/// point at the current cursor (so any visible highlight disappears without
+/// jumping the caret), and yanks focus off the label if it currently holds
+/// it — that's what hides the blinking cursor. We only yank focus when the
+/// label is the focused widget, so this never steals focus from the compose
+/// entry the user is typing in.
+fn deselect_all_labels() {
+    SELECTABLE_LABELS.with(|labels| {
+        let mut labels = labels.borrow_mut();
+        labels.retain(|weak| {
+            if let Some(label) = weak.upgrade() {
+                clear_label_selection_and_cursor(&label);
+                true
+            } else {
+                false
+            }
+        });
+    });
+}
+
+/// Deselect every registered label except `active`. Used when the user
+/// clicks into a different label — the new one takes focus and the old one
+/// must drop both its selection and its blinking cursor. Does not touch
+/// focus, since the new active label needs it.
+fn deselect_all_labels_except(active: &gtk::Label) {
+    SELECTABLE_LABELS.with(|labels| {
+        let mut labels = labels.borrow_mut();
+        labels.retain(|weak| {
+            if let Some(label) = weak.upgrade() {
+                if !std::ptr::eq(label.as_ptr(), active.as_ptr()) {
+                    clear_label_selection_and_cursor(&label);
+                }
+                true
+            } else {
+                false
+            }
+        });
+    });
+}
+
+/// Drop the highlight on `label` (if any) and hide its cursor. A label that
+/// isn't focused has no visible cursor, so we skip the focus yank in that
+/// case — yanking focus from an unfocused label would steal it from the
+/// compose entry, which would be very rude while the user is typing.
+fn clear_label_selection_and_cursor(label: &gtk::Label) {
+    // Setting start == end at the current cursor position clears the
+    // selection while leaving the caret where the user put it; we then
+    // move focus off the label to hide the caret itself.
+    if label.selection_bounds().is_some() {
+        // Setting start == end collapses any highlight to a single point;
+        // the caret is then hidden by the focus yank below. We don't bother
+        // reading the current cursor position — the selection bounds (the
+        // visible highlight) is the only thing the user actually sees, and
+        // collapsing it to a point is enough to make it disappear.
+        label.select_region(0, 0);
+    }
+    if label.has_focus() {
+        if let Some(root) = label.root() {
+            root.set_focus(None::<&gtk::Widget>);
+        }
+    }
+}
+
+/// Register `label` so the click-outside handlers can find and clear it.
+/// Also wires up the per-label `notify::cursor-position` hook so that
+/// clicking *into* this label (the cursor moves here) automatically clears
+/// the previously-highlighted label.
+fn register_selectable_label(label: &gtk::Label) {
+    let weak = label.downgrade();
+    SELECTABLE_LABELS.with(|labels| {
+        labels.borrow_mut().push(weak);
+    });
+    // When the cursor moves in this label — i.e. the user just clicked on
+    // its text — the previously-focused label must give up its selection
+    // and cursor. The "give up" call is in `clear_label_selection_and_cursor`,
+    // which only yanks focus if the losing label was the one holding it.
+    let label_weak = label.downgrade();
+    label.connect_notify_local(Some("cursor-position"), move |_label, _pspec| {
+        if let Some(active) = label_weak.upgrade() {
+            deselect_all_labels_except(&active);
+        }
+    });
+}
+
+/// Drop focus from the compose `entry` and collapse any active text
+/// selection inside it. Called when the user clicks somewhere that isn't
+/// the entry — a message, the chat sidebar, the chat-view background — so
+/// the blue focus outline disappears and they don't come back to a stale
+/// highlight sitting in the draft they're about to overwrite. Yanking
+/// focus to NULL is the only way to hide the focus outline; a click on a
+/// non-focusable widget (like a Box or the scrolled viewport background)
+/// wouldn't otherwise change focus, so the entry would keep its outline.
+///
+/// Note: `entry.has_focus()` is NOT a reliable gate here. GTK4's
+/// `GtkEntry` delegates input focus to an internal `GtkText` child, so
+/// `has_focus()` on the entry itself returns `false` even when the entry
+/// is the visibly-focused widget. We always yank focus to NULL — it's
+/// safe to do so (a no-op when nothing is focused) and avoids the
+/// outline lingering after a background click.
+fn defocus_entry(entry: &gtk::Entry) {
+    // Collapse any text selection to a single point at the current cursor.
+    // The caret itself is hidden by the focus yank below.
+    let pos: i32 = gtk::glib::object::ObjectExt::property(entry, "cursor-position");
+    entry.select_region(pos, pos);
+    if let Some(root) = entry.root() {
+        root.set_focus(None::<&gtk::Widget>);
+    }
+}
+
 /// Build a small incoming-style chat bubble holding a sample sentence. The
 /// text uses [`PREVIEW_CLASS`] so its size is driven by the live CSS rule
 /// that `refresh_preview_css` rewrites on every +/- click. Styled to match
@@ -2843,6 +3016,9 @@ fn bubble_label(text: &str) -> gtk::Label {
         open_uri(uri);
         glib::Propagation::Stop // prevent default handler
     });
+    // Register for click-outside clearing and wire up the cursor-moved hook
+    // so clicking into this label drops the previous one's highlight + cursor.
+    register_selectable_label(&label);
     label
 }
 
