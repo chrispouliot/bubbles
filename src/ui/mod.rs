@@ -73,6 +73,11 @@ const CSS: &str = "
 .lightbox-dim {
   background-color: rgba(0, 0, 0, 0.8);
 }
+/* Empty-state illustration: double the default AdwStatusPage icon size
+   (128px) so the artwork reads as a proper hero graphic, not an icon. */
+statuspage.empty-hero > scrolledwindow > viewport > box > clamp > box > .icon {
+  -gtk-icon-size: 256px;
+}
 .unread-pill {
   padding: 4px 14px;
   font-size: 0.9em;
@@ -296,6 +301,9 @@ struct Ui {
     pending_chip: gtk::Box,
     pending_chip_label: gtk::Label,
     compose_outer: gtk::Box,
+    /// Swaps the content pane between the empty-state illustration (no chat
+    /// open) and the timeline + compose view.
+    content_stack: gtk::Stack,
 }
 
 /// Swap the window over to the messaging UI and start receiving. Called once a
@@ -472,9 +480,24 @@ pub fn enter_messaging(
     rename_button.set_tooltip_text(Some("Rename conversation"));
     rename_button.set_sensitive(false);
 
+    // Empty-state illustration shown in the content pane before any chat is
+    // opened. Sits behind the same content page as the timeline, swapped in via
+    // a Stack. In collapsed (narrow) mode the split view hides the content pane
+    // entirely until a chat is opened, so this only appears when both the
+    // sidebar and the content pane are visible — the side-by-side layout.
+    let empty_state = adw::StatusPage::builder()
+        .icon_name("empty-state")
+        .description("Pick a conversation from the sidebar to start messaging.")
+        .build();
+    empty_state.add_css_class("empty-hero");
+    let content_stack = gtk::Stack::new();
+    content_stack.add_named(&empty_state, Some("empty"));
+    content_stack.add_named(&msg_overlay, Some("chat"));
+    content_stack.set_visible_child_name("empty");
+
     let content_page = page(
         "Select a chat",
-        &msg_overlay,
+        &content_stack,
         Some(compose_outer.upcast_ref()),
         Some(rename_button.upcast_ref()),
     );
@@ -528,6 +551,7 @@ pub fn enter_messaging(
         pending_chip: pending_chip.clone(),
         pending_chip_label: pending_chip_label.clone(),
         compose_outer: compose_outer.clone(),
+        content_stack: content_stack.clone(),
     };
 
     // Sync the compose bar visibility with the split view's content panel.
@@ -627,10 +651,45 @@ pub fn enter_messaging(
         // during a rebuild.
         let was_at_bottom_c = was_at_bottom.clone();
         let ui_c = ui.clone();
+        let container_c = ui.msg_container.clone();
+        // Sticky-bottom re-pin, synchronously inside `changed`.
+        //
+        // Content height changes during a resize for height-for-width reasons —
+        // both message images *and* wrapped text labels reflow as the width
+        // crosses thresholds (a long message wrapping 1->2 lines is the same
+        // class of jitter as a photo's scaled height stepping up). GTK keeps
+        // the scroll value at its old absolute position across the reallocation:
+        // on a narrowing resize the content grows, so the old value is now too
+        // LOW (under-scrolled) and the newest message drops behind the input
+        // bar for one frame until something re-pins to the new bottom.
+        //
+        // We must re-pin in the SAME frame `changed` fires — deferring to an
+        // idle callback leaves that one under-scrolled frame painted (the
+        // "down then up" flicker). But we can't trust `adj.upper()` either: it
+        // can briefly hold the pre-re-measurement height, and pinning to a
+        // stale upper lands short the same way. So force a fresh measure of
+        // the container for the current width — `measure(width)` recomputes
+        // height-for-width immediately (wrapped labels return their new line
+        // count, pictures their new scaled height), giving the true content
+        // height now. This is the same trick `scroll_to` uses for the rebuild
+        // path. The EPS guard avoids a no-op set_value (and the value-changed
+        // it would emit) when already parked at the bottom.
         adj.connect_changed(move |a| {
             if !ui_c.settling.get() && was_at_bottom_c.get() {
-                let bottom = (a.upper() - a.page_size()).max(0.0);
-                a.set_value(bottom);
+                let page = a.page_size();
+                let width = container_c.width();
+                let content_h = if width > 0 {
+                    container_c.measure(gtk::Orientation::Vertical, width).1 as f64
+                } else {
+                    a.upper()
+                };
+                let bottom = (content_h - page).max(0.0);
+                if (a.value() - bottom).abs() > 0.5 {
+                    if content_h > a.upper() {
+                        a.set_upper(content_h);
+                    }
+                    a.set_value(bottom);
+                }
             }
         });
     }
@@ -1322,6 +1381,9 @@ impl Ui {
         self.rename_button.set_sensitive(true);
         self.split.set_show_content(true);
         self.compose_outer.set_visible(true);
+        // Drop the empty-state illustration now that a real conversation is
+        // loaded into the content pane.
+        self.content_stack.set_visible_child_name("chat");
         // Opening the chat means reading it — clear any pending notification.
         self.withdraw_chat_notification(chat.id);
 
