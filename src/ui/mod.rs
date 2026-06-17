@@ -700,17 +700,37 @@ pub fn enter_messaging(
     // Adaptive layout. Below the breakpoint the split collapses into a single
     // pane: the sidebar is the visible page, activating a chat pushes the chat
     // view over it, and the content header bar gets an automatic back button —
-    // the phone-style flow. Above it, the side-by-side split returns. We drive
-    // this from a BreakpointBin (rather than the window) so it works under both
-    // the real and demo windows without either needing to know about it.
+    // the phone-style flow. Above it, the side-by-side split returns.
+    //
+    // Sizing. AdwNavigationSplitView reports its uncollapsed natural width as
+    // `sidebar_nat + content_nat` (see measure_uncollapsed in libadwaita),
+    // where sidebar_nat is derived from content via `sidebar_width_fraction`.
+    // With our default 0.25 fraction and 180sp min_sidebar_width, that's
+    // ~180 + the widest message row — easily 560–610px once a chat with image
+    // attachments or max-width text bubbles is open. We size the BreakpointBin
+    // and the breakpoint threshold so the bin's allocation is *always* at least
+    // the active layout's natural width:
+    //   - collapsed natural ≈ max(sidebar page, content page) ≈ max chat row,
+    //     widest message row — bounded above by ~430px for typical chats.
+    //   - uncollapsed natural ≈ 180 + content ≈ 560–610px.
+    // Putting the breakpoint at 620sp keeps the split collapsed for any size
+    // where the uncollapsed natural would overflow the bin, and width_request
+    // of 440 sets the window minimum above the collapsed natural so we never
+    // clip the bottom of the phone-mode range either. AdwBreakpointBin forces
+    // its own minimum to 0 when breakpoints are present, so width_request is
+    // the only floor — set it carefully.
+    //
+    // We drive this from a BreakpointBin (rather than the window) so it works
+    // under both the real and demo windows without either needing to know
+    // about it.
     let bp_bin = adw::BreakpointBin::builder()
-        .width_request(360)
+        .width_request(440)
         .height_request(294)
         .child(&split)
         .build();
     let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
         adw::BreakpointConditionLengthType::MaxWidth,
-        500.0,
+        620.0,
         adw::LengthUnit::Sp,
     ));
     breakpoint.add_setter(&split, "collapsed", Some(&true.to_value()));
