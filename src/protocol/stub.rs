@@ -182,6 +182,7 @@ impl Backend for StubBackend {
         path: String,
         mime: String,
         name: String,
+        text: Option<String>,
         guid: String,
     ) -> Result<crate::store::IncomingMessage> {
         Ok(crate::store::IncomingMessage {
@@ -189,6 +190,7 @@ impl Backend for StubBackend {
             chat: chat.clone(),
             sender: Some(my_handle.to_string()),
             is_from_me: true,
+            text,
             date: 0,
             attachments: vec![crate::store::AttachmentRecord {
                 mime: Some(mime),

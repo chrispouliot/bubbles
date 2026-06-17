@@ -569,6 +569,7 @@ impl Backend for RustpushBackend {
         path: String,
         mime: String,
         name: String,
+        text: Option<String>,
         guid: String,
     ) -> Result<IncomingMessage> {
         use std::io::Seek;
@@ -591,7 +592,7 @@ impl Backend for RustpushBackend {
                 .await
                 .map_err(|e| anyhow::anyhow!("upload attachment: {e:?}"))?;
 
-        let mut normal = NormalMessage::new(String::new(), MessageType::IMessage);
+        let mut normal = NormalMessage::new(text.clone().unwrap_or_default(), MessageType::IMessage);
         normal.parts = MessageParts(vec![IndexedMessagePart {
             part: MessagePart::Attachment(attachment),
             idx: None,
@@ -613,6 +614,7 @@ impl Backend for RustpushBackend {
             chat: chat.clone(),
             sender: Some(my_handle.to_string()),
             is_from_me: true,
+            text,
             service: Some("iMessage".into()),
             date,
             attachments: vec![AttachmentRecord {

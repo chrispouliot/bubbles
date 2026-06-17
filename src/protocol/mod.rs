@@ -319,6 +319,8 @@ pub trait Backend: Send + Sync {
 
     /// Upload a file to MMCS and send it as an attachment. Returns the locally
     /// persistable record (with a cached `local_path`) on success.
+    /// `text` is the optional caption carried with the attachment.
+    #[allow(clippy::too_many_arguments)]
     async fn send_attachment(
         &self,
         client: &ImClient,
@@ -328,6 +330,7 @@ pub trait Backend: Send + Sync {
         path: String,
         mime: String,
         name: String,
+        text: Option<String>,
         guid: String,
     ) -> Result<IncomingMessage>;
 

@@ -1668,7 +1668,7 @@ impl Ui {
                         backend
                             .send_attachment(
                                 &client, &connection, &chat_ref, &my_handle, path_str, mime,
-                                name, guid,
+                                name, None, guid,
                             )
                             .await?;
                         Ok::<(), anyhow::Error>(())
