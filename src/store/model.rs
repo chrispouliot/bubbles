@@ -101,6 +101,7 @@ pub enum Ingest {
     /// `message_link_preview`, upserted on `(message_guid, part_idx)`.
     LinkPreview(MessageLinkPreview),
     /// A recognized-but-unstored control event; the &str names the variant.
+    #[allow(dead_code)]
     Ignored(&'static str),
 }
 
@@ -113,6 +114,7 @@ pub struct ChatSummary {
     pub display_name: Option<String>,
     pub is_group: bool,
     pub service: Option<String>,
+    #[allow(dead_code)]
     pub last_message_date: Option<i64>,
     pub participants: Vec<String>,
     pub unread: i64,
@@ -132,6 +134,7 @@ pub struct NewMessage {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct StoredMessage {
     pub id: i64,
     pub guid: String,
@@ -159,6 +162,7 @@ pub struct StoredAttachment {
     pub mime: Option<String>,
     pub name: Option<String>,
     pub local_path: Option<String>,
+    #[allow(dead_code)]
     pub is_sticker: bool,
 }
 
@@ -226,6 +230,7 @@ impl MessageLinkPreview {
 /// table, but the schema lives alongside `message_link_preview` in the same
 /// migration so the rollout is one atomic bump.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct LinkPreview {
     pub url: String,
     pub title: Option<String>,

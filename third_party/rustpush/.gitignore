@@ -1,0 +1,18 @@
+.idea
+/target
+/cloudkit-derive/target
+/cloudkit-proto/target
+/open-absinthe/target
+/config.json
+/config.plist
+/out
+/jniLibs
+/id_cache.plist
+/hwconfig.plist
+/anisette_test
+# NOTE: certs/fairplay/* is NOT ignored here. The build seeds placeholder
+# FairPlay certs (copies of the public certs/legacy-fairplay/fairplay.{crt,pem})
+# into certs/fairplay/ at the expected names so activation.rs can
+# include_bytes!() them at compile time. The real Apple keys are never present;
+# only these public placeholders ship in this vendored tree.
+/keystore/target

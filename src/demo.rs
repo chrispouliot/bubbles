@@ -9,8 +9,6 @@
 
 use std::sync::Arc;
 
-use adw::prelude::*;
-
 use crate::protocol::stub::StubBackend;
 use crate::protocol::{Backend, Connection, ImClient};
 use crate::runtime;

@@ -10,9 +10,9 @@ build = "build.rs"
 
 [features]
 # rustpush is on by default now: plain `cargo build`/`cargo run` uses the real
-# backend (needs the ../rustpush clone with seeded certs + protoc, per
-# setup-rustpush.sh). Use `--no-default-features` for the StubBackend path
-# (fast offline iteration, the verify harness, no protoc).
+# backend (the vendored third_party/rustpush tree with pre-seeded FairPlay
+# certs + protoc on PATH). Use `--no-default-features` for the StubBackend
+# path (fast offline iteration, the verify harness, no protoc).
 default = ["rustpush"]
 rustpush = [
     "dep:rustpush", "dep:keystore", "dep:prost", "dep:plist", "dep:rand",
@@ -36,9 +36,9 @@ anyhow = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 tokio-rusqlite = "0.5"
 
-# rustpush backend (only under --features rustpush). Path deps pointing at a
-# local clone where the FairPlay certs are seeded (git checkouts can't hold
-# the gitignored certs). Clone is pinned to a7fab47; see PHASE_A.md.
+# rustpush backend (only under --features rustpush). Vendored path deps under
+# third_party/rustpush (pinned to a7fab47) with FairPlay certs pre-seeded into
+# certs/fairplay/, so no clone or cert-seeding step is needed at build time.
 rustpush = { path = "third_party/rustpush", features = ["macos-validation-data", "remote-anisette-v3"], optional = true }
 keystore = { path = "third_party/rustpush/keystore", optional = true }
 

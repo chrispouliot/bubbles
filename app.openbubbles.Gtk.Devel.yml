@@ -1,10 +1,11 @@
 # Flatpak manifest for OpenBubbles GTK.
 #
 # This is set up for LOCAL builds (flatpak-builder --user), not Flathub: the
-# build step is allowed network access so it can clone rustpush, pull its
-# submodules, seed the FairPlay certs, and fetch crates. Flathub requires fully
-# offline/sandboxed builds (declared sources + vendored cargo), which is a
-# later step — see flatpak/README.md.
+# build step is allowed network access so it can fetch crates and download
+# protoc. rustpush is vendored under third_party/rustpush (with submodules and
+# pre-seeded FairPlay certs), so no build-time clone is needed. Flathub
+# requires fully offline/sandboxed builds (declared sources + vendored cargo),
+# which is a later step — see flatpak/README.md.
 app-id: app.openbubbles.Gtk.Devel
 
 # Match these to what you actually have installed:
@@ -33,10 +34,8 @@ finish-args:
 
 build-options:
   build-args:
-    - --share=network      # LOCAL ONLY: lets the build clone/fetch
+    - --share=network      # LOCAL ONLY: lets the build fetch crates + protoc
   append-path: /usr/lib/sdk/rust-stable/bin
-  env:
-    CARGO_NET_GIT_FETCH_WITH_CLI: '1'
 
 modules:
   - name: openbubbles-gtk
@@ -49,7 +48,6 @@ modules:
       - type: dir
         path: .
         skip:
-          - third_party     # build.sh clones rustpush fresh inside the sandbox
           - target
           - .cargo-home
           - .flatpak-builder

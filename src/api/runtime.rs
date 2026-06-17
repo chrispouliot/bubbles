@@ -12,6 +12,7 @@ use std::sync::LazyLock;
 use flexi_logger::{opt_format, Age, Cleanup, Criterion, FileSpec, Logger, Naming, WriteMode};
 use log::info;
 
+#[allow(dead_code)]
 pub static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     info!("creating runner");
     tokio::runtime::Builder::new_multi_thread()

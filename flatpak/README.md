@@ -48,23 +48,22 @@ Demo mode (no network/onboarding): `--env=OPENBUBBLES_DEMO=1`.
 
 1. downloads a prebuilt `protoc` (the freedesktop SDK has none; `build.rs`
    needs it for `mac_hw_info.proto`, and so does rustpush),
-2. clones rustpush at the pinned rev into `third_party/rustpush` (inside the
-   build dir, where the Cargo `path` dep expects it), syncs submodules, and
-   seeds the FairPlay certs that `activation.rs` `include_bytes!()`s at compile
-   time (logic inlined from `setup-rustpush.sh`),
-3. `cargo build --release` (rustpush is on by default),
-4. installs the binary, `.desktop`, icon, and metainfo into `/app`.
+2. `cargo build --release` (rustpush is on by default). rustpush is vendored
+   under `third_party/rustpush` in this repo — submodules (`apple-private-apis`,
+   `open-absinthe`, and `apple-private-apis/clearadi`) and the seeded FairPlay
+   certs (`certs/fairplay/`, copies of the public `certs/legacy-fairplay/`
+   placeholders) are committed, so there is no build-time clone or
+   cert-seeding step,
+3. installs the binary, `.desktop`, icon, and metainfo into `/app`.
 
 ## Going offline / Flathub (later)
 
-Flathub forbids network during build. To get there you'd:
+Flathub forbids network during build. rustpush is already vendored, so only
+two network uses remain: fetching crates and downloading `protoc`. To finish:
 
-- replace the `--share=network` build-arg by **vendoring**: run
+- replace the `--share=network` build-arg by vendoring crates: run
   `flatpak-cargo-generator.py Cargo.lock -o cargo-sources.json` and add those
-  sources, plus a `git` source for rustpush (pinned `a7fab47`) and its
-  submodules,
-- still reproduce the cert seeding as an offline build step (the certs ship in
-  rustpush's `certs/legacy-fairplay/`, so no network needed for that part),
+  sources (this also covers the one cargo git dep, `android-loader`),
 - vendor `protoc` as a `protobuf` module or an `extra-data` binary instead of
   curling it.
 

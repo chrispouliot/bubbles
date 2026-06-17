@@ -87,6 +87,7 @@ opaque_handle!(
 #[derive(Clone, Debug, Default)]
 pub struct DeviceInfo {
     pub name: String,
+    #[allow(dead_code)]
     pub serial: String,
     pub os_version: String,
 }
@@ -138,6 +139,7 @@ pub enum LoginState {
     /// An SMS code is now expected from the user.
     NeedsSms2FaVerification(VerifyBody),
     /// Apple requires an extra step (carries a human-readable description).
+    #[allow(dead_code)]
     NeedsExtraStep(String),
     /// Fully authenticated.
     LoggedIn,

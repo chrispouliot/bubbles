@@ -251,6 +251,10 @@ struct Ui {
     unread_pill: gtk::Button,
     // Compose entry, and outbound-typing bookkeeping: whether we currently have
     // a typing=true outstanding, and a generation guard for the idle-stop timer.
+    // `entry` is retained on the Ui for completeness but read-back happens via
+    // the per-handler clones captured at build time, so the field itself is
+    // unread — kept rather than dropped to avoid churning the struct layout.
+    #[allow(dead_code)]
     entry: gtk::Entry,
     typing_sent: Rc<Cell<bool>>,
     typing_idle_gen: Rc<Cell<u64>>,
@@ -2414,8 +2418,14 @@ fn apply_text_scale(w: &impl IsA<gtk::Widget>, base_pt: f64) {
     let css = format!(".{} {{ font-size: {:.2}pt; }}", class, base_pt + offset);
     let provider = gtk::CssProvider::new();
     provider.load_from_string(&css);
-    w.style_context()
-        .add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    // style_context() is deprecated since 4.10; add the provider at the
+    // display level instead. The CSS is scoped by a unique per-widget class
+    // name, so display-level application only ever styles this one widget.
+    gtk::style_context_add_provider_for_display(
+        &w.display(),
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
     w.add_css_class(&class);
 }
 

@@ -18,7 +18,6 @@ use std::sync::OnceLock;
 
 use adw::prelude::*;
 use gtk::gdk_pixbuf::PixbufLoader;
-use gtk::gdk_pixbuf::prelude::*;
 use ksni::blocking::TrayMethods;
 
 /// The app icon, embedded at compile time so the tray renders identically in

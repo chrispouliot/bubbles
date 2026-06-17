@@ -1,5 +1,11 @@
 //! Vendored onboarding subset of OpenBubbles rust/src/api/api.rs @ a7fab47, de-FRB'd.
 //! rustpush re-exports below were provided by the dropped mirrors include.
+// This module deliberately mirrors upstream's api.rs re-export surface. As a
+// binary crate we have no external consumer, so the `pub use` re-exports read
+// as unused imports here — silence them file-wide rather than surgically
+// trimming the mirror (which would make re-vendor painful).
+#![allow(unused_imports)]
+#![allow(dead_code)]
 
 pub mod runtime;
 use crate::api::runtime::init_logger;
@@ -427,7 +433,7 @@ pub async fn try_auth(path: String, conf: &JoinedOSConfig, conn: &APSConnection,
 
 pub async fn try_icloud_login(path: String, conf: &JoinedOSConfig, account: &Arc<Mutex<AppleAccount<DefaultAnisetteProvider>>>) -> anyhow::Result<Option<IDSUser>> {
     let pet = account.lock().await.get_pet();
-    if let Some(pet) = pet {
+    if let Some(_pet) = pet {
         info!("Here4");
         let identity = do_login(path, &account, None, conf).await?;
         info!("Here5");
@@ -445,11 +451,11 @@ pub async fn do_login(path: String, account: &Arc<Mutex<AppleAccount<DefaultAnis
 
     account.update_postdata("Apple Device", None, &["icloud", "imessage", "facetime"]).await?;
     
-    let Some(pet) = account.get_pet() else { return Err(anyhow!("No pet!")) };
+    let Some(_pet) = account.get_pet() else { return Err(anyhow!("No pet!")) };
     let Some(spd) = &account.spd else { return Err(anyhow!("No spd!")) };
 
     debug!("Got spd {:?}", spd);
-    let acname = spd.get("acname").ok_or(anyhow!("No acname!"))?.as_string().unwrap().to_string();
+    let _acname = spd.get("acname").ok_or(anyhow!("No acname!"))?.as_string().unwrap().to_string();
     let dsid = spd.get("DsPrsId").ok_or(anyhow!("No dsid!"))?.as_unsigned_integer().unwrap().to_string();
     let adsid = spd.get("adsid").ok_or(anyhow!("No adsid!"))?.as_string().unwrap();
     
@@ -530,7 +536,7 @@ pub async fn send_2fa_to_devices(state: &Arc<Mutex<AppleAccount<DefaultAnisetteP
     Ok((client_session, LoginState::Needs2FAVerification, sid))
 }
 
-pub async fn verify_2fa(path: String, client: &mut CircleClientSession<DefaultAnisetteProvider>, anisette: &ArcAnisetteClient<DefaultAnisetteProvider>, os_config: &JoinedOSConfig, account: &Arc<Mutex<AppleAccount<DefaultAnisetteProvider>>>, watcher: &mut broadcast::Receiver<APSMessage>, idms: &Arc<IdmsAuthListener>, code: String) -> anyhow::Result<(LoginState, Option<IDSUser>)> {
+pub async fn verify_2fa(path: String, client: &mut CircleClientSession<DefaultAnisetteProvider>, _anisette: &ArcAnisetteClient<DefaultAnisetteProvider>, os_config: &JoinedOSConfig, account: &Arc<Mutex<AppleAccount<DefaultAnisetteProvider>>>, watcher: &mut broadcast::Receiver<APSMessage>, idms: &Arc<IdmsAuthListener>, code: String) -> anyhow::Result<(LoginState, Option<IDSUser>)> {
     client.send_code(&code).await?;
 
     // todo add timeout
@@ -552,7 +558,7 @@ pub async fn verify_2fa(path: String, client: &mut CircleClientSession<DefaultAn
 
     let mut user = None;
     let pet = account.lock().await.get_pet();
-    if let Some(pet) = pet {
+    if let Some(_pet) = pet {
         let identity = do_login(path, &account, None, os_config).await?;
         user = Some(identity);
 
@@ -584,12 +590,12 @@ pub async fn send_2fa_sms(locked: Option<CircleClientSession<DefaultAnisetteProv
     Ok(account.send_sms_2fa_to_devices(phone_id).await?)
 }
 
-pub async fn verify_2fa_sms(path: String, account_mut: &Arc<Mutex<AppleAccount<DefaultAnisetteProvider>>>, anisette: &ArcAnisetteClient<DefaultAnisetteProvider>, config: &JoinedOSConfig, body: &VerifyBody, code: String) -> anyhow::Result<(LoginState, Option<IDSUser>)> {
+pub async fn verify_2fa_sms(path: String, account_mut: &Arc<Mutex<AppleAccount<DefaultAnisetteProvider>>>, _anisette: &ArcAnisetteClient<DefaultAnisetteProvider>, config: &JoinedOSConfig, body: &VerifyBody, code: String) -> anyhow::Result<(LoginState, Option<IDSUser>)> {
     let mut account = account_mut.lock().await;
     let mut login_state = account.verify_sms_2fa(code, body.clone()).await?;
 
     let mut user = None;
-    if let Some(pet) = account.get_pet() {
+    if let Some(_pet) = account.get_pet() {
         drop(account);
         let identity = do_login(path, &account_mut, None, config).await?;
         user = Some(identity);

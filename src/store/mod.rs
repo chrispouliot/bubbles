@@ -582,6 +582,10 @@ fn attach_to(c: &Connection, messages: &mut [StoredMessage]) -> rusqlite::Result
     Ok(())
 }
 
+/// Full-chat message list (ascending). Used by the unit tests below; in
+/// production the UI drives paged/windowed access (`messages_page`,
+/// `messages_from`) instead, so this whole-message helper is test-only.
+#[cfg(test)]
 pub fn query_messages(c: &Connection, chat_id: i64) -> rusqlite::Result<Vec<StoredMessage>> {
     let mut stmt = c.prepare(&format!(
         "SELECT {MSG_COLS}
@@ -717,10 +721,6 @@ impl Store {
     /// Inbound messages newer than `date`, for desktop notifications.
     pub async fn incoming_since(&self, date: i64) -> Result<Vec<NewMessage>> {
         Ok(self.conn.call(move |c| Ok(incoming_since(c, date)?)).await?)
-    }
-
-    pub async fn messages(&self, chat_id: i64) -> Result<Vec<StoredMessage>> {
-        Ok(self.conn.call(move |c| Ok(query_messages(c, chat_id)?)).await?)
     }
 
     /// One page of a chat's messages (ascending). `before` is the `(date, id)`
