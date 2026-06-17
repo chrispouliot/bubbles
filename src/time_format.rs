@@ -42,27 +42,52 @@ pub(crate) fn data_dir() -> PathBuf {
 
 /// Path to the time-format state file. `pub(crate)` for test access.
 pub(crate) fn state_path() -> PathBuf {
+    #[cfg(test)]
+    return data_dir().join(format!(
+        "time_format-{:?}.txt",
+        std::thread::current().id()
+    ));
+    #[cfg(not(test))]
     data_dir().join(STATE_FILE)
 }
 
 /// Read the saved time format, or [`DEFAULT`] if nothing is saved yet.
 pub fn get() -> TimeFormat {
-    // TODO: read state_path(), parse "0" → AmPm, "1" → H24, fallback DEFAULT
-    DEFAULT
+    let data = match std::fs::read_to_string(state_path()) {
+        Ok(d) => d,
+        Err(_) => return DEFAULT,
+    };
+    match data.trim() {
+        "1" => TimeFormat::H24,
+        _ => DEFAULT,
+    }
 }
 
 /// Save a time format to disk. Creates the parent directory if needed.
-pub fn set(_mode: TimeFormat) {
-    // TODO: write "0" or "1" to state_path()
+pub fn set(mode: TimeFormat) {
+    let path = state_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, match mode {
+        TimeFormat::AmPm => "0",
+        TimeFormat::H24 => "1",
+    });
 }
 
 /// Format a unix-epoch millisecond timestamp as a local-time clock string.
 ///
 /// - `AmPm`: `"%I:%M %p"` — leading zero on hour, e.g. "01:30 PM", "12:00 AM"
 /// - `H24`:   `"%H:%M"`   — leading zero on hour, e.g. "13:30", "00:00"
-pub fn format_time(_ms: i64, _mode: TimeFormat) -> String {
-    // TODO: use glib::DateTime::from_unix_local(ms / 1000).and_then(|dt| dt.format(...))
-    String::new()
+pub fn format_time(ms: i64, mode: TimeFormat) -> String {
+    let format_str = match mode {
+        TimeFormat::AmPm => "%I:%M %p",
+        TimeFormat::H24 => "%H:%M",
+    };
+    glib::DateTime::from_unix_local(ms / 1000)
+        .and_then(|dt| dt.format(format_str))
+        .map(|s| s.to_string())
+        .unwrap_or_default()
 }
 
 // --- tests ---
