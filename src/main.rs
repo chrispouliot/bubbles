@@ -4,6 +4,7 @@ mod runtime;
 mod setup;
 mod store;
 mod text_scale;
+mod time_format;
 mod tray;
 mod ui;
 mod window_state;
