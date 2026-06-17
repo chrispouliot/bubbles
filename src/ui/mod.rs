@@ -295,6 +295,7 @@ struct Ui {
     pending_attachment: Rc<RefCell<Option<PendingAttachment>>>,
     pending_chip: gtk::Box,
     pending_chip_label: gtk::Label,
+    compose_outer: gtk::Box,
 }
 
 /// Swap the window over to the messaging UI and start receiving. Called once a
@@ -461,6 +462,9 @@ pub fn enter_messaging(
         .build();
     compose_outer.append(&pending_chip);
     compose_outer.append(&compose);
+    // Hidden until a chat is opened — the compose bar only makes sense
+    // when the user is inside a conversation.
+    compose_outer.set_visible(false);
 
     // Rename action in the chat header; only meaningful with a chat open, so it
     // starts insensitive and open_chat enables it.
@@ -523,7 +527,19 @@ pub fn enter_messaging(
         pending_attachment: Rc::new(RefCell::new(None)),
         pending_chip: pending_chip.clone(),
         pending_chip_label: pending_chip_label.clone(),
+        compose_outer: compose_outer.clone(),
     };
+
+    // Sync the compose bar visibility with the split view's content panel.
+    // In collapsed (mobile) mode, pressing back hides the content panel —
+    // the compose bar should hide with it. In expanded mode this is a no-op
+    // because show-content stays true once open_chat sets it.
+    {
+        let compose_outer = compose_outer.clone();
+        split.connect_notify_local(Some("show-content"), move |split, _| {
+            compose_outer.set_visible(split.shows_content());
+        });
+    }
 
     // Open a chat when its row is activated.
     {
@@ -1253,6 +1269,7 @@ impl Ui {
         self.content_page.set_title(&chat_title(chat, &self.handles));
         self.rename_button.set_sensitive(true);
         self.split.set_show_content(true);
+        self.compose_outer.set_visible(true);
         // Opening the chat means reading it — clear any pending notification.
         self.withdraw_chat_notification(chat.id);
 
