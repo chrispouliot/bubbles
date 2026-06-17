@@ -117,7 +117,6 @@ const CSS: &str = "
   border: 1px solid alpha(currentColor, 0.08);
   background-color: alpha(currentColor, 0.03);
   min-width: 220px;
-  max-width: 360px;
 }
 .link-preview:hover {
   background-color: alpha(currentColor, 0.06);
