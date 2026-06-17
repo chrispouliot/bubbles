@@ -7,8 +7,12 @@ use gtk::glib;
 
 const STATE_FILE: &str = "text_scale.txt";
 const DEFAULT_OFFSET: f64 = 0.0;
-const MIN_OFFSET: f64 = -5.0;
-const MAX_OFFSET: f64 = 5.0;
+/// Minimum chat-text-size offset the UI is willing to step down to. Used
+/// by the +/- stepper to clamp and to disable the "-" button at the floor.
+pub const MIN_OFFSET: f64 = -5.0;
+/// Maximum chat-text-size offset the UI is willing to step up to. Used
+/// by the +/- stepper to clamp and to disable the "+" button at the ceiling.
+pub const MAX_OFFSET: f64 = 5.0;
 
 fn data_dir() -> PathBuf {
     glib::user_data_dir().join("openbubbles-gtk")

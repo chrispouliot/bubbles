@@ -673,35 +673,106 @@ impl Ui {
         let dialog = adw::PreferencesDialog::new();
         let page = adw::PreferencesPage::new();
 
-        // --- Display: chat text size slider ---
+        // --- Display: chat text size with a live sample-bubble preview ---
+        //
+        // The slider is gone. Two `circular` stepper buttons (– / +) walk the
+        // offset in whole points; a sample chat bubble below the row shows
+        // the chosen size in real time, so the user sees exactly what their
+        // messages will look like. The bubble updates via a single CSS rule
+        // on a stable class — no widget rebuild, no flash, no main-thread
+        // store call.
         let display = adw::PreferencesGroup::builder().title("Display").build();
-        let scale_row = adw::ActionRow::builder()
+
+        // Control row: title + stepper buttons.
+        let size_row = adw::ActionRow::builder()
             .title("Chat text size")
             .build();
-        let slider = gtk::Scale::builder()
-            .adjustment(
-                &gtk::Adjustment::builder()
-                    .lower(-5.0)
-                    .upper(5.0)
-                    .step_increment(1.0)
-                    .page_increment(2.0)
-                    .value(crate::text_scale::get())
-                    .build(),
-            )
-            .draw_value(true)
-            .digits(1)
-            .hexpand(true)
+
+        // The +/− stepper buttons. We hold a handle to each so we can
+        // disable the button that would push past the clamp. The tooltip
+        // names the step so the user can predict the change before clicking.
+        let dec_btn = gtk::Button::from_icon_name("value-decrease-symbolic");
+        dec_btn.add_css_class("circular");
+        dec_btn.set_tooltip_text(Some("Smaller text (–0.5 pt)"));
+        let inc_btn = gtk::Button::from_icon_name("value-increase-symbolic");
+        inc_btn.add_css_class("circular");
+        inc_btn.set_tooltip_text(Some("Larger text (+0.5 pt)"));
+
+        let stepper = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
             .build();
-        scale_row.add_prefix(&slider);
-        {
+        stepper.append(&dec_btn);
+        stepper.append(&inc_btn);
+        size_row.add_suffix(&stepper);
+
+        // Sample-bubble preview row. We build a tiny incoming-style bubble
+        // with a sentence of placeholder text. The text size mirrors the
+        // chat-text-size offset (base 13pt, same as a real bubble), updated
+        // via a single shared CSS provider (`preview_provider`).
+        let preview_row = adw::ActionRow::builder()
+            .title("Preview")
+            .build();
+        let preview_bubble = build_preview_bubble();
+        preview_row.add_suffix(&preview_bubble);
+
+        // Wire the buttons. Each click clamps to the model's range, writes
+        // the new value, refreshes the live preview, updates which buttons
+        // are enabled, and asks the open chat to redraw so the user sees
+        // the change in their messages too.
+        let min = crate::text_scale::MIN_OFFSET;
+        let max = crate::text_scale::MAX_OFFSET;
+        let refresh_buttons = {
+            let dec_btn = dec_btn.clone();
+            let inc_btn = inc_btn.clone();
+            move |val: f64| {
+                dec_btn.set_sensitive(val > min);
+                inc_btn.set_sensitive(val < max);
+            }
+        };
+        let apply = {
+            let dec_btn = dec_btn.clone();
+            let inc_btn = inc_btn.clone();
             let ui = self.clone();
-            slider.connect_value_changed(move |s| {
-                let val = s.value();
-                crate::text_scale::set(val);
+            move |delta: f64| {
+                // Add the step, round to 1 decimal to match the persistence
+                // format (`{:.1}`) and avoid float drift across many clicks
+                // (e.g. starting from 0.1, +0.5 yields 0.6 in math but
+                // 0.6000000000000001 in IEEE 754). Clamp after rounding so
+                // the disabled-button state reflects the post-clamp value.
+                let stepped = crate::text_scale::get() + delta;
+                let rounded = (stepped * 10.0).round() / 10.0;
+                let new_val = rounded.clamp(
+                    crate::text_scale::MIN_OFFSET,
+                    crate::text_scale::MAX_OFFSET,
+                );
+                if (new_val - crate::text_scale::get()).abs() < 1e-9 {
+                    return;
+                }
+                crate::text_scale::set(new_val);
+                // Refresh the bubble's font size in place. The CSS class
+                // is stable; we just rewrite the rule.
+                refresh_preview_css();
+                dec_btn.set_sensitive(new_val > min);
+                inc_btn.set_sensitive(new_val < max);
+                // Apply the new size to the open chat (if any) so messages
+                // pick it up on the next render.
                 ui.reload_open_chat_scaled();
-            });
-        }
-        display.add(&scale_row);
+            }
+        };
+        dec_btn.connect_clicked({
+            let apply = apply.clone();
+            move |_| apply(-0.5)
+        });
+        inc_btn.connect_clicked(move |_| apply(0.5));
+        // Initial state: enable/disable buttons based on the loaded value,
+        // and push the current value into the preview CSS so it reflects the
+        // already-persisted preference on first open.
+        refresh_buttons(crate::text_scale::get());
+        refresh_preview_css();
+
+        display.add(&size_row);
+        display.add(&preview_row);
         page.add(&display);
 
         // --- Account ---
@@ -2042,6 +2113,86 @@ fn apply_text_scale(w: &impl IsA<gtk::Widget>, base_pt: f64) {
     w.style_context()
         .add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     w.add_css_class(&class);
+}
+
+/// CSS class assigned to the live chat-text-size preview bubble in the
+/// preferences dialog. Stable across value changes so we can rewrite the
+/// rule in place instead of stacking providers.
+const PREVIEW_CLASS: &str = "text-scale-preview";
+
+/// The one and only CSS provider that drives the live preview. Registered
+/// for the display exactly once (the first time the preferences dialog is
+/// opened); `refresh_preview_css` just rewrites the rule on the same
+/// provider across subsequent opens. `gtk::CssProvider` isn't `Send + Sync`
+/// so we can't stash it in a global `OnceLock`; instead we keep it on the
+/// main thread via `Rc<RefCell<Option<_>>>` and initialize it on first use.
+/// This guarantees we only ever register one provider for the preview
+/// class, no matter how many times the dialog is opened.
+fn preview_provider_cell() -> Rc<RefCell<Option<gtk::CssProvider>>> {
+    thread_local! {
+        static CELL: std::cell::OnceCell<Rc<RefCell<Option<gtk::CssProvider>>>> = std::cell::OnceCell::new();
+    }
+    CELL.with(|c| {
+        c.get_or_init(|| {
+            let cell: Rc<RefCell<Option<gtk::CssProvider>>> = Rc::new(RefCell::new(None));
+            let provider = gtk::CssProvider::new();
+            if let Some(display) = gtk::gdk::Display::default() {
+                gtk::style_context_add_provider_for_display(
+                    &display,
+                    &provider,
+                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                );
+            }
+            *cell.borrow_mut() = Some(provider);
+            cell
+        })
+        .clone()
+    })
+}
+
+/// Rewrite the rule on `PREVIEW_CLASS` to reflect the current offset, using
+/// the same 13pt base a real incoming bubble's `body_text` uses. Cheap: it
+/// just swaps the rule on the existing provider. The widget is never
+/// rebuilt, so the change shows up on the very next paint.
+fn refresh_preview_css() {
+    let offset = crate::text_scale::get();
+    let css = format!(
+        ".{} {{ font-size: {:.2}pt; }}",
+        PREVIEW_CLASS,
+        13.0 + offset
+    );
+    // Clone the Rc so the borrow on the RefCell ends before the load call:
+    // we only need a short-lived reference to the provider.
+    let provider = preview_provider_cell().borrow().clone();
+    if let Some(p) = provider {
+        p.load_from_string(&css);
+    }
+}
+
+/// Build a small incoming-style chat bubble holding a sample sentence. The
+/// text uses [`PREVIEW_CLASS`] so its size is driven by the live CSS rule
+/// that `refresh_preview_css` rewrites on every +/- click. Styled to match
+/// the real `bubble-in` so the preview is a faithful "what my chats will
+/// look like" sample rather than a generic text box.
+fn build_preview_bubble() -> gtk::Widget {
+    let bubble = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .build();
+    bubble.add_css_class("bubble");
+    bubble.add_css_class("bubble-in");
+    // Cap the bubble width so the preview stays compact even at large
+    // text sizes — matches the cap on real bubbles so the comparison is
+    // honest, not just a wide textarea.
+    bubble.set_size_request(160, -1);
+    let label = gtk::Label::builder()
+        .label("The quick brown fox jumps over the lazy dog.")
+        .wrap(true)
+        .xalign(0.0)
+        .max_width_chars(28)
+        .build();
+    label.add_css_class(PREVIEW_CLASS);
+    bubble.append(&label);
+    bubble.upcast()
 }
 
 /// A sidebar row: avatar + chat name + unread badge.
