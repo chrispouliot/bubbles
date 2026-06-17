@@ -587,18 +587,50 @@ pub fn enter_messaging(
     }
 
     // Load the previous page when the user scrolls near the top (ignoring the
-    // transient resets a rebuild produces while it settles).
+    // transient resets a rebuild produces while it settles). The same handler
+    // also tracks whether the viewport is parked at the bottom of the chat,
+    // which the sticky-bottom logic below uses to keep the latest message
+    // visible across viewport-size changes (window resize, sidebar collapse)
+    // without yanking the user away from older history they're reading.
     {
         let ui = ui.clone();
         let adj = msg_scroller.vadjustment();
+        let was_at_bottom = Rc::new(Cell::new(false));
+
+        // value-changed: refresh the parked flag and run the existing
+        // pagination check (which is suppressed during rebuild settles).
+        let was_at_bottom_v = was_at_bottom.clone();
+        let ui_v = ui.clone();
         adj.connect_value_changed(move |a| {
-            if ui.settling.get() {
+            // 8px of slop for sub-pixel jitter — anything further means the
+            // user deliberately scrolled up to read; not "at the bottom".
+            let at_bot = a.value() >= a.upper() - a.page_size() - 8.0;
+            was_at_bottom_v.set(at_bot);
+
+            if ui_v.settling.get() {
                 return;
             }
             // Only a genuine near-top with real scrollback counts — a transient
             // reset during a rebuild collapses upper to the viewport and is ignored.
             if a.value() <= 64.0 && a.upper() > a.page_size() + 4.0 {
-                ui.maybe_load_older();
+                ui_v.maybe_load_older();
+            }
+        });
+
+        // changed (fires when lower/upper/page-size/step change): sticky-bottom
+        // snap. GTK preserves the absolute scroll value when the viewport is
+        // reallocated, so a content height that grew under it (reflow on a
+        // narrower window, or the sidebar collapsing into a single pane and
+        // expanding the content view) leaves the bottom of the viewport cut
+        // off below the visible area. Re-snap to the new bottom iff we were
+        // parked there and we're not mid-rebuild — scroll_to owns positioning
+        // during a rebuild.
+        let was_at_bottom_c = was_at_bottom.clone();
+        let ui_c = ui.clone();
+        adj.connect_changed(move |a| {
+            if !ui_c.settling.get() && was_at_bottom_c.get() {
+                let bottom = (a.upper() - a.page_size()).max(0.0);
+                a.set_value(bottom);
             }
         });
     }
