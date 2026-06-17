@@ -1,6 +1,0 @@
-Implemented: Wired time_format into preferences dialog and applied it to message timestamps
-Changed files: [src/ui/mod.rs]
-Validation: cargo build — OK | cargo clippy — 0 new warnings in src/ui/mod.rs | cargo test time_format — 11/11
-Reload-method decision: renamed — `reload_open_chat_scaled` → `reload_open_chat` (only 2 callsites; the method reloads both sidebar and messages for any preference change, not just text scale)
-Open risks: none
-Recommended next step: final review, ready for orchestrator integration check
