@@ -288,6 +288,14 @@ struct Ui {
     // and replace it on a placeholder→fillin without rebuilding the whole
     // timeline. Cleared on every `populate_messages` rebuild.
     preview_cards: Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
+    // File the user has picked but not yet sent. While `Some`, the compose
+    // area shows a chip with the file name + a remove button. Either path —
+    // typing a caption and pressing send, or pressing send with an empty
+    // entry — clears this and dispatches backend.send_attachment with the
+    // entry text (or None when the entry is empty).
+    pending_attachment: Rc<RefCell<Option<PendingAttachment>>>,
+    pending_chip: gtk::Box,
+    pending_chip_label: gtk::Label,
 }
 
 /// Swap the window over to the messaging UI and start receiving. Called once a
@@ -377,6 +385,32 @@ pub fn enter_messaging(
     compose.append(&entry);
     compose.append(&send);
 
+    // Pending-attachment chip row: icon + file name + close button.
+    let pending_chip = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_start(8)
+        .margin_end(8)
+        .margin_top(4)
+        .margin_bottom(0)
+        .visible(false)
+        .build();
+    pending_chip.append(&gtk::Image::from_icon_name("text-x-generic-symbolic"));
+    let pending_chip_label = gtk::Label::new(None);
+    pending_chip.append(&pending_chip_label);
+    let pending_chip_close = gtk::Button::from_icon_name("window-close-symbolic");
+    pending_chip_close.add_css_class("flat");
+    pending_chip_close.set_valign(gtk::Align::Center);
+    pending_chip.append(&pending_chip_close);
+
+    // Outer vertical box: chip row above the compose bar.
+    let compose_outer = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(0)
+        .build();
+    compose_outer.append(&pending_chip);
+    compose_outer.append(&compose);
+
     // Rename action in the chat header; only meaningful with a chat open, so it
     // starts insensitive and open_chat enables it.
     let rename_button = gtk::Button::from_icon_name("document-edit-symbolic");
@@ -386,7 +420,7 @@ pub fn enter_messaging(
     let content_page = page(
         "Select a chat",
         &msg_overlay,
-        Some(compose.upcast_ref()),
+        Some(compose_outer.upcast_ref()),
         Some(rename_button.upcast_ref()),
     );
 
@@ -435,6 +469,9 @@ pub fn enter_messaging(
         notified_chats: Rc::new(RefCell::new(HashSet::new())),
         notify_swept: Rc::new(Cell::new(false)),
         preview_cards: Rc::new(RefCell::new(std::collections::HashMap::new())),
+        pending_attachment: Rc::new(RefCell::new(None)),
+        pending_chip: pending_chip.clone(),
+        pending_chip_label: pending_chip_label.clone(),
     };
 
     // Open a chat when its row is activated.
@@ -456,6 +493,12 @@ pub fn enter_messaging(
     {
         let ui = ui.clone();
         rename_button.connect_clicked(move |_| ui.prompt_rename());
+    }
+
+    // Close button on the pending-attachment chip clears it.
+    {
+        let ui = ui.clone();
+        pending_chip_close.connect_clicked(move |_| ui.clear_pending_attachment());
     }
 
     // Sidebar hamburger menu actions ("menu" group, resolved via the split).
@@ -516,7 +559,7 @@ pub fn enter_messaging(
         entry.connect_changed(move |e| ui.note_typing_activity(!e.text().trim().is_empty()));
     }
 
-    // Attach: open the system file picker, then upload + send the chosen file.
+    // Attach: open the system file picker, then set a pending attachment.
     {
         let ui = ui.clone();
         attach.connect_clicked(move |btn| {
@@ -528,7 +571,16 @@ pub fn enter_messaging(
             dialog.open(win.as_ref(), gtk::gio::Cancellable::NONE, move |res| {
                 if let Ok(file) = res {
                     if let Some(path) = file.path() {
-                        ui.send_file(path);
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "file".to_string());
+                        let mime = guess_mime(&name);
+                        ui.set_pending_attachment(PendingAttachment {
+                            path,
+                            name,
+                            mime,
+                        });
                     }
                 }
             });
@@ -624,7 +676,31 @@ pub fn enter_messaging(
     });
 }
 
+/// A file the user has picked but not yet sent.
+#[derive(Clone, Debug)]
+struct PendingAttachment {
+    path: std::path::PathBuf,
+    name: String,
+    mime: String,
+}
+
 impl Ui {
+    /// Set the pending attachment and show the chip. The chip's label is
+    /// updated to the file name.
+    fn set_pending_attachment(&self, att: PendingAttachment) {
+        self.pending_chip_label.set_text(&att.name);
+        self.pending_chip.set_visible(true);
+        *self.pending_attachment.borrow_mut() = Some(att);
+    }
+
+    /// Clear the pending attachment and hide the chip. Safe to call when
+    /// nothing is pending.
+    fn clear_pending_attachment(&self) {
+        *self.pending_attachment.borrow_mut() = None;
+        self.pending_chip.set_visible(false);
+        self.pending_chip_label.set_text("");
+    }
+
     fn reload_chats(&self) {
         let store = self.store.clone();
         let ui = self.clone();
@@ -1121,6 +1197,7 @@ impl Ui {
             }
         }
         self.hide_typing_indicator();
+        self.clear_pending_attachment();
         *self.open_summary.borrow_mut() = Some(chat.clone());
         self.content_page.set_title(&chat_title(chat, &self.handles));
         self.rename_button.set_sensitive(true);
@@ -1546,6 +1623,91 @@ impl Ui {
 
     fn compose_send(&self, entry: &gtk::Entry) {
         let text = entry.text().to_string();
+        // Take the pending attachment (if any) and clear it eagerly so the
+        // chip disappears immediately on send.
+        let pending = self.pending_attachment.borrow_mut().take();
+        self.pending_chip.set_visible(false);
+        self.pending_chip_label.set_text("");
+
+        if let Some(att) = pending {
+            // --- attachment path ---
+            let Some(chat) = self.open_summary.borrow().clone() else {
+                return;
+            };
+            let Some(my_handle) = self_handle(&chat.participants, &self.handles) else {
+                eprintln!("no self handle in chat; cannot send");
+                return;
+            };
+            let path_str = att.path.to_string_lossy().into_owned();
+            let chat_ref = chat_ref_of(&chat);
+            let guid = new_guid();
+            let chat_id = chat.id;
+            let is_group = chat.is_group;
+            let text_for_msg = if text.is_empty() {
+                None
+            } else {
+                Some(text.clone())
+            };
+
+            // Optimistic record points at the chosen file so the image renders now.
+            let optimistic = IncomingMessage {
+                guid: guid.clone(),
+                chat: chat_ref.clone(),
+                sender: Some(my_handle.clone()),
+                is_from_me: true,
+                text: text_for_msg,
+                service: Some("iMessage".into()),
+                date: now_ms(),
+                attachments: vec![AttachmentRecord {
+                    guid: Some(format!("{guid}-0")),
+                    mime: Some(att.mime.clone()),
+                    name: Some(att.name.clone()),
+                    local_path: Some(path_str.clone()),
+                    part_index: Some(0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+
+            let store = self.store.clone();
+            let backend = self.backend.clone();
+            let client = self.client.clone();
+            let connection = self.connection.clone();
+            let ui = self.clone();
+            if !text.is_empty() {
+                entry.set_text("");
+            }
+            gtk_bridge::spawn(
+                async move { store.apply(Ingest::Message(optimistic)).await },
+                move |res| {
+                    if let Err(e) = res {
+                        eprintln!("optimistic insert failed: {e:#}");
+                    }
+                    ui.reload_messages(chat_id, is_group);
+                    ui.reload_chats();
+                    gtk_bridge::spawn(
+                        async move {
+                            backend
+                                .send_attachment(
+                                    &client, &connection, &chat_ref, &my_handle, path_str,
+                                    att.mime, att.name, if text.is_empty() { None } else { Some(text) },
+                                    guid,
+                                )
+                                .await?;
+                            Ok::<(), anyhow::Error>(())
+                        },
+                        move |res| {
+                            if let Err(e) = res {
+                                eprintln!("attachment send failed: {e:#}");
+                            }
+                        },
+                    );
+                },
+            );
+            return;
+        }
+
+        // --- text-only path ---
         if text.trim().is_empty() {
             return;
         }
@@ -1605,77 +1767,6 @@ impl Ui {
                     move |res| {
                         if let Err(e) = res {
                             eprintln!("send failed: {e:#}");
-                        }
-                    },
-                );
-            },
-        );
-    }
-
-    fn send_file(&self, path: std::path::PathBuf) {
-        let Some(chat) = self.open_summary.borrow().clone() else {
-            return;
-        };
-        let Some(my_handle) = self_handle(&chat.participants, &self.handles) else {
-            eprintln!("no self handle in chat; cannot send");
-            return;
-        };
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "file".to_string());
-        let mime = guess_mime(&name);
-        let path_str = path.to_string_lossy().into_owned();
-        let chat_ref = chat_ref_of(&chat);
-        let guid = new_guid();
-        let chat_id = chat.id;
-        let is_group = chat.is_group;
-
-        // Optimistic record points at the chosen file so the image renders now.
-        let optimistic = IncomingMessage {
-            guid: guid.clone(),
-            chat: chat_ref.clone(),
-            sender: Some(my_handle.clone()),
-            is_from_me: true,
-            service: Some("iMessage".into()),
-            date: now_ms(),
-            attachments: vec![AttachmentRecord {
-                guid: Some(format!("{guid}-0")),
-                mime: Some(mime.clone()),
-                name: Some(name.clone()),
-                local_path: Some(path_str.clone()),
-                part_index: Some(0),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-
-        let store = self.store.clone();
-        let backend = self.backend.clone();
-        let client = self.client.clone();
-        let connection = self.connection.clone();
-        let ui = self.clone();
-        gtk_bridge::spawn(
-            async move { store.apply(Ingest::Message(optimistic)).await },
-            move |res| {
-                if let Err(e) = res {
-                    eprintln!("optimistic insert failed: {e:#}");
-                }
-                ui.reload_messages(chat_id, is_group);
-                ui.reload_chats();
-                gtk_bridge::spawn(
-                    async move {
-                        backend
-                            .send_attachment(
-                                &client, &connection, &chat_ref, &my_handle, path_str, mime,
-                                name, None, guid,
-                            )
-                            .await?;
-                        Ok::<(), anyhow::Error>(())
-                    },
-                    move |res| {
-                        if let Err(e) = res {
-                            eprintln!("attachment send failed: {e:#}");
                         }
                     },
                 );
