@@ -910,14 +910,18 @@ impl Ui {
             self.pending_chip_icon.set_icon_name(Some("text-x-generic-symbolic"));
         }
         self.pending_chip.set_visible(true);
-        // The 48 px layout shift from a newly-visible chip can leave the
-        // scrolled window's adjustment with value > upper - page_size. GTK
-        // doesn't always re-clamp automatically, leaving scroll events as
-        // no-ops until the chat is reloaded. set_value(current_value)
-        // re-clamps explicitly — idempotent if the value was already in range.
+        // set_visible schedules a re-layout; the adjustment's page_size /
+        // upper don't update until the frame-clock phase of the main loop.
+        // A synchronous re-clamp here would run with the *old* bounds and
+        // be a no-op — then the layout fires and leaves value above the
+        // new upper - page_size, which makes scroll events no-ops (the
+        // user has to drag the scrollbar way up to recover). Defer the
+        // re-clamp to the next idle so it sees the post-layout bounds.
         {
             let adj = self.scroller.vadjustment();
-            adj.set_value(adj.value());
+            glib::idle_add_local_once(move || {
+                adj.set_value(adj.value());
+            });
         }
         *self.pending_attachment.borrow_mut() = Some(att);
     }
@@ -929,11 +933,14 @@ impl Ui {
         self.pending_chip_label.set_text("");
         self.pending_chip_icon.set_paintable(None::<&gtk::gdk::Paintable>);
         // Same rationale as in set_pending_attachment: the chip's collapse
-        // shifts the bottom bar smaller, growing the scrolled window's
-        // viewport. Re-clamp the adjustment so scroll events route correctly.
+        // schedules a re-layout that changes the scrolled window's viewport.
+        // A synchronous re-clamp here runs before layout and is a no-op;
+        // defer to the next idle so it sees the post-layout bounds.
         {
             let adj = self.scroller.vadjustment();
-            adj.set_value(adj.value());
+            glib::idle_add_local_once(move || {
+                adj.set_value(adj.value());
+            });
         }
         *self.pending_attachment.borrow_mut() = None;
     }
