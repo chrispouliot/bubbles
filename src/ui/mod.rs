@@ -469,6 +469,7 @@ pub fn enter_messaging(
     let pending_chip_close = gtk::Button::from_icon_name("window-close-symbolic");
     pending_chip_close.add_css_class("flat");
     pending_chip_close.set_valign(gtk::Align::Center);
+    pending_chip_close.set_focus_on_click(false);
     pending_chip.append(&pending_chip_close);
 
     // Outer vertical box: chip row above the compose bar.
@@ -909,16 +910,32 @@ impl Ui {
             self.pending_chip_icon.set_icon_name(Some("text-x-generic-symbolic"));
         }
         self.pending_chip.set_visible(true);
+        // The 48 px layout shift from a newly-visible chip can leave the
+        // scrolled window's adjustment with value > upper - page_size. GTK
+        // doesn't always re-clamp automatically, leaving scroll events as
+        // no-ops until the chat is reloaded. set_value(current_value)
+        // re-clamps explicitly — idempotent if the value was already in range.
+        {
+            let adj = self.scroller.vadjustment();
+            adj.set_value(adj.value());
+        }
         *self.pending_attachment.borrow_mut() = Some(att);
     }
 
     /// Clear the pending attachment and hide the chip. Safe to call when
     /// nothing is pending.
     fn clear_pending_attachment(&self) {
-        *self.pending_attachment.borrow_mut() = None;
         self.pending_chip.set_visible(false);
         self.pending_chip_label.set_text("");
         self.pending_chip_icon.set_paintable(None::<&gtk::gdk::Paintable>);
+        // Same rationale as in set_pending_attachment: the chip's collapse
+        // shifts the bottom bar smaller, growing the scrolled window's
+        // viewport. Re-clamp the adjustment so scroll events route correctly.
+        {
+            let adj = self.scroller.vadjustment();
+            adj.set_value(adj.value());
+        }
+        *self.pending_attachment.borrow_mut() = None;
     }
 
     /// Inspect the default clipboard and, if it carries a file URI or a
