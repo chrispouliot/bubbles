@@ -25,8 +25,11 @@ finish-args:
   - --share=ipc            # X11 shm (paired with fallback-x11)
   - --socket=wayland
   - --socket=fallback-x11
+  - --socket=session-bus   # D-Bus session bus (tray + portals)
   - --device=dri           # GTK4 GL rendering
   - --talk-name=org.freedesktop.Notifications   # desktop notifications
+  - --talk-name=org.kde.StatusNotifierWatcher   # system tray (ksni)
+  - --talk-name=org.freedesktop.portal.OpenURI   # link opening via GIO
   # messages.db + rustpush credentials live under the per-app data dir
   # (XDG_DATA_HOME -> ~/.var/app/app.openbubbles.Gtk.Devel/data/openbubbles-gtk),
   # which Flatpak sandboxes automatically. No host --filesystem grant needed

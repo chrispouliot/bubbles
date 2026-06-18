@@ -208,15 +208,15 @@ fn escape_markup_attr(s: &str) -> String {
 }
 
 /// Open a URI in the system browser.
+/// Uses GIO which routes through xdg-desktop-portal inside Flatpak,
+/// and launches the default handler directly outside Flatpak.
 fn open_uri(uri: &str) {
-    use std::process::Command;
-    // Normalize www. prefixes to https:// so xdg-open handles them correctly.
     let uri = if uri.starts_with("www.") && !uri.starts_with("http") {
         format!("https://{uri}")
     } else {
         uri.to_string()
     };
-    if let Err(e) = Command::new("xdg-open").arg(&uri).status() {
+    if let Err(e) = gtk::gio::AppInfo::launch_default_for_uri(&uri, None::<&gtk::gio::AppLaunchContext>) {
         eprintln!("failed to open URI {}: {e}", uri);
     }
 }

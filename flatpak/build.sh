@@ -41,3 +41,10 @@ for sz in 64 128 256; do
   install -Dm644 "assets/icons/hicolor/${sz}x${sz}/apps/app.openbubbles.Gtk.Devel.png" \
     "/app/share/icons/hicolor/${sz}x${sz}/apps/app.openbubbles.Gtk.Devel.png"
 done
+# In-app action icons (splash hero, send button, etc.) are referenced by name
+# at runtime — from_icon_name("empty-state"), from_icon_name("ob-send-symbolic")
+# — and GTK resolves them against $XDG_DATA_DIRS/icons/hicolor.
+for icon in assets/icons/hicolor/scalable/actions/*.svg; do
+  install -Dm644 "$icon" \
+    "/app/share/icons/hicolor/scalable/actions/$(basename "$icon")"
+done
