@@ -722,6 +722,24 @@ pub fn enter_messaging(
         entry.connect_changed(move |e| ui.note_typing_activity(!e.text().trim().is_empty()));
     }
 
+    // Ctrl+V paste-from-clipboard: intercept before the Entry's default handler.
+    {
+        let paste_ctrl = gtk::EventControllerKey::new();
+        paste_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let ui = ui.clone();
+        paste_ctrl.connect_key_pressed(move |_ctrl, keyval, _keycode, state| {
+            let ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+            if !ctrl {
+                return glib::Propagation::Proceed;
+            }
+            if keyval != gtk::gdk::Key::v && keyval != gtk::gdk::Key::V {
+                return glib::Propagation::Proceed;
+            }
+            ui.try_attach_from_clipboard()
+        });
+        entry.add_controller(paste_ctrl);
+    }
+
     // Attach: open the system file picker, then set a pending attachment.
     {
         let ui = ui.clone();
@@ -882,6 +900,124 @@ impl Ui {
         *self.pending_attachment.borrow_mut() = None;
         self.pending_chip.set_visible(false);
         self.pending_chip_label.set_text("");
+    }
+
+    /// Inspect the default clipboard and, if it carries a file URI or a
+    /// supported image mime, attach the first item via `set_pending_attachment`.
+    /// Returns `Propagation::Stop` when we initiate an attach (so the entry's
+    /// default text paste is suppressed) and `Propagation::Proceed` otherwise.
+    fn try_attach_from_clipboard(&self) -> glib::Propagation {
+        let Some(display) = gtk::gdk::Display::default() else {
+            return glib::Propagation::Proceed;
+        };
+        let clipboard = display.clipboard();
+        let formats = clipboard.formats();
+
+        // Priority: text/uri-list wins over images.
+        if formats.contain_mime_type("text/uri-list") {
+            let ui = self.clone();
+            clipboard.read_async(
+                &["text/uri-list"],
+                glib::Priority::DEFAULT,
+                gtk::gio::Cancellable::NONE,
+                move |res| match res {
+                    Ok((stream, _mime)) => {
+                        stream.read_bytes_async(
+                            64 * 1024,
+                            glib::Priority::DEFAULT,
+                            gtk::gio::Cancellable::NONE,
+                            move |result| match result {
+                                Ok(bytes) => {
+                                    let text = String::from_utf8_lossy(bytes.as_ref()).into_owned();
+                                    let paths = parse_uri_list(&text);
+                                    if let Some(first) = paths.first() {
+                                        let name = first
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| "file".to_string());
+                                        let mime = guess_mime(&name);
+                                        ui.set_pending_attachment(PendingAttachment {
+                                            path: first.clone(),
+                                            name,
+                                            mime,
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("clipboard uri-list read failed: {e:#}");
+                                }
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("clipboard uri-list read failed: {e:#}");
+                    }
+                },
+            );
+            return glib::Propagation::Stop;
+        }
+
+        // Image path: ask the clipboard for a Texture directly. This bypasses the
+        // mime-based Texture→PNG serializer that produces stub PNGs (valid envelope,
+        // zero pixels) when the source provides only a gdk::Texture GType — which is
+        // the case for gnome-screenshot and most modern GTK apps.
+        let has_image = formats.contains_type(gtk::gdk::Texture::static_type())
+            || ["image/png", "image/jpeg", "image/webp", "image/gif"]
+                .iter()
+                .any(|m| formats.contain_mime_type(m));
+        if has_image {
+            let ui = self.clone();
+            clipboard.read_texture_async(
+                gtk::gio::Cancellable::NONE,
+                move |res| match res {
+                    Ok(Some(texture)) => {
+                        // Unique temp path so concurrent pastes don't collide.
+                        static COUNTER: AtomicU64 = AtomicU64::new(0);
+                        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+                        let pid = std::process::id();
+                        let filename = format!("pasted-{}-{}.png", pid, n);
+                        let path = std::env::temp_dir().join(&filename);
+
+                        if let Err(e) = texture.save_to_png(&path) {
+                            eprintln!("clipboard image save_to_png failed: {e:#}");
+                            return;
+                        }
+
+                        // Defensive: if the source gave us a stub PNG, fail loud here
+                        // so the user sees a clear warning instead of a silent black
+                        // image on the recipient's device.
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            if meta.len() < 1024 {
+                                eprintln!(
+                                    "clipboard image paste wrote a suspiciously small PNG ({} bytes); \
+                                     the source image may not have been real pixels",
+                                    meta.len()
+                                );
+                            }
+                        }
+
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "image.png".to_string());
+                        ui.set_pending_attachment(PendingAttachment {
+                            path,
+                            name,
+                            mime: "image/png".to_string(),
+                        });
+                    }
+                    Ok(None) => {
+                        eprintln!("clipboard image: no texture available");
+                    }
+                    Err(e) => {
+                        eprintln!("clipboard image read_texture_async failed: {e:#}");
+                    }
+                },
+            );
+            return glib::Propagation::Stop;
+        }
+
+        glib::Propagation::Proceed
     }
 
     fn reload_chats(&self) {
