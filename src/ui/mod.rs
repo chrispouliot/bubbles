@@ -3267,6 +3267,36 @@ fn parse_uri_list(text: &str) -> Vec<std::path::PathBuf> {
     result
 }
 
+/// Write raw clipboard image bytes to a uniquely-named temp file and return
+/// the inputs needed to construct a `PendingAttachment`.
+///
+/// Each call produces a fresh path (process id + atomic counter), so two
+/// concurrent calls never collide. The file lives in `std::env::temp_dir()`.
+/// The returned name has the same extension as the mime type (e.g. `.png`,
+/// `.jpg`, `.webp`), and the returned mime string is the input mime.
+///
+/// Recognised mime types and their extensions:
+///   - "image/png"  -> ".png"  / "image/png"
+///   - "image/jpeg" -> ".jpg"  / "image/jpeg"
+///   - "image/webp" -> ".webp" / "image/webp"
+///   - "image/gif"  -> ".gif"  / "image/gif"
+///
+/// Unknown mime types fall back to extension ".bin" and mime
+/// "application/octet-stream" — we still write the bytes; the user can
+/// send them like any other attachment.
+///
+/// Returns `(path, name, mime)` where:
+///   - path: the absolute `PathBuf` of the written file
+///   - name: just the file's basename (e.g. "pasted-...png"), suitable
+///     for the chip label
+///   - mime: the mime to attach
+fn clipboard_image_to_tempfile(
+    bytes: &[u8],
+    mime: &str,
+) -> std::io::Result<(std::path::PathBuf, String, String)> {
+    todo!()
+}
+
 fn install_css() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -3502,5 +3532,112 @@ mod tests {
     fn parse_uri_list_accepts_crlf_line_endings() {
         let result = parse_uri_list("file:///a\r\nfile:///b\r\n");
         assert_eq!(result, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+}
+
+#[cfg(test)]
+mod clipboard_image_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn clipboard_image_writes_png_bytes_with_png_extension() {
+        let bytes = b"\x89PNG\r\n\x1a\nfake-png-bytes";
+        let result = clipboard_image_to_tempfile(bytes, "image/png");
+        assert!(result.is_ok(), "clipboard_image_to_tempfile should succeed for image/png");
+        let (path, name, mime) = result.unwrap();
+
+        // File exists and contains the exact input bytes
+        assert!(path.exists(), "temp file should exist on disk");
+        let file_bytes = std::fs::read(&path).expect("should be able to read temp file");
+        assert_eq!(file_bytes, bytes, "file contents must match input bytes exactly");
+
+        // Extension and name assertions
+        assert_eq!(path.extension().map(|e| e.to_str().unwrap()), Some("png"), "PathBuf extension should be \"png\"");
+        assert!(name.ends_with(".png"), "name should end with \".png\", got: {}", name);
+        assert_eq!(mime, "image/png", "returned mime should be \"image/png\"");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clipboard_image_writes_jpeg_bytes_with_jpg_extension() {
+        let bytes = b"fake-jpeg-content";
+        let result = clipboard_image_to_tempfile(bytes, "image/jpeg");
+        assert!(result.is_ok(), "clipboard_image_to_tempfile should succeed for image/jpeg");
+        let (path, name, mime) = result.unwrap();
+
+        assert!(path.exists(), "temp file should exist on disk");
+        assert_eq!(path.extension().map(|e| e.to_str().unwrap()), Some("jpg"), "PathBuf extension should be \"jpg\" (not \"jpeg\")");
+        assert!(name.ends_with(".jpg"), "name should end with \".jpg\", got: {}", name);
+        assert_eq!(mime, "image/jpeg", "returned mime should be \"image/jpeg\"");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clipboard_image_writes_webp_bytes_with_webp_extension() {
+        let bytes = b"fake-webp-content";
+        let result = clipboard_image_to_tempfile(bytes, "image/webp");
+        assert!(result.is_ok(), "clipboard_image_to_tempfile should succeed for image/webp");
+        let (path, name, mime) = result.unwrap();
+
+        assert!(path.exists(), "temp file should exist on disk");
+        assert_eq!(path.extension().map(|e| e.to_str().unwrap()), Some("webp"), "PathBuf extension should be \"webp\"");
+        assert!(name.ends_with(".webp"), "name should end with \".webp\", got: {}", name);
+        assert_eq!(mime, "image/webp", "returned mime should be \"image/webp\"");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clipboard_image_writes_gif_bytes_with_gif_extension() {
+        let bytes = b"fake-gif-content";
+        let result = clipboard_image_to_tempfile(bytes, "image/gif");
+        assert!(result.is_ok(), "clipboard_image_to_tempfile should succeed for image/gif");
+        let (path, name, mime) = result.unwrap();
+
+        assert!(path.exists(), "temp file should exist on disk");
+        assert_eq!(path.extension().map(|e| e.to_str().unwrap()), Some("gif"), "PathBuf extension should be \"gif\"");
+        assert!(name.ends_with(".gif"), "name should end with \".gif\", got: {}", name);
+        assert_eq!(mime, "image/gif", "returned mime should be \"image/gif\"");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clipboard_image_unknown_mime_falls_back_to_bin_extension() {
+        let bytes = b"some-unknown-format-data";
+        let result = clipboard_image_to_tempfile(bytes, "application/x-weird-thing");
+        assert!(result.is_ok(), "clipboard_image_to_tempfile should succeed even for unknown mimes");
+        let (path, name, mime) = result.unwrap();
+
+        assert!(path.exists(), "temp file should exist on disk");
+        let file_bytes = std::fs::read(&path).expect("should be able to read temp file");
+        assert_eq!(file_bytes, bytes, "file contents must match input bytes exactly");
+
+        assert_eq!(path.extension().map(|e| e.to_str().unwrap()), Some("bin"), "PathBuf extension should be \"bin\" for unknown mime");
+        assert!(name.ends_with(".bin"), "name should end with \".bin\", got: {}", name);
+        assert_eq!(mime, "application/octet-stream", "returned mime should fall back to \"application/octet-stream\"");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clipboard_image_two_calls_produce_distinct_paths() {
+        let result1 = clipboard_image_to_tempfile(b"first", "image/png");
+        assert!(result1.is_ok(), "first call should succeed");
+        let (p1, _, _) = result1.unwrap();
+
+        let result2 = clipboard_image_to_tempfile(b"second", "image/png");
+        assert!(result2.is_ok(), "second call should succeed");
+        let (p2, _, _) = result2.unwrap();
+
+        assert_ne!(p1, p2, "two calls must produce different paths");
+        assert!(p1.exists(), "first file should exist on disk");
+        assert!(p2.exists(), "second file should exist on disk");
+
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
     }
 }
