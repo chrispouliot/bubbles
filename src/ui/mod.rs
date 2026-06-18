@@ -9,6 +9,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Once, OnceLock};
 
 use adw::prelude::*;
@@ -3294,7 +3295,29 @@ fn clipboard_image_to_tempfile(
     bytes: &[u8],
     mime: &str,
 ) -> std::io::Result<(std::path::PathBuf, String, String)> {
-    todo!()
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+
+    let (ext, final_mime) = match mime {
+        "image/png" => ("png", "image/png"),
+        "image/jpeg" => ("jpg", "image/jpeg"),
+        "image/webp" => ("webp", "image/webp"),
+        "image/gif" => ("gif", "image/gif"),
+        _ => ("bin", "application/octet-stream"),
+    };
+
+    let filename = format!("pasted-{}-{}.{}", pid, n, ext);
+    let path = std::env::temp_dir().join(&filename);
+
+    std::fs::write(&path, bytes)?;
+
+    let name = path.file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    Ok((path, name, final_mime.to_string()))
 }
 
 fn install_css() {
