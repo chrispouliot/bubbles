@@ -3222,6 +3222,21 @@ fn guess_mime(name: &str) -> String {
     .to_string()
 }
 
+/// Parse a `text/uri-list` clipboard payload into local file paths.
+///
+/// - One `PathBuf` per `file://` URI, in source order.
+/// - Non-`file://` URIs (http, https, ftp, …) are skipped — they are not local files.
+/// - Lines starting with `#` (after optional whitespace) are comments and skipped.
+/// - Blank lines (including lines containing only whitespace) are skipped.
+/// - Both `\n` and `\r\n` line endings are accepted.
+/// - URI percent-encoded characters are decoded (e.g. `Screenshot%20from%20foo.png`
+///   becomes the path `Screenshot from foo.png`).
+/// - The canonical `file:///abs/path` (three slashes) form is supported.
+/// - An empty input string yields an empty `Vec`.
+fn parse_uri_list(text: &str) -> Vec<std::path::PathBuf> {
+    todo!()
+}
+
 fn install_css() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -3402,5 +3417,60 @@ fn clear(list: &gtk::ListBox) {
 fn clear_box(b: &gtk::Box) {
     while let Some(child) = b.first_child() {
         b.remove(&child);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn parse_uri_list_single_file_uri_returns_one_path() {
+        let result = parse_uri_list("file:///tmp/foo.png");
+        assert_eq!(result, vec![PathBuf::from("/tmp/foo.png")]);
+    }
+
+    #[test]
+    fn parse_uri_list_multiple_file_uris_returns_all_in_order() {
+        let result = parse_uri_list("file:///a\nfile:///b\nfile:///c");
+        assert_eq!(result, vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")]);
+    }
+
+    #[test]
+    fn parse_uri_list_skips_non_file_schemes() {
+        let result = parse_uri_list("file:///a\nhttps://example.com/b\nfile:///c");
+        assert_eq!(result, vec![PathBuf::from("/a"), PathBuf::from("/c")]);
+    }
+
+    #[test]
+    fn parse_uri_list_empty_string_returns_empty_vec() {
+        let result = parse_uri_list("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_uri_list_decodes_percent_encoded_chars() {
+        let result = parse_uri_list("file:///home/me/Screenshot%20from%202024.png");
+        assert_eq!(result, vec![PathBuf::from("/home/me/Screenshot from 2024.png")]);
+    }
+
+    #[test]
+    fn parse_uri_list_accepts_canonical_triple_slash_form() {
+        let result = parse_uri_list("file:///etc/hosts");
+        assert_eq!(result, vec![PathBuf::from("/etc/hosts")]);
+    }
+
+    #[test]
+    fn parse_uri_list_skips_comment_lines_and_blanks() {
+        let input = "# this is a comment\nfile:///a\n\n# another comment\nfile:///b\n";
+        let result = parse_uri_list(input);
+        assert_eq!(result, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+
+    #[test]
+    fn parse_uri_list_accepts_crlf_line_endings() {
+        let result = parse_uri_list("file:///a\r\nfile:///b\r\n");
+        assert_eq!(result, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
     }
 }
