@@ -661,43 +661,34 @@ pub fn enter_messaging(
         // during a rebuild.
         let was_at_bottom_c = was_at_bottom.clone();
         let ui_c = ui.clone();
-        let container_c = ui.msg_container.clone();
         // Sticky-bottom re-pin, synchronously inside `changed`.
         //
-        // Content height changes during a resize for height-for-width reasons —
-        // both message images *and* wrapped text labels reflow as the width
-        // crosses thresholds (a long message wrapping 1->2 lines is the same
-        // class of jitter as a photo's scaled height stepping up). GTK keeps
-        // the scroll value at its old absolute position across the reallocation:
-        // on a narrowing resize the content grows, so the old value is now too
-        // LOW (under-scrolled) and the newest message drops behind the input
-        // bar for one frame until something re-pins to the new bottom.
+        // GTK keeps the scroll value at its old absolute position across a
+        // viewport reallocation: when the content grows under it (a narrowing
+        // resize reflowing text, or — critically — the compose-area chip row
+        // appearing/disappearing on attach/clear, which resizes the scrolled
+        // window and fires `changed` via the page-size change), the old value
+        // is now too LOW and the newest message drops behind the input bar.
+        // We re-pin to the new bottom in the same frame `changed` fires.
         //
-        // We must re-pin in the SAME frame `changed` fires — deferring to an
-        // idle callback leaves that one under-scrolled frame painted (the
-        // "down then up" flicker). But we can't trust `adj.upper()` either: it
-        // can briefly hold the pre-re-measurement height, and pinning to a
-        // stale upper lands short the same way. So force a fresh measure of
-        // the container for the current width — `measure(width)` recomputes
-        // height-for-width immediately (wrapped labels return their new line
-        // count, pictures their new scaled height), giving the true content
-        // height now. This is the same trick `scroll_to` uses for the rebuild
-        // path. The EPS guard avoids a no-op set_value (and the value-changed
-        // it would emit) when already parked at the bottom.
+        // Use the adjustment's own `upper`, NOT a `measure()` of the container.
+        // `changed` is emitted by GtkViewport *after* it has configured the
+        // adjustment in size_allocate, so `upper` is already the fresh, real
+        // content height. The viewport's default `vscroll-policy = MINIMUM`
+        // sizes `upper` from the child's minimum height — and a size-requested
+        // GtkPicture's minimum height is its *scaled* size (the real on-screen
+        // height). A `measure().1` (natural) call instead returns the picture's
+        // *intrinsic* (unscaled) height, which is thousands of pixels for a
+        // photo. Raising `upper` to that overstated value (as this handler used
+        // to) and scrolling to `overstated - page` parks the viewport in empty
+        // space past the real content — the chat goes blank and scroll events
+        // become no-ops until a rebuild. This was the attach-a-file bug. The
+        // EPS guard avoids a no-op set_value when already parked at the bottom.
         adj.connect_changed(move |a| {
             if !ui_c.settling.get() && was_at_bottom_c.get() {
                 let page = a.page_size();
-                let width = container_c.width();
-                let content_h = if width > 0 {
-                    container_c.measure(gtk::Orientation::Vertical, width).1 as f64
-                } else {
-                    a.upper()
-                };
-                let bottom = (content_h - page).max(0.0);
+                let bottom = (a.upper() - page).max(0.0);
                 if (a.value() - bottom).abs() > 0.5 {
-                    if content_h > a.upper() {
-                        a.set_upper(content_h);
-                    }
                     a.set_value(bottom);
                 }
             }
@@ -910,19 +901,6 @@ impl Ui {
             self.pending_chip_icon.set_icon_name(Some("text-x-generic-symbolic"));
         }
         self.pending_chip.set_visible(true);
-        // set_visible schedules a re-layout; the adjustment's page_size /
-        // upper don't update until the frame-clock phase of the main loop.
-        // A synchronous re-clamp here would run with the *old* bounds and
-        // be a no-op — then the layout fires and leaves value above the
-        // new upper - page_size, which makes scroll events no-ops (the
-        // user has to drag the scrollbar way up to recover). Defer the
-        // re-clamp to the next idle so it sees the post-layout bounds.
-        {
-            let adj = self.scroller.vadjustment();
-            glib::idle_add_local_once(move || {
-                adj.set_value(adj.value());
-            });
-        }
         *self.pending_attachment.borrow_mut() = Some(att);
     }
 
@@ -932,16 +910,6 @@ impl Ui {
         self.pending_chip.set_visible(false);
         self.pending_chip_label.set_text("");
         self.pending_chip_icon.set_paintable(None::<&gtk::gdk::Paintable>);
-        // Same rationale as in set_pending_attachment: the chip's collapse
-        // schedules a re-layout that changes the scrolled window's viewport.
-        // A synchronous re-clamp here runs before layout and is a no-op;
-        // defer to the next idle so it sees the post-layout bounds.
-        {
-            let adj = self.scroller.vadjustment();
-            glib::idle_add_local_once(move || {
-                adj.set_value(adj.value());
-            });
-        }
         *self.pending_attachment.borrow_mut() = None;
     }
 
@@ -2371,9 +2339,19 @@ impl Ui {
             // height — targeting it flashes the previous scroll position. Measure
             // the container instead (recomputes for the new content immediately),
             // so the first painted frame already sits at the right place.
+            //
+            // Use the *minimum* height (`.0`), not the natural height (`.1`). A
+            // GtkPicture's natural height is the image's intrinsic (unscaled)
+            // size — thousands of pixels for a photo — while its minimum height
+            // is the scaled size we set via `set_size_request`. The viewport's
+            // default MINIMUM scroll policy sizes `upper` from that same
+            // minimum, so measuring minimum here matches the value the viewport
+            // will configure `upper` to a moment later. Using natural instead
+            // would overshoot, inflate `upper` past the real content, and park
+            // the viewport in empty space (the attach-a-file bug, same class).
             let width = container.width();
             let content_h = if width > 0 {
-                container.measure(gtk::Orientation::Vertical, width).1 as f64
+                container.measure(gtk::Orientation::Vertical, width).0 as f64
             } else {
                 adj.upper()
             };
