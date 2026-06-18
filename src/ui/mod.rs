@@ -3234,7 +3234,37 @@ fn guess_mime(name: &str) -> String {
 /// - The canonical `file:///abs/path` (three slashes) form is supported.
 /// - An empty input string yields an empty `Vec`.
 fn parse_uri_list(text: &str) -> Vec<std::path::PathBuf> {
-    todo!()
+    let mut result = Vec::new();
+    for line in text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(path_str) = trimmed.strip_prefix("file://") {
+            let mut decoded = Vec::with_capacity(path_str.len());
+            let bytes = path_str.as_bytes();
+            let mut i = 0;
+            let mut valid = true;
+            while i < bytes.len() {
+                if bytes[i] == b'%' && i + 2 < bytes.len() {
+                    let hex = &path_str[i + 1..i + 3];
+                    match u8::from_str_radix(hex, 16) {
+                        Ok(byte) => { decoded.push(byte); i += 3; }
+                        Err(_) => { valid = false; break; }
+                    }
+                } else {
+                    decoded.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            if valid {
+                if let Ok(s) = String::from_utf8(decoded) {
+                    result.push(std::path::PathBuf::from(s));
+                }
+            }
+        }
+    }
+    result
 }
 
 fn install_css() {
