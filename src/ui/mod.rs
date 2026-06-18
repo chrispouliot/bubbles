@@ -305,6 +305,7 @@ struct Ui {
     pending_attachment: Rc<RefCell<Option<PendingAttachment>>>,
     pending_chip: gtk::Box,
     pending_chip_label: gtk::Label,
+    pending_chip_icon: gtk::Image,
     compose_outer: gtk::Box,
     /// Swaps the content pane between the empty-state illustration (no chat
     /// open) and the timeline + compose view.
@@ -460,7 +461,9 @@ pub fn enter_messaging(
         .margin_bottom(0)
         .visible(false)
         .build();
-    pending_chip.append(&gtk::Image::from_icon_name("text-x-generic-symbolic"));
+    let pending_chip_icon = gtk::Image::new();
+    pending_chip_icon.set_pixel_size(48);
+    pending_chip.append(&pending_chip_icon);
     let pending_chip_label = gtk::Label::new(None);
     pending_chip.append(&pending_chip_label);
     let pending_chip_close = gtk::Button::from_icon_name("window-close-symbolic");
@@ -555,6 +558,7 @@ pub fn enter_messaging(
         pending_attachment: Rc::new(RefCell::new(None)),
         pending_chip: pending_chip.clone(),
         pending_chip_label: pending_chip_label.clone(),
+        pending_chip_icon,
         compose_outer: compose_outer.clone(),
         content_stack: content_stack.clone(),
     };
@@ -890,6 +894,20 @@ impl Ui {
     /// updated to the file name.
     fn set_pending_attachment(&self, att: PendingAttachment) {
         self.pending_chip_label.set_text(&att.name);
+        if att.mime.starts_with("image/") {
+            match gtk::gdk::Texture::from_filename(&att.path) {
+                Ok(texture) => self.pending_chip_icon.set_paintable(Some(&texture)),
+                Err(e) => {
+                    eprintln!(
+                        "pending attachment thumbnail: failed to decode {}: {e}",
+                        att.path.display()
+                    );
+                    self.pending_chip_icon.set_icon_name(Some("text-x-generic-symbolic"));
+                }
+            }
+        } else {
+            self.pending_chip_icon.set_icon_name(Some("text-x-generic-symbolic"));
+        }
         self.pending_chip.set_visible(true);
         *self.pending_attachment.borrow_mut() = Some(att);
     }
@@ -900,6 +918,7 @@ impl Ui {
         *self.pending_attachment.borrow_mut() = None;
         self.pending_chip.set_visible(false);
         self.pending_chip_label.set_text("");
+        self.pending_chip_icon.set_paintable(None::<&gtk::gdk::Paintable>);
     }
 
     /// Inspect the default clipboard and, if it carries a file URI or a
