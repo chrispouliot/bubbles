@@ -48,6 +48,10 @@ fn main() -> glib::ExitCode {
         .build();
 
     app.connect_activate(|app| {
+        if let Some(existing) = app.windows().into_iter().next() {
+            existing.present();
+            return;
+        }
         let window = if std::env::var_os("OPENBUBBLES_DEMO").is_some() {
             demo::build_demo_window(app)
         } else {
