@@ -120,11 +120,10 @@
 
           # `hicolor-icon-theme` provides the base hicolor files
           # (share/icons/hicolor/index.theme, symbolic/apps/, etc.) that
-          # every other icon theme inherits from. Without it in the
-          # closure, NixOS's union at /run/current-system/sw/share/icons/
-          # has no hicolor theme at all and GTK has nothing to resolve
-          # against. Propagated via buildInputs so it ends up in the
-          # runtime closure / system profile.
+          # every other icon theme inherits from. Pulled in via the
+          # nixosModules.default below so it lands in the *system*
+          # profile (and therefore in the system-wide icons union) —
+          # buildInputs here wouldn't propagate.
           buildInputs = with pkgs; [
             glib
             gtk4
@@ -134,7 +133,6 @@
             cairo
             pango
             openssl
-            hicolor-icon-theme
           ];
 
           postInstall = ''
@@ -221,7 +219,17 @@
           };
 
           config = lib.mkIf cfg.enable {
-            environment.systemPackages = [ cfg.package ];
+            environment.systemPackages = [
+              cfg.package
+              # The base hicolor icon theme (index.theme, symbolic/apps/, etc.)
+              # is what every other theme inherits from, and is what the openbubbles-gtk
+              # .desktop + icon-theme union at /run/current-system/sw/share/icons/
+              # needs to actually be a valid hicolor tree. Without this in the
+              # system profile, the app icon silently fails to resolve in the
+              # apps grid and the tray/system notification lookups also fall back
+              # to broken-image placeholders.
+              pkgs.hicolor-icon-theme
+            ];
           };
         };
     };
