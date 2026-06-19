@@ -81,17 +81,19 @@
           pname = "openbubbles-gtk";
           version = "0.1.0";
 
-          # Use `builtins.fetchGit ./.` so only git-tracked files are copied
-          # into the nix store — `pkgs.lib.cleanSource` only strips `.git/`
-          # and does NOT respect `.gitignore`, so `src = ./.;` would copy
-          # the entire 5+ GB `target/` directory on every rebuild.
-          # `fetchGit` reads the git index, so untracked/ignored files
-          # (target/, .direnv/, build-dir/, etc.) are excluded.
-          # The trade-off: uncommitted changes are NOT visible to the
-          # build, so you must `git add` (staging is enough; no commit
-          # needed) before `nixos-rebuild switch` for new files to be
-          # picked up.
-          src = builtins.fetchGit ./.;
+          # `self` is the flake's own source tree. For a git-based flake,
+          # Nix copies ONLY git-tracked files into the store, so untracked /
+          # gitignored paths (target/, .direnv/, build-dir/, etc.) are already
+          # excluded — no `cleanSource`/`fetchGit` gymnastics needed, and the
+          # 5+ GB `target/` dir is never copied. We previously used
+          # `builtins.fetchGit ./.` here, but that breaks pure evaluation
+          # (which `nixos-rebuild` uses): when this flake is consumed as an
+          # input and the tree is dirty, fetchGit has no locked rev and errors
+          # with "in pure evaluation mode, 'fetchGit' doesn't fetch unlocked
+          # input". `self` has no such problem.
+          # Note: a file must be git-*tracked* to be visible to the build, so
+          # `git add` any newly created file before rebuilding.
+          src = self;
           cargoLock = {
             lockFile = ./Cargo.lock;
             # Cargo.lock pins android-loader to a git+https rev. Letting
