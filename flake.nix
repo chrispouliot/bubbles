@@ -81,16 +81,17 @@
           pname = "openbubbles-gtk";
           version = "0.1.0";
 
-          # `pkgs.lib.cleanSource` strips `.git/` and respects the
-          # project's `.gitignore`. Without it, `src = ./.;` copies
-          # everything under the project root into the store verbatim
-          # — including `target/` (a `cargo build` cache that can be
-          # 10+ GB) and `.cargo-home/` — making the copy step slow and
-          # the Nix store path huge. The build only needs the Rust
-          # sources, the Cargo manifests, the vendored rustpush tree,
-          # and the assets/ + .desktop + .metainfo files; all of those
-          # are not in `.gitignore` so `cleanSource` keeps them.
-          src = pkgs.lib.cleanSource ./.;
+          # Use `builtins.fetchGit ./.` so only git-tracked files are copied
+          # into the nix store — `pkgs.lib.cleanSource` only strips `.git/`
+          # and does NOT respect `.gitignore`, so `src = ./.;` would copy
+          # the entire 5+ GB `target/` directory on every rebuild.
+          # `fetchGit` reads the git index, so untracked/ignored files
+          # (target/, .direnv/, build-dir/, etc.) are excluded.
+          # The trade-off: uncommitted changes are NOT visible to the
+          # build, so you must `git add` (staging is enough; no commit
+          # needed) before `nixos-rebuild switch` for new files to be
+          # picked up.
+          src = builtins.fetchGit ./.;
           cargoLock = {
             lockFile = ./Cargo.lock;
             # Cargo.lock pins android-loader to a git+https rev. Letting
@@ -103,11 +104,19 @@
           # is on, so `protoc` (from the `protobuf` drv) must be on PATH.
           # rustpush pins `openssl` with the `vendored` feature, which the
           # OpenSSL build script drives through `perl`.
-          # `gtk4` is also in nativeBuildInputs so its `gtk4-update-icon-cache`
-          # setup hook runs over `$out/share/icons/` and writes
-          # `icon-theme.cache` for the hicolor tree we install below —
-          # without it GTK falls back to a slow on-disk scan and the app
-          # icon silently fails to resolve in the apps grid.
+          # `gtk4` is in nativeBuildInputs for `gtk4-update-icon-cache`,
+          # which we invoke ourselves at the end of postInstall to build
+          # `$out/share/icons/hicolor/icon-theme.cache`. NOTE: gtk4's setup
+          # hook does NOT generate that cache — its `dropIconThemeCache`
+          # hook *deletes* any `icon-theme.cache` from `$out/share/icons`
+          # in preFixup (because per-prefix caches normally only collide in
+          # a merged profile). We opt out of that via `dontDropIconThemeCache`
+          # below so the cache we build survives. `gdk-pixbuf` and `librsvg`
+          # are here (not just buildInputs) because their setup hooks set
+          # `GDK_PIXBUF_MODULE_FILE` and register the SVG loader — without
+          # those, `gtk4-update-icon-cache` silently fails to load the
+          # scalable SVG and writes an empty/partial cache, which is exactly
+          # the "icon shows up blank in the apps grid" symptom.
           nativeBuildInputs = with pkgs; [
             pkg-config
             cmake
@@ -116,6 +125,8 @@
             protobuf
             rustPlatform.bindgenHook
             gtk4
+            gdk-pixbuf
+            librsvg
           ];
 
           # `hicolor-icon-theme` provides the base hicolor files
@@ -133,6 +144,7 @@
             cairo
             pango
             openssl
+            librsvg
           ];
 
           postInstall = ''
@@ -158,7 +170,28 @@
               install -Dm644 "$icon" \
                 "$out/share/icons/hicolor/scalable/actions/$(basename "$icon")"
             done
+            # hicolor self-containment: copy the base hicolor files
+            # (index.theme, etc.) from hicolor-icon-theme into our own
+            # $out/share/icons/hicolor/ so this package ships a complete
+            # hicolor tree. This must happen BEFORE we build the cache
+            # below so index.theme is present.
+            cp -r ${pkgs.hicolor-icon-theme}/share/icons/hicolor/. \
+              $out/share/icons/hicolor/
+            # Build the hicolor cache ourselves. gtk4's setup hook does NOT
+            # create this (it only ever *removes* it — see dropIconThemeCache),
+            # so without this the app icon has no cache and GNOME shows a blank
+            # entry in the overview/dash on install paths that don't trigger
+            # the system-level `gtk.iconCache.enable` rebuild (nix profile,
+            # home-manager, etc.). `dontDropIconThemeCache = true` below keeps
+            # the gtk4 preFixup hook from deleting what we generate here.
+            # gdk-pixbuf + librsvg (in nativeBuildInputs) provide the SVG
+            # loader so the scalable icon is indexed too.
+            gtk4-update-icon-cache -f -t $out/share/icons/hicolor
           '';
+
+          # Keep the cache we build in postInstall; gtk4's setup hook would
+          # otherwise strip it in preFixup. See the postInstall comment.
+          dontDropIconThemeCache = true;
 
           meta = with pkgs.lib; {
             description = "Native GTK4/libadwaita client for OpenBubbles (iMessage)";
