@@ -20,11 +20,16 @@ use adw::prelude::*;
 use gtk::gdk_pixbuf::PixbufLoader;
 use ksni::blocking::TrayMethods;
 
-/// The app icon, embedded at compile time so the tray renders identically in
+/// The tray icon, embedded at compile time so the tray renders identically in
 /// dev, system installs, and Flatpak with no runtime icon-theme lookup (the
 /// shell can't resolve a sandboxed theme path, so we hand it raw pixels).
-const ICON_PNG: &[u8] =
-    include_bytes!("../assets/icons/hicolor/128x128/apps/app.openbubbles.Gtk.Devel.png");
+///
+/// This is a dedicated copy kept outside the hicolor theme: the dock/launcher
+/// icon is intentionally smaller (see `assets/icons/.../app.openbubbles.Gtk.Devel.svg`
+/// for the padded variant) so it doesn't visually dominate, but the tray needs
+/// to stay at full visual weight — the system tray scales icons down to ~16-22px
+/// and a padded 80% icon would render as a tiny dot of blue.
+const ICON_PNG: &[u8] = include_bytes!("../assets/tray-icon.png");
 
 /// Live handle to the running tray; `set_unread` pushes state through it.
 static TRAY: OnceLock<ksni::blocking::Handle<ObTray>> = OnceLock::new();
