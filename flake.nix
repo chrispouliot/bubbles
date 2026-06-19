@@ -103,6 +103,11 @@
           # is on, so `protoc` (from the `protobuf` drv) must be on PATH.
           # rustpush pins `openssl` with the `vendored` feature, which the
           # OpenSSL build script drives through `perl`.
+          # `gtk4` is also in nativeBuildInputs so its `gtk4-update-icon-cache`
+          # setup hook runs over `$out/share/icons/` and writes
+          # `icon-theme.cache` for the hicolor tree we install below —
+          # without it GTK falls back to a slow on-disk scan and the app
+          # icon silently fails to resolve in the apps grid.
           nativeBuildInputs = with pkgs; [
             pkg-config
             cmake
@@ -110,8 +115,16 @@
             perl
             protobuf
             rustPlatform.bindgenHook
+            gtk4
           ];
 
+          # `hicolor-icon-theme` provides the base hicolor files
+          # (share/icons/hicolor/index.theme, symbolic/apps/, etc.) that
+          # every other icon theme inherits from. Without it in the
+          # closure, NixOS's union at /run/current-system/sw/share/icons/
+          # has no hicolor theme at all and GTK has nothing to resolve
+          # against. Propagated via buildInputs so it ends up in the
+          # runtime closure / system profile.
           buildInputs = with pkgs; [
             glib
             gtk4
@@ -121,6 +134,7 @@
             cairo
             pango
             openssl
+            hicolor-icon-theme
           ];
 
           postInstall = ''
