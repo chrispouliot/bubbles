@@ -67,6 +67,7 @@
           cairo
           pango
           openssl # for OPENSSL_NO_VENDOR=1 if you ever drop vendored
+          libheif # libheif-rs decode path for image/heic and image/heif
         ];
       in
       {
@@ -157,6 +158,7 @@
             pango
             openssl
             librsvg
+            libheif # libheif-rs decode path for image/heic and image/heif
           ];
 
           postInstall = ''
