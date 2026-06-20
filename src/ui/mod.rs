@@ -3254,14 +3254,13 @@ fn message_body(
         .build();
 
     for att in &m.attachments {
-        let placed = att
-            .is_image()
-            .then(|| att.local_path.as_deref())
-            .flatten()
-            .and_then(image_widget);
-        match placed {
-            Some(pic) => col.append(&pic),
-            None => col.append(&file_chip(att, own)),
+        if att.is_image() {
+            if let Some(path) = att.local_path.as_deref() {
+                col.append(&image_widget(path));
+            }
+            // No local path → no widget for this attachment.
+        } else {
+            col.append(&file_chip(att, own));
         }
     }
 
@@ -3302,8 +3301,9 @@ fn strip_marker(s: &str) -> String {
     s.replace('\u{FFFC}', "").trim().to_string()
 }
 
-/// Load a texture from `path`, with HEIC/HEIF support via libheif-rs.
-/// Falls back to gdk-pixbuf (`Texture::from_filename`) for all other formats.
+/// Load a texture from `path`. HEIC/HEIF files are decoded via libheif-rs;
+/// all other formats are decoded via gdk-pixbuf, with EXIF orientation applied
+/// to the decoded RGBA pixels before wrapping in a `MemoryTexture`.
 fn load_texture(path: &str) -> Option<gtk::gdk::Texture> {
     if is_heic_path(path) {
         let decoded =
@@ -3320,7 +3320,55 @@ fn load_texture(path: &str) -> Option<gtk::gdk::Texture> {
         )
         .upcast());
     }
-    gtk::gdk::Texture::from_filename(path).ok()
+
+    // JPEG (and other non-HEIC) path: decode to RGBA, read EXIF orientation,
+    // apply the transform, and wrap in a MemoryTexture.
+    let file_bytes = std::fs::read(path).ok()?;
+    let orientation = crate::image::read_exif_orientation(&file_bytes).unwrap_or(1);
+
+    // Decode from memory via gdk-pixbuf (handles JPEG, PNG, etc.)
+    let loader = gtk::gdk_pixbuf::PixbufLoader::new();
+    loader.write(&file_bytes).ok()?;
+    loader.close().ok()?;
+    let pb = loader.pixbuf()?;
+
+    let w = pb.width() as u32;
+    let h = pb.height() as u32;
+    let nch = pb.n_channels() as usize;
+    let stride = pb.rowstride() as usize;
+    let src = pb.read_pixel_bytes();
+    let src = src.as_ref();
+
+    // Copy to tightly-packed RGBA (strip stride padding)
+    let mut pixels = Vec::with_capacity(w as usize * h as usize * 4);
+    for y in 0..h as usize {
+        let row = &src[y * stride..y * stride + w as usize * nch];
+        for px in row.chunks_exact(nch) {
+            pixels.push(px[0]);
+            pixels.push(px[1]);
+            pixels.push(px[2]);
+            pixels.push(if nch == 4 { px[3] } else { 0xff });
+        }
+    }
+
+    let decoded = crate::image::DecodedRgba {
+        width: w,
+        height: h,
+        pixels,
+    };
+    let oriented = crate::image::apply_orientation(decoded, orientation);
+
+    let w = oriented.width;
+    let h = oriented.height;
+    let bytes = gtk::glib::Bytes::from_owned(oriented.pixels);
+    Some(gtk::gdk::MemoryTexture::new(
+        w as i32,
+        h as i32,
+        gtk::gdk::MemoryFormat::R8g8b8a8,
+        &bytes,
+        w as usize * 4,
+    )
+    .upcast())
 }
 
 /// Returns `true` when the path has a `.heic` or `.heif` extension
@@ -3330,23 +3378,49 @@ fn is_heic_path(path: &str) -> bool {
     lower.ends_with(".heic") || lower.ends_with(".heif")
 }
 
-/// A rounded, size-capped image from a local file, or `None` if it can't load
-/// (e.g. an unsupported format like HEIC without a decoder).
-fn image_widget(path: &str) -> Option<gtk::Widget> {
-    let texture = load_texture(path)?;
-    let (iw, ih) = (texture.width() as f64, texture.height() as f64);
-    if iw <= 0.0 || ih <= 0.0 {
-        return None;
-    }
-    let (max_w, max_h) = (260.0, 340.0);
-    let scale = (max_w / iw).min(max_h / ih).min(1.0);
+/// An image widget that decodes on a background thread and swaps in the
+/// finished texture when ready.  Returns a placeholder immediately so the
+/// chat opens without blocking.
+fn image_widget(path: &str) -> gtk::Widget {
     let pic = gtk::Picture::new();
-    pic.set_paintable(Some(&texture));
-    pic.set_size_request((iw * scale).round() as i32, (ih * scale).round() as i32);
+    let (max_w, max_h) = (260.0, 340.0);
+    pic.set_size_request(max_w as i32, max_h as i32);
     pic.set_content_fit(gtk::ContentFit::Contain);
     pic.set_overflow(gtk::Overflow::Hidden);
     pic.add_css_class("attachment-image");
     pic.set_cursor_from_name(Some("pointer"));
+
+    // Schedule background decode via the image scheduler.
+    let weak = pic.downgrade();
+    crate::image::schedule_image_loads(vec![std::path::PathBuf::from(path)], {
+        move |result| {
+            if let Some(pic) = weak.upgrade() {
+                if let Ok(decoded) = result {
+                    let w = decoded.width as i32;
+                    let h = decoded.height as i32;
+                    let bytes = glib::Bytes::from_owned(decoded.pixels);
+                    let texture = gtk::gdk::MemoryTexture::new(
+                        w,
+                        h,
+                        gtk::gdk::MemoryFormat::R8g8b8a8,
+                        &bytes,
+                        w as usize * 4,
+                    )
+                    .upcast::<gtk::gdk::Texture>();
+                    pic.set_paintable(Some(&texture));
+                    // Re-size based on actual image dimensions, capped.
+                    let scale = (max_w / w.max(1) as f64)
+                        .min(max_h / h.max(1) as f64)
+                        .min(1.0);
+                    pic.set_size_request(
+                        (w as f64 * scale).round() as i32,
+                        (h as f64 * scale).round() as i32,
+                    );
+                }
+                // On failure, leave the placeholder empty.
+            }
+        }
+    });
 
     // Click to enlarge: find the lightbox host overlay and layer the full image.
     let gesture = gtk::GestureClick::new();
@@ -3359,7 +3433,7 @@ fn image_widget(path: &str) -> Option<gtk::Widget> {
     });
     pic.add_controller(gesture);
 
-    Some(pic.upcast())
+    pic.upcast()
 }
 
 /// Walk up from `w` to the named overlay we wrap the messaging UI in.
