@@ -3302,10 +3302,38 @@ fn strip_marker(s: &str) -> String {
     s.replace('\u{FFFC}', "").trim().to_string()
 }
 
+/// Load a texture from `path`, with HEIC/HEIF support via libheif-rs.
+/// Falls back to gdk-pixbuf (`Texture::from_filename`) for all other formats.
+fn load_texture(path: &str) -> Option<gtk::gdk::Texture> {
+    if is_heic_path(path) {
+        let decoded =
+            crate::image::decode_heic_to_rgba(std::path::Path::new(path)).ok()?;
+        let w = decoded.width;
+        let h = decoded.height;
+        let bytes = gtk::glib::Bytes::from_owned(decoded.pixels);
+        return Some(gtk::gdk::MemoryTexture::new(
+            w as i32,
+            h as i32,
+            gtk::gdk::MemoryFormat::R8g8b8a8,
+            &bytes,
+            w as usize * 4,
+        )
+        .upcast());
+    }
+    gtk::gdk::Texture::from_filename(path).ok()
+}
+
+/// Returns `true` when the path has a `.heic` or `.heif` extension
+/// (case-insensitive).
+fn is_heic_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".heic") || lower.ends_with(".heif")
+}
+
 /// A rounded, size-capped image from a local file, or `None` if it can't load
 /// (e.g. an unsupported format like HEIC without a decoder).
 fn image_widget(path: &str) -> Option<gtk::Widget> {
-    let texture = gtk::gdk::Texture::from_filename(path).ok()?;
+    let texture = load_texture(path)?;
     let (iw, ih) = (texture.width() as f64, texture.height() as f64);
     if iw <= 0.0 || ih <= 0.0 {
         return None;
@@ -3349,7 +3377,7 @@ fn find_lightbox_host(w: &gtk::Widget) -> Option<gtk::Overlay> {
 /// Layer a dimmed, centered, full-size image over the UI. Click anywhere or
 /// press Escape to dismiss.
 fn show_lightbox(host: &gtk::Overlay, path: &str) {
-    let Ok(texture) = gtk::gdk::Texture::from_filename(path) else {
+    let Some(texture) = load_texture(path) else {
         return;
     };
 

@@ -1,4 +1,5 @@
 mod gtk_bridge;
+mod image;
 mod protocol;
 mod runtime;
 mod setup;
