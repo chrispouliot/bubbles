@@ -3382,6 +3382,8 @@ fn is_heic_path(path: &str) -> bool {
 /// finished texture when ready.  Returns a placeholder immediately so the
 /// chat opens without blocking.
 fn image_widget(path: &str) -> gtk::Widget {
+    const CHAT_THUMBNAIL_MAX_EDGE: u32 = 1024;
+
     let pic = gtk::Picture::new();
     let (max_w, max_h) = (260.0, 340.0);
     pic.set_size_request(max_w as i32, max_h as i32);
@@ -3392,7 +3394,7 @@ fn image_widget(path: &str) -> gtk::Widget {
 
     // Schedule background decode via the image scheduler.
     let weak = pic.downgrade();
-    crate::image::schedule_image_loads(vec![std::path::PathBuf::from(path)], {
+    crate::image::schedule_image_loads(vec![std::path::PathBuf::from(path)], Some(CHAT_THUMBNAIL_MAX_EDGE), {
         move |result| {
             if let Some(pic) = weak.upgrade() {
                 if let Ok(decoded) = result {
@@ -3425,10 +3427,12 @@ fn image_widget(path: &str) -> gtk::Widget {
     // Click to enlarge: find the lightbox host overlay and layer the full image.
     let gesture = gtk::GestureClick::new();
     let path_owned = path.to_string();
-    let pic_click = pic.clone();
+    let pic_weak = pic.downgrade();
     gesture.connect_released(move |_, _, _, _| {
-        if let Some(host) = find_lightbox_host(pic_click.upcast_ref()) {
-            show_lightbox(&host, &path_owned);
+        if let Some(pic) = pic_weak.upgrade() {
+            if let Some(host) = find_lightbox_host(pic.upcast_ref()) {
+                show_lightbox(&host, &path_owned);
+            }
         }
     });
     pic.add_controller(gesture);

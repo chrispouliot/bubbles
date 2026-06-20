@@ -256,6 +256,70 @@ fn parse_tiff_orientation(data: &[u8]) -> Option<u8> {
     None
 }
 
+/// Try to read pixel dimensions from a PNG or JPEG byte buffer.
+///
+/// Returns `(width, height)` for recognised formats, or `None` if the format
+/// is not recognised or the buffer is too short.  Never panics.
+fn read_image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    // PNG: 8-byte signature (0x8950 4E47 0D0A 1A0A) followed by IHDR chunk.
+    if bytes.len() >= 24 && &bytes[0..8] == b"\x89PNG\r\n\x1a\n" {
+        let chunk_len =
+            u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        if chunk_len == 13 && &bytes[12..16] == b"IHDR" {
+            let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+            let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+            return Some((w, h));
+        }
+        return None;
+    }
+
+    // JPEG: must begin with SOI marker (0xFF 0xD8).
+    if bytes.len() < 2 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return None;
+    }
+
+    // Scan markers for SOF0 / SOF1 / SOF2 which carry the dimensions.
+    let mut pos = 2usize;
+    while pos + 7 < bytes.len() {
+        if bytes[pos] != 0xFF {
+            return None;
+        }
+        let marker = bytes[pos + 1];
+        match marker {
+            0xC0 | 0xC1 | 0xC2 => {
+                // SOF: marker(2) + length(2) + precision(1) + height(2) + width(2)
+                let seg_len =
+                    u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+                if seg_len < 7 || pos + 2 + seg_len > bytes.len() {
+                    return None;
+                }
+                let h = u16::from_be_bytes([bytes[pos + 5], bytes[pos + 6]]);
+                let w = u16::from_be_bytes([bytes[pos + 7], bytes[pos + 8]]);
+                return Some((w as u32, h as u32));
+            }
+            0xD9 | 0xDA => {
+                // EOI (end of image) or SOS (start of scan) — no more metadata.
+                return None;
+            }
+            0xD0..=0xD8 => {
+                // RST markers — no length field.
+                pos += 2;
+            }
+            _ => {
+                // All other markers carry a 2-byte length field.
+                let seg_len =
+                    u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+                if seg_len < 2 {
+                    return None;
+                }
+                pos += 2 + seg_len;
+            }
+        }
+    }
+
+    None
+}
+
 /// Apply an EXIF orientation transform (1–8) to decoded RGBA pixel data.
 ///
 /// Orientation 1 returns the input unchanged. Orientations 2–8 produce a
@@ -407,20 +471,77 @@ pub fn apply_orientation(decoded: DecodedRgba, orientation: u8) -> DecodedRgba {
     }
 }
 
+/// Downscale a decoded RGBA image so the longer edge ≤ `max_edge`,
+/// preserving aspect ratio.  Does nothing when `max_edge` is `None` or
+/// when the image already fits within the cap (no upscaling).
+fn apply_max_edge(decoded: DecodedRgba, max_edge: Option<u32>) -> DecodedRgba {
+    let Some(cap) = max_edge else { return decoded; };
+    let long_edge = decoded.width.max(decoded.height);
+    if long_edge <= cap {
+        return decoded;
+    }
+
+    let scale = cap as f64 / long_edge as f64;
+    let new_w = (decoded.width as f64 * scale).round() as i32;
+    let new_h = (decoded.height as f64 * scale).round() as i32;
+
+    // Reconstruct a Pixbuf from the tightly-packed RGBA data, scale it, and
+    // read back tightly-packed pixels.  This is the simplest approach that
+    // works uniformly for both the gdk-pixbuf and libheif code paths.
+    let stride = decoded.width as usize * 4;
+    let bytes = glib::Bytes::from_owned(decoded.pixels);
+    let src_pb = gtk::gdk_pixbuf::Pixbuf::from_bytes(
+        &bytes,
+        gtk::gdk_pixbuf::Colorspace::Rgb,
+        true, // has_alpha — DecodedRgba is always RGBA
+        8,    // bits per sample
+        decoded.width as i32,
+        decoded.height as i32,
+        stride as i32,
+    );
+
+    let scaled = src_pb
+        .scale_simple(new_w, new_h, gtk::gdk_pixbuf::InterpType::Bilinear)
+        .expect("scale_simple should succeed for valid dimensions");
+
+    let w = scaled.width() as u32;
+    let h = scaled.height() as u32;
+    let scaled_stride = scaled.rowstride() as usize;
+    let src = scaled.read_pixel_bytes();
+    let src = src.as_ref();
+
+    let mut pixels = Vec::with_capacity(w as usize * h as usize * 4);
+    for y in 0..h as usize {
+        let row = &src[y * scaled_stride..y * scaled_stride + w as usize * 4];
+        pixels.extend_from_slice(row);
+    }
+
+    DecodedRgba { width: w, height: h, pixels }
+}
+
 /// Read the file at `path`, decode it (JPEG/PNG/etc. via gdk-pixbuf; HEIC/HEIF
 /// via libheif), apply EXIF orientation (JPEG/PNG only — libheif applies it
-/// internally), and return tightly-packed RGBA pixels.
+/// internally), optionally cap the longer edge to `max_edge`, and return
+/// tightly-packed RGBA pixels.
+///
+/// When `max_edge` is `Some(n)` the decoded image is downscaled so its longer
+/// side ≤ `n`, preserving aspect ratio.  Never upscales.  When `max_edge` is
+/// `None` the image is returned at full resolution.
 ///
 /// This is a synchronous, CPU/memory-bound function intended to be called from
 /// `tokio::task::spawn_blocking` — never call it on the GTK main thread.
-pub fn decode_image_rgba(path: &Path) -> Result<DecodedRgba, ImageLoadError> {
+pub fn decode_image_rgba(
+    path: &Path,
+    max_edge: Option<u32>,
+) -> Result<DecodedRgba, ImageLoadError> {
     // HEIC/HEIF: delegate to libheif (applies EXIF orientation internally).
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
     if matches!(ext.as_deref(), Some("heic") | Some("heif")) {
-        return decode_heic_to_rgba(path);
+        let decoded = decode_heic_to_rgba(path)?;
+        return Ok(apply_max_edge(decoded, max_edge));
     }
 
     let bytes = std::fs::read(path).map_err(|e| {
@@ -435,6 +556,26 @@ pub fn decode_image_rgba(path: &Path) -> Result<DecodedRgba, ImageLoadError> {
 
     // Decode from memory via gdk-pixbuf
     let loader = gtk::gdk_pixbuf::PixbufLoader::new();
+    if let Some(cap) = max_edge {
+        // Best-effort: ask the loader to decode at the target size,
+        // preserving aspect ratio.  We first read the source dimensions
+        // from the file header so we can compute the correct target
+        // width/height — this avoids upscaling or stretching.
+        //
+        // If we cannot determine the source dimensions (unrecognised
+        // format) or the image already fits within the cap, we skip
+        // set_size entirely; apply_max_edge at the end of this function
+        // guarantees the output respects the cap.
+        if let Some((img_w, img_h)) = read_image_dimensions(&bytes) {
+            let long_edge = img_w.max(img_h);
+            if long_edge > cap {
+                let scale = cap as f64 / long_edge as f64;
+                let target_w = (img_w as f64 * scale).round() as i32;
+                let target_h = (img_h as f64 * scale).round() as i32;
+                loader.set_size(target_w, target_h);
+            }
+        }
+    }
     loader
         .write(&bytes)
         .map_err(|e| ImageLoadError::DecodeFailed(e.to_string()))?;
@@ -469,7 +610,7 @@ pub fn decode_image_rgba(path: &Path) -> Result<DecodedRgba, ImageLoadError> {
         height: h,
         pixels,
     };
-    Ok(apply_orientation(decoded, orientation))
+    Ok(apply_max_edge(apply_orientation(decoded, orientation), max_edge))
 }
 
 /// Dispatch `work` for each path on a `spawn_blocking` thread and call
@@ -487,12 +628,17 @@ where
     W: Fn(&Path) -> Result<DecodedRgba, ImageLoadError> + Send + Sync + 'static,
     D: Fn(Result<DecodedRgba, ImageLoadError>) + Send + Sync + 'static,
 {
+    const MAX_CONCURRENT_DECODES: usize = 3;
+
     let work = Arc::new(work);
     let deliver = Arc::new(deliver);
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DECODES));
     for path in items {
         let work = Arc::clone(&work);
         let deliver = Arc::clone(&deliver);
+        let sem = Arc::clone(&sem);
         crate::runtime::runtime().spawn(async move {
+            let _permit = sem.acquire().await.expect("semaphore should not be closed");
             let result = tokio::task::spawn_blocking(move || work(&path)).await;
             let result = match result {
                 Ok(r) => r,
@@ -507,10 +653,13 @@ where
 /// given paths (via [`decode_image_rgba`]) on `spawn_blocking` threads and
 /// invokes `on_each` on the GTK main thread with each result as it arrives.
 ///
+/// `max_edge` is forwarded to each [`decode_image_rgba`] call — see that
+/// function's documentation for details.
+///
 /// `on_each` does not need to be `Send` — delivery is always on the main
 /// thread.  The outer dispatcher uses a channel to ferry results from the
 /// tokio worker threads to the GTK main loop.
-pub fn schedule_image_loads<F>(items: Vec<PathBuf>, on_each: F)
+pub fn schedule_image_loads<F>(items: Vec<PathBuf>, max_edge: Option<u32>, on_each: F)
 where
     F: Fn(Result<DecodedRgba, ImageLoadError>) + Clone + 'static,
 {
@@ -521,7 +670,7 @@ where
 
     schedule_parallel(
         items,
-        |path: &Path| decode_image_rgba(path),
+        move |path: &Path| decode_image_rgba(path, max_edge),
         move |result| {
             // send on an unbounded channel is non-blocking; send_blocking
             // on an unbounded channel never blocks.
@@ -606,7 +755,7 @@ mod tests {
             .expect("create temp .heic file");
         std::fs::write(temp.path(), HEIC_FIXTURE).expect("write HEIC fixture bytes");
 
-        let result = decode_image_rgba(temp.path());
+        let result = decode_image_rgba(temp.path(), None);
 
         assert!(
             result.is_ok(),
@@ -1130,6 +1279,186 @@ mod tests {
     }
 
     // =======================================================================
+    // max_edge parameter: decode_image_rgba(path, max_edge)
+    //
+    // The `decode_image_rgba` and `schedule_image_loads` functions gain a
+    // new `max_edge: Option<u32>` parameter.  When Some(n), the decoded
+    // image is downscaled so the longer edge ≤ n, preserving aspect ratio.
+    // When None, the image is decoded at full resolution.  Do NOT upscale
+    // when the source is already smaller than n.
+    //
+    // The test below synthesises a 200×400 PNG, then calls
+    // decode_image_rgba with several max_edge values and asserts the
+    // returned dimensions.
+    //
+    // These tests will not compile until the max_edge parameter is added
+    // to the production signature — that compile error IS the expected
+    // red state.
+    // =======================================================================
+
+    #[test]
+    fn decode_image_rgba_respects_max_edge() {
+        // ---------- Create a known-size test PNG (200 × 400) ----------
+        let pb = gtk::gdk_pixbuf::Pixbuf::new(
+            gtk::gdk_pixbuf::Colorspace::Rgb,
+            true, // has_alpha
+            8,    // bits per sample
+            200,  // width
+            400,  // height
+        )
+        .expect("create 200×400 test pixbuf");
+
+        // Fill with a simple non-zero pattern via the unsafe pixel buffer.
+        let buf = unsafe { pb.pixels() };
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i % 256) as u8;
+        }
+
+        // Save as PNG bytes and write to a temp file.
+        let png_bytes = pb
+            .save_to_bufferv("png", &[])
+            .expect("encode test pixbuf as PNG");
+        let temp = tempfile::Builder::new()
+            .suffix(".png")
+            .tempfile()
+            .expect("create temp .png file");
+        std::fs::write(temp.path(), &png_bytes)
+            .expect("write PNG bytes to temp file");
+
+        // ---------- max_edge = Some(100) → cap at 100 on long edge ----------
+        // Long edge is 400, cap is 100 → scale factor = 100/400 = 0.25.
+        // width: 200 * 0.25 = 50,  height: 400 * 0.25 = 100.
+        let result = decode_image_rgba(temp.path(), Some(100));
+        assert!(
+            result.is_ok(),
+            "expected Ok for max_edge=Some(100), got Err: {:?}",
+            result
+        );
+        let decoded = result.unwrap();
+        assert_eq!(
+            decoded.width, 50,
+            "width should be scaled to 50 (200 × 100÷400)"
+        );
+        assert_eq!(
+            decoded.height, 100,
+            "height should be capped at 100 (400 × 100÷400)"
+        );
+
+        // ---------- max_edge = None → full resolution ----------
+        let result = decode_image_rgba(temp.path(), None);
+        assert!(
+            result.is_ok(),
+            "expected Ok for max_edge=None, got Err: {:?}",
+            result
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.width, 200, "width should be 200 (full resolution)");
+        assert_eq!(
+            decoded.height, 400,
+            "height should be 400 (full resolution)"
+        );
+
+        // ---------- max_edge = Some(1000) → no upscale ----------
+        // Source (200×400) is already smaller than 1000 on the long edge.
+        let result = decode_image_rgba(temp.path(), Some(1000));
+        assert!(
+            result.is_ok(),
+            "expected Ok for max_edge=Some(1000), got Err: {:?}",
+            result
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.width, 200, "width should be 200 (no upscale)");
+        assert_eq!(
+            decoded.height, 400,
+            "height should be 400 (no upscale)"
+        );
+    }
+
+    #[test]
+    fn decode_image_rgba_respects_max_edge_for_large_images() {
+        // ---------- Create a large 2000×2000 test PNG (~16 MB raw) ----------
+        let pb = gtk::gdk_pixbuf::Pixbuf::new(
+            gtk::gdk_pixbuf::Colorspace::Rgb,
+            true, // has_alpha
+            8,    // bits per sample
+            2000, // width
+            2000, // height
+        )
+        .expect("create 2000×2000 test pixbuf");
+
+        // Fill with a non-zero pattern.
+        let buf = unsafe { pb.pixels() };
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i % 256) as u8;
+        }
+
+        // Encode as PNG and write to a temp file.
+        let png_bytes = pb
+            .save_to_bufferv("png", &[])
+            .expect("encode large test pixbuf as PNG");
+        let temp = tempfile::Builder::new()
+            .suffix(".png")
+            .tempfile()
+            .expect("create temp .png file");
+        std::fs::write(temp.path(), &png_bytes)
+            .expect("write large PNG bytes to temp file");
+
+        // ---------- max_edge = Some(100) → cap at 100 ----------
+        // Square 2000×2000, long edge = 2000, cap = 100 → scale = 100/2000 = 0.05
+        // → width = 2000 * 0.05 = 100, height = 2000 * 0.05 = 100.
+        let result = decode_image_rgba(temp.path(), Some(100));
+        assert!(
+            result.is_ok(),
+            "expected Ok for max_edge=Some(100) on large image, got Err: {:?}",
+            result
+        );
+        let decoded = result.unwrap();
+        assert_eq!(
+            decoded.width, 100,
+            "width should be scaled to 100 (2000 × 100÷2000)"
+        );
+        assert_eq!(
+            decoded.height, 100,
+            "height should be scaled to 100 (2000 × 100÷2000)"
+        );
+
+        // ---------- max_edge = None → full resolution ----------
+        let result = decode_image_rgba(temp.path(), None);
+        assert!(
+            result.is_ok(),
+            "expected Ok for max_edge=None on large image, got Err: {:?}",
+            result
+        );
+        let decoded = result.unwrap();
+        assert_eq!(
+            decoded.width, 2000,
+            "width should be 2000 (full resolution)"
+        );
+        assert_eq!(
+            decoded.height, 2000,
+            "height should be 2000 (full resolution)"
+        );
+
+        // ---------- max_edge = Some(5000) → no upscale ----------
+        // Source 2000×2000 is already smaller than 5000 on the long edge.
+        let result = decode_image_rgba(temp.path(), Some(5000));
+        assert!(
+            result.is_ok(),
+            "expected Ok for max_edge=Some(5000) on large image, got Err: {:?}",
+            result
+        );
+        let decoded = result.unwrap();
+        assert_eq!(
+            decoded.width, 2000,
+            "width should be 2000 (no upscale)"
+        );
+        assert_eq!(
+            decoded.height, 2000,
+            "height should be 2000 (no upscale)"
+        );
+    }
+
+    // =======================================================================
     // Schedule outside tokio context (regression test)
     // =======================================================================
 
@@ -1189,5 +1518,76 @@ mod tests {
         for (i, r) in results.iter().enumerate() {
             assert!(r.is_ok(), "result {i} should be Ok, got {r:?}");
         }
+    }
+
+    // =======================================================================
+    // Concurrency cap: schedule_parallel is limited to MAX_IN_FLIGHT in-flight
+    // work items at any time
+    // =======================================================================
+
+    const EXPECTED_MAX_IN_FLIGHT: usize = 3;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn schedule_parallel_caps_concurrent_work_and_completes_all_items() {
+        // N = 10 items — well above the cap of 3, so the cap is exercised.
+        let n = 10usize;
+        let paths: Vec<PathBuf> = (0..n)
+            .map(|i| PathBuf::from(format!("/tmp/test-capped-{i}.jpg")))
+            .collect();
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let deliver_count = Arc::new(AtomicUsize::new(0));
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+        let work = {
+            let infl = Arc::clone(&in_flight);
+            let max_infl = Arc::clone(&max_in_flight);
+            move |_path: &Path| -> Result<DecodedRgba, ImageLoadError> {
+                let prev = infl.fetch_add(1, Ordering::SeqCst);
+                let cur = prev + 1;
+                max_infl.fetch_max(cur, Ordering::SeqCst);
+                // Sleep long enough that the cap window is observable.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                infl.fetch_sub(1, Ordering::SeqCst);
+                Ok(DecodedRgba {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; 4],
+                })
+            }
+        };
+
+        let deliver = {
+            let dc = Arc::clone(&deliver_count);
+            let done_tx = done_tx.clone();
+            move |_result: Result<DecodedRgba, ImageLoadError>| {
+                dc.fetch_add(1, Ordering::SeqCst);
+                let _ = done_tx.send(());
+            }
+        };
+
+        schedule_parallel(paths, work, deliver);
+
+        // Wait for all N deliveries with a generous timeout.
+        for _ in 0..n {
+            tokio::time::timeout(std::time::Duration::from_secs(5), done_rx.recv())
+                .await
+                .expect("timeout waiting for delivery")
+                .expect("channel closed before all deliveries");
+        }
+
+        let max = max_in_flight.load(Ordering::SeqCst);
+        assert!(
+            max <= EXPECTED_MAX_IN_FLIGHT,
+            "expected at most {} concurrent work items, got {max}",
+            EXPECTED_MAX_IN_FLIGHT,
+        );
+
+        let delivered = deliver_count.load(Ordering::SeqCst);
+        assert_eq!(
+            delivered, n,
+            "all {n} items should be delivered, got {delivered}"
+        );
     }
 }
