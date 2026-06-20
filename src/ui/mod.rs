@@ -18,9 +18,19 @@ use regex::Regex;
 use crate::gtk_bridge;
 use crate::protocol::{Backend, Connection, ImClient, RecvEvent};
 use crate::store::{
-    AttachmentRecord, ChatRef, ChatSummary, IncomingMessage, Ingest, MessageLinkPreview, Store,
-    StoredAttachment, StoredMessage,
+    group_tapbacks_by_target, live_tapbacks, AttachmentRecord, ChatRef, ChatSummary,
+    IncomingMessage, Ingest, LiveReactionSummary, MessageLinkPreview, Store, StoredAttachment,
+    StoredMessage,
 };
+#[cfg(feature = "rustpush")]
+use crate::store::Tapback;
+#[cfg(feature = "rustpush")]
+use rustpush::{Reaction, ReactMessageType};
+
+/// Callback type for the reaction emoji picker: receives the target message
+/// GUID, the reaction index (0-5), and the target message's text (for the
+/// wire-level `ams` field).
+type ReactionHandler = dyn Fn(String, usize, String);
 
 /// Phase D default: send read receipts when a chat is viewed. Becomes a user
 /// setting once a settings module exists.
@@ -114,6 +124,19 @@ statuspage.empty-hero > scrolledwindow > viewport > box > clamp > box > .icon {
 }
 .bubble-appear {
   animation: bubble-appear 0.2s ease-out;
+}
+
+/* Reaction chips on message bubbles. Both reaction types use the same
+   light grey pill — visible against both the grey incoming bubble and the
+   blue sent bubble, and gives every emoji (including the red ‼) a
+   neutral background to read clearly against. */
+.reaction-chip,
+.reaction-chip-self {
+  font-size: 0.9em;
+  padding: 3px 8px;
+  border-radius: 12px;
+  background-color: #f0f0f3;
+  color: #161616;
 }
 
 /* iMessage rich link (sender-generated preview) card. */
@@ -1567,9 +1590,13 @@ impl Ui {
                 if let Some((_, date)) = &latest {
                     let _ = store.mark_read_through(chat_id, *date).await;
                 }
-                (msgs, previews, first, latest.map(|(g, _)| g))
+                // Fetch tapbacks and group for reaction chips.
+                let tapbacks = store.tapbacks_for_chat(chat_id).await.unwrap_or_default();
+                let live = live_tapbacks(&tapbacks);
+                let reactions = group_tapbacks_by_target(live);
+                (msgs, previews, first, latest.map(|(g, _)| g), reactions)
             },
-            move |(msgs, previews, first, receipt_guid)| {
+            move |(msgs, previews, first, receipt_guid, reactions)| {
                 // Reset pagination for the newly opened chat.
                 *ui.page_oldest.borrow_mut() = msgs.first().map(|m| (m.date, m.id));
                 *ui.page_has_more.borrow_mut() = msgs.len() as i64 >= PAGE_SIZE;
@@ -1577,7 +1604,8 @@ impl Ui {
                 *ui.unread.borrow_mut() = first.clone();
 
                 let anchor = first.as_ref().map(|(g, _)| g.as_str());
-                let marker = populate_messages(&ui.msg_container, &msgs, is_group, anchor, &previews, &ui.preview_cards);
+                let on_reaction = ui.make_reaction_handler();
+                let marker = populate_messages(&ui.msg_container, &msgs, is_group, anchor, &previews, &ui.preview_cards, on_reaction.as_ref(), &reactions);
                 *ui.unread_marker_shown.borrow_mut() = marker.is_some();
                 *ui.unread_marker.borrow_mut() = marker.clone();
                 ui.update_unread_pill();
@@ -1633,9 +1661,13 @@ impl Ui {
                 } else {
                     None
                 };
-                (msgs, previews, first)
+                // Fetch tapbacks and group for reaction chips.
+                let tapbacks = store.tapbacks_for_chat(chat_id).await.unwrap_or_default();
+                let live = live_tapbacks(&tapbacks);
+                let reactions = group_tapbacks_by_target(live);
+                (msgs, previews, first, reactions)
             },
-            move |(res, previews, first)| {
+            move |(res, previews, first, reactions)| {
                 let msgs = res.unwrap_or_else(|e| {
                     eprintln!("messages load error: {e:#}");
                     Vec::new()
@@ -1647,6 +1679,7 @@ impl Ui {
                 let at_bottom = adj.value() + adj.page_size() >= adj.upper() - 80.0;
                 let prev = adj.value();
                 let anchor = ui.unread.borrow().as_ref().map(|(g, _)| g.clone());
+                let on_reaction = ui.make_reaction_handler();
                 let marker = populate_messages(
                     &ui.msg_container,
                     &msgs,
@@ -1654,6 +1687,8 @@ impl Ui {
                     anchor.as_deref(),
                     &previews,
                     &ui.preview_cards,
+                    on_reaction.as_ref(),
+                    &reactions,
                 );
                 *ui.unread_marker_shown.borrow_mut() = marker.is_some();
                 *ui.unread_marker.borrow_mut() = marker.clone();
@@ -1708,9 +1743,15 @@ impl Ui {
                 } else {
                     Default::default()
                 };
-                (older, previews)
+                // Also fetch tapbacks for the chat so older messages (prepended
+                // by this page) get reaction chips. Without this, `build_message_widgets`
+                // would have no `reactions` map to look up, and old tapbacks would
+                // never render when the user scrolls up.
+                let tapbacks = store.tapbacks_for_chat(chat_id).await.unwrap_or_default();
+                let reactions = group_tapbacks_by_target(live_tapbacks(&tapbacks));
+                (older, previews, reactions)
             },
-            move |(res, previews)| {
+            move |(res, previews, reactions)| {
                 let older = res.unwrap_or_default();
                 // Bail if the user switched chats while we were loading.
                 let still_open = ui
@@ -1764,8 +1805,16 @@ impl Ui {
                 // this page contains the first unread, the divider slots in here
                 // and the floating pill is dismissed.
                 let anchor = ui.unread.borrow().as_ref().map(|(g, _)| g.clone());
-                let (widgets, marker) =
-                    build_message_widgets(&older, is_group, anchor.as_deref(), &previews, &ui.preview_cards);
+                let on_reaction = ui.make_reaction_handler();
+                let (widgets, marker) = build_message_widgets(
+                    &older,
+                    is_group,
+                    anchor.as_deref(),
+                    &previews,
+                    &ui.preview_cards,
+                    on_reaction.as_ref(),
+                    &reactions,
+                );
                 for w in widgets.into_iter().rev() {
                     ui.msg_container.prepend(&w);
                 }
@@ -1879,9 +1928,13 @@ impl Ui {
                 } else {
                     Default::default()
                 };
-                (msgs, previews)
+                // Fetch tapbacks and group for reaction chips.
+                let tapbacks = store.tapbacks_for_chat(chat_id).await.unwrap_or_default();
+                let live = live_tapbacks(&tapbacks);
+                let reactions = group_tapbacks_by_target(live);
+                (msgs, previews, reactions)
             },
-            move |(res, previews)| {
+            move |(res, previews, reactions)| {
                 let msgs = res.unwrap_or_default();
                 let still_open = ui
                     .open_summary
@@ -1895,6 +1948,7 @@ impl Ui {
                 // Read history still sits above the first unread.
                 *ui.page_has_more.borrow_mut() = true;
                 *ui.page_loading.borrow_mut() = false;
+                let on_reaction = ui.make_reaction_handler();
                 let marker = populate_messages(
                     &ui.msg_container,
                     &msgs,
@@ -1902,6 +1956,8 @@ impl Ui {
                     Some(guid.as_str()),
                     &previews,
                     &ui.preview_cards,
+                    on_reaction.as_ref(),
+                    &reactions,
                 );
                 *ui.unread_marker_shown.borrow_mut() = marker.is_some();
                 *ui.unread_marker.borrow_mut() = marker.clone();
@@ -2106,6 +2162,105 @@ impl Ui {
                 );
             },
         );
+    }
+
+    /// Send a tapback reaction to a target message. The optimistic insert +
+    /// network send pattern mirrors `send_text`.
+    #[cfg(feature = "rustpush")]
+    fn send_reaction(&self, target_guid: &str, index: usize, target_text: &str) {
+        let reaction = match index {
+            0 => Reaction::Heart,
+            1 => Reaction::Like,
+            2 => Reaction::Dislike,
+            3 => Reaction::Laugh,
+            4 => Reaction::Emphasize,
+            5 => Reaction::Question,
+            _ => return,
+        };
+        let reaction_msg = ReactMessageType::React {
+            reaction,
+            enable: true,
+        };
+
+        let Some(chat) = self.open_summary.borrow().clone() else {
+            return;
+        };
+        let Some(my_handle) = self_handle(&chat.participants, &self.handles) else {
+            eprintln!("no self handle in chat; cannot send reaction");
+            return;
+        };
+        let chat_ref = chat_ref_of(&chat);
+
+        let tapback = Tapback {
+            guid: new_guid(),
+            chat: chat_ref.clone(),
+            sender: Some(my_handle.clone()),
+            is_from_me: true,
+            date: now_ms(),
+            associated_guid: target_guid.to_string(),
+            associated_part: None,
+            associated_type: 2000 + index as i64,
+        };
+
+        let store = self.store.clone();
+        let backend = self.backend.clone();
+        let client = self.client.clone();
+        let ui = self.clone();
+        let guid_owned = target_guid.to_string();
+        let text_owned = target_text.to_string();
+        let chat_id = chat.id;
+        let is_group = chat.is_group;
+
+        gtk_bridge::spawn(
+            async move { store.apply(Ingest::Tapback(tapback)).await },
+            move |res| {
+                if let Err(e) = res {
+                    eprintln!("optimistic tapback insert failed: {e:#}");
+                }
+                ui.reload_messages(chat_id, is_group);
+                ui.reload_chats();
+                gtk_bridge::spawn(
+                    async move {
+                        backend
+                            .send_reaction(
+                                &client,
+                                &chat_ref,
+                                &my_handle,
+                                &guid_owned,
+                                None,
+                                &text_owned,
+                                &reaction_msg,
+                            )
+                            .await?;
+                        Ok::<(), anyhow::Error>(())
+                    },
+                    move |res| {
+                        if let Err(e) = res {
+                            eprintln!("reaction send failed: {e:#}");
+                        }
+                    },
+                );
+            },
+        );
+    }
+
+    /// Build a closure suitable as the `on_reaction` callback for
+    /// `populate_messages` / `build_message_widgets`. With the `rustpush` feature
+    /// it dispatches to `send_reaction`; without it, it logs a stub message.
+    fn make_reaction_handler(&self) -> Option<Rc<ReactionHandler>> {
+        #[cfg(feature = "rustpush")]
+        {
+            let ui = self.clone();
+            Some(Rc::new(move |guid, index, target_text| {
+                ui.send_reaction(&guid, index, &target_text)
+            }))
+        }
+        #[cfg(not(feature = "rustpush"))]
+        {
+            Some(Rc::new(move |_guid, index, _target_text| {
+                eprintln!("reaction {} send skipped (rustpush feature disabled)", index);
+            }))
+        }
     }
 
     /// Ack the newest unread inbound message (implicitly marking earlier ones read).
@@ -2400,6 +2555,8 @@ fn build_message_widgets(
     unread_anchor: Option<&str>,
     previews: &std::collections::HashMap<(String, i64), MessageLinkPreview>,
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
+    on_reaction: Option<&Rc<ReactionHandler>>,
+    reactions: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
 ) -> (Vec<gtk::Widget>, Option<gtk::Widget>) {
     let mut out = Vec::with_capacity(msgs.len());
     let mut marker: Option<gtk::Widget> = None;
@@ -2414,6 +2571,10 @@ fn build_message_widgets(
             last_key = None;
             last_from_me = None;
         }
+        // Skip tapback rows — they render as reaction chips on the target message.
+        if m.associated_guid.is_some() {
+            continue;
+        }
         let key = group_key(m);
         let show_header =
             last_key.as_deref() != Some(key.as_str()) || m.date - last_date > GROUP_GAP_MS;
@@ -2427,7 +2588,13 @@ fn build_message_widgets(
         } else {
             2
         };
-        out.push(message_widget(m, show_header, is_group, top, previews, preview_cards));
+        // Look up the chip for this message in the reactions map (same as
+        // populate_messages does for the initial page). Without this, messages
+        // loaded by maybe_load_older never get reaction chips.
+        let chip = reactions
+            .get(&m.guid)
+            .map(|chips| reaction_chips_row(chips));
+        out.push(message_widget(m, show_header, is_group, top, previews, preview_cards, on_reaction, chip.as_ref()));
         last_key = Some(key);
         last_date = m.date;
         last_from_me = Some(m.is_from_me);
@@ -2435,6 +2602,7 @@ fn build_message_widgets(
     (out, marker)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn populate_messages(
     container: &gtk::Box,
     msgs: &[StoredMessage],
@@ -2442,6 +2610,8 @@ fn populate_messages(
     unread_anchor: Option<&str>,
     previews: &std::collections::HashMap<(String, i64), MessageLinkPreview>,
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
+    on_reaction: Option<&Rc<ReactionHandler>>,
+    reactions: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
 ) -> Option<gtk::Widget> {
     clear_box(container);
     // Stale card handles from the previous render are about to be destroyed
@@ -2453,9 +2623,16 @@ fn populate_messages(
     let mut last_from_me: Option<bool> = None;
     let mut marker: Option<gtk::Widget> = None;
     // The single message that carries the Delivered/Read indicator.
-    let last_sent_idx = msgs.iter().rposition(|m| m.is_from_me);
+    // Skip tapback rows — they render as chips on the target message.
+    let last_sent_idx = msgs.iter().rposition(|m| m.is_from_me && m.associated_guid.is_none());
 
     for (i, m) in msgs.iter().enumerate() {
+        // Tapback rows are rendered as reaction chips on the target message,
+        // not as standalone bubbles. Skip them here.
+        if m.associated_guid.is_some() {
+            continue;
+        }
+
         // Place the "new messages" divider immediately before the exact first
         // unread message (matched by guid), so it can't drift to the top of a
         // partially-loaded window.
@@ -2483,7 +2660,25 @@ fn populate_messages(
         } else {
             2
         };
-        container.append(&message_widget(m, show_header, is_group, top, previews, preview_cards));
+
+        // Reaction chips: the chip is built here and passed into the message
+        // widget so it can be placed at the top corner of the bubble
+        // (inside `bubble_box`, which is now vertical). The chip's `halign` is
+        // set by `bubble_box` based on `own` so it lands at the correct
+        // corner for incoming (top-right) vs sent (top-left) messages.
+        let chip = reactions
+            .get(&m.guid)
+            .map(|chips| reaction_chips_row(chips));
+        container.append(&message_widget(
+            m,
+            show_header,
+            is_group,
+            top,
+            previews,
+            preview_cards,
+            on_reaction,
+            chip.as_ref(),
+        ));
 
         // Delivered/Read indicator: only under the most recent sent message, so
         // it moves forward as new messages are sent and never lingers on older ones.
@@ -2505,6 +2700,37 @@ fn populate_messages(
         last_from_me = Some(m.is_from_me);
     }
     marker
+}
+
+/// A row of small reaction chips overlaid on a message bubble corner. Each chip
+/// shows the emoji and, if count > 1, a count. Chips for reactions the current
+/// user sent get a distinct visual class.
+fn reaction_chips_row(chips: &[LiveReactionSummary]) -> gtk::Widget {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .margin_top(0)
+        .margin_bottom(0)
+        .build();
+    for chip in chips {
+        let emoji = code_to_emoji(2000 + chip.reaction_index as i64).unwrap_or("?");
+        let text = if chip.count > 1 {
+            format!("{} {}", emoji, chip.count)
+        } else {
+            emoji.to_string()
+        };
+        let label = gtk::Label::builder()
+            .label(&text)
+            .build();
+        if chip.my_reacted {
+            label.add_css_class("reaction-chip-self");
+        } else {
+            label.add_css_class("reaction-chip");
+        }
+        row.append(&label);
+    }
+
+    row.upcast()
 }
 
 /// "Read 16:06" if read, else "Delivered" if delivered, else nothing.
@@ -2837,15 +3063,19 @@ fn message_widget(
     top: i32,
     previews: &std::collections::HashMap<(String, i64), MessageLinkPreview>,
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
+    on_reaction: Option<&Rc<dyn Fn(String, usize, String)>>,
+    chip: Option<&gtk::Widget>,
 ) -> gtk::Widget {
     if m.is_from_me {
-        own_message(m, show_header, top, previews, preview_cards)
+        own_message(m, show_header, top, previews, preview_cards, chip)
     } else {
-        incoming_message(m, show_header, is_group, top, previews, preview_cards)
+        incoming_message(m, show_header, is_group, top, previews, preview_cards, on_reaction, chip)
     }
 }
 
 /// Left: grey bubble, with an avatar + sender name in group chats only.
+/// On incoming messages, a right-click gesture opens a popover with the 6
+/// standard tapback emoji buttons.
 fn incoming_message(
     m: &StoredMessage,
     show_header: bool,
@@ -2853,6 +3083,8 @@ fn incoming_message(
     top: i32,
     previews: &std::collections::HashMap<(String, i64), MessageLinkPreview>,
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
+    on_reaction: Option<&Rc<ReactionHandler>>,
+    chip: Option<&gtk::Widget>,
 ) -> gtk::Widget {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -2896,13 +3128,74 @@ fn incoming_message(
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
         .build();
-    line.append(&message_body(m, false, previews, preview_cards));
+
+    // Build the reaction popover early (before the message body) so the text
+    // label's extra menu can share the same popover via the show_picker callback.
+    let show_picker: Option<Rc<dyn Fn()>> = on_reaction.map(|cb| {
+        let popover = gtk::Popover::builder()
+            .autohide(true)
+            .build();
+
+        let emoji_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(0)
+            .margin_start(4)
+            .margin_end(4)
+            .margin_top(4)
+            .margin_bottom(4)
+            .build();
+
+        let target_guid = m.guid.clone();
+        let target_text = extract_target_text(m);
+        for (i, entry) in REACTIONS.iter().enumerate() {
+            let btn = gtk::Button::builder()
+                .label(entry.emoji)
+                .css_classes(["flat", "circular"])
+                .build();
+            let cb = cb.clone();
+            let guid = target_guid.clone();
+            let text = target_text.clone();
+            let popover = popover.clone();
+            btn.connect_clicked(move |_| {
+                cb(guid.clone(), i, text.clone());
+                popover.popdown();
+            });
+            emoji_box.append(&btn);
+        }
+
+        popover.set_child(Some(&emoji_box));
+        popover.set_parent(&row);
+
+        // Right-click gesture on the row (fires on clicks outside the label).
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(3);
+        let popover2 = popover.clone();
+        gesture.connect_released(move |_gesture, _n, _x, _y| {
+            popover2.popup();
+        });
+        row.add_controller(gesture);
+
+        // Shared show-picker closure — called from both the row gesture and
+        // the label's "Reaction" extra menu item.
+        let picker: Rc<dyn Fn()> = Rc::new(move || popover.popup());
+        picker
+    });
+
+    line.append(&message_body(
+        m,
+        false,
+        previews,
+        preview_cards,
+        show_picker.as_ref(),
+        chip,
+    ));
     if show_header {
         line.append(&time_label(m));
     }
     col.append(&line);
 
     row.append(&col);
+
     row.upcast()
 }
 
@@ -2913,6 +3206,7 @@ fn own_message(
     top: i32,
     previews: &std::collections::HashMap<(String, i64), MessageLinkPreview>,
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
+    chip: Option<&gtk::Widget>,
 ) -> gtk::Widget {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -2930,7 +3224,7 @@ fn own_message(
     if show_header {
         line.append(&time_label(m));
     }
-    line.append(&message_body(m, true, previews, preview_cards));
+    line.append(&message_body(m, true, previews, preview_cards, None, chip));
 
     row.append(&line);
     row.upcast()
@@ -2946,6 +3240,8 @@ fn message_body(
     own: bool,
     previews: &std::collections::HashMap<(String, i64), MessageLinkPreview>,
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
+    show_picker: Option<&Rc<dyn Fn()>>,
+    chip: Option<&gtk::Widget>,
 ) -> gtk::Widget {
     let col = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -2976,12 +3272,12 @@ fn message_body(
     let is_tapback = m.associated_guid.is_some();
     if has_text || is_tapback {
         let bubble = bubble_box(own);
-        bubble.append(&bubble_label(&body_text(m)));
-        col.append(&bubble);
+        bubble.append(&bubble_label(&body_text(m), show_picker));
+        col.append(&bubble_with_chip(&bubble, own, chip));
     } else if m.attachments.is_empty() {
         let bubble = bubble_box(own);
-        bubble.append(&bubble_label("(no text)"));
-        col.append(&bubble);
+        bubble.append(&bubble_label("(no text)", show_picker));
+        col.append(&bubble_with_chip(&bubble, own, chip));
     }
 
     // Sender-generated link preview (iMessage rich link). The store already
@@ -3290,8 +3586,95 @@ fn file_chip(att: &StoredAttachment, own: bool) -> gtk::Widget {
 }
 
 /// A rounded bubble container; `own` selects blue-on-white vs grey-on-dark.
+/// Wrap the bubble in a `gtk::Fixed` so a reaction chip (if provided) can
+/// straddle the bubble's top corner — half on, half off (iMessage look).
+/// `GtkFixed` lets us position the chip at explicit coordinates; we compute
+/// the corner-straddling position from the bubble's allocation via a
+/// `connect_allocate` callback so the chip stays anchored as the bubble
+/// resizes. GTK CSS can't do this (no `position: absolute`/`top`/`right`),
+/// and `set_translate` isn't in the `gtk4 0.11` bindings, so `Fixed` is the
+/// only path that works.
+/// Wrap the bubble in a `GtkOverlay` so a reaction chip (if provided) can
+/// be placed at the bubble's top corner. The overlay's main child is the
+/// bubble itself — nothing wider — so the overlay sizes to the bubble. We
+/// use `connect_get_child_position` to return a `gdk::Rectangle` for the
+/// chip that places its *center* exactly at the bubble's top edge corner,
+/// so the chip straddles the edge — half on, half off (the iMessage
+/// tapback look). The rectangle is relative to the main child, and
+/// negative coordinates are legal here (this is NOT a CSS margin, so it
+/// doesn't trigger the negative-margin panic).
+///
+/// `connect_get_child_position` is a typed wrapper in `gtk4 0.11.3` that
+/// uses `connect_raw` internally — it does NOT go through `connect_local`
+/// by string name, so it doesn't panic with "Signal not found" the way
+/// the earlier `size-allocate` attempts did. The handler re-fires on
+/// every re-layout, so the position self-corrects if the first pass is
+/// imperfect.
+fn bubble_with_chip(bubble: &gtk::Box, own: bool, chip: Option<&gtk::Widget>) -> gtk::Widget {
+    let Some(c) = chip else {
+        return bubble.clone().upcast();
+    };
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(bubble));
+    overlay.set_hexpand(false);
+    overlay.set_halign(if own {
+        gtk::Align::End
+    } else {
+        gtk::Align::Start
+    });
+    c.set_valign(gtk::Align::Start);
+    c.set_halign(if own {
+        gtk::Align::Start
+    } else {
+        gtk::Align::End
+    });
+    overlay.add_overlay(c);
+    overlay.set_measure_overlay(c, false);
+    overlay.set_clip_overlay(c, false);
+
+    // Position the chip so its center is at the bubble's top edge corner.
+    // - incoming (own=false): top-RIGHT corner → x = bubble_w - chip_w/2
+    // - sent     (own=true):  top-LEFT  corner → x = -chip_w/2
+    // y is always -chip_h/2 (above the bubble's top edge).
+    let own_side = own;
+    // The closure must be `'static`, so clone the bubble (ref-counted by
+    // GTK internally — cheap) to move it into the closure.
+    let bubble_for_closure = bubble.clone();
+    overlay.connect_get_child_position(move |_overlay, child| {
+        let (_, chip_w, _, _) = child.measure(gtk::Orientation::Horizontal, -1);
+        let (_, chip_h, _, _) = child.measure(gtk::Orientation::Vertical, -1);
+        // Prefer the bubble's allocated width (which is the actual rendered
+        // width after CSS max-width/wrapping constraints) for accurate chip
+        // positioning on wide bubbles. Fall back to natural width on the
+        // first layout pass before allocation is known.
+        let bubble_w = {
+            let a = bubble_for_closure.allocated_width();
+            if a > 0 {
+                a as i32
+            } else {
+                let (_, natural, _, _) =
+                    bubble_for_closure.measure(gtk::Orientation::Horizontal, -1);
+                natural
+            }
+        };
+        let y = -(chip_h / 2);
+        let x = if own_side {
+            -(chip_w / 2)
+        } else {
+            bubble_w - chip_w / 2
+        };
+        Some(gtk::gdk::Rectangle::new(x, y, chip_w, chip_h))
+    });
+
+    overlay.upcast()
+}
+
+/// A vertical bubble container for the text label. The reaction chip (if any)
+/// is layered on top via a `GtkOverlay` in `message_body` — the overlay wraps
+/// only the bubble, so the chip is positioned relative to the bubble's bounds
+/// (not the whole message row).
 fn bubble_box(own: bool) -> gtk::Box {
-    let b = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
     b.add_css_class("bubble");
     b.add_css_class(if own { "bubble-out" } else { "bubble-in" });
     b
@@ -3299,7 +3682,7 @@ fn bubble_box(own: bool) -> gtk::Box {
 
 /// The wrapped, width-capped, left-justified text inside a bubble.
 /// URLs in the text are rendered as clickable links that open in the system browser.
-fn bubble_label(text: &str) -> gtk::Label {
+fn bubble_label(text: &str, show_picker: Option<&Rc<dyn Fn()>>) -> gtk::Label {
     let markup = text_to_markup(text);
     let label = gtk::Label::builder()
         .label(&markup)
@@ -3317,6 +3700,22 @@ fn bubble_label(text: &str) -> gtk::Label {
     // Register for click-outside clearing and wire up the cursor-moved hook
     // so clicking into this label drops the previous one's highlight + cursor.
     register_selectable_label(&label);
+
+    // Append a "Reaction" item to the label's built-in context menu
+    // (Copy / Select All / …) when a show_picker callback is wired.
+    if let Some(picker) = show_picker {
+        let action_group = gtk::gio::SimpleActionGroup::new();
+        let open_action = gtk::gio::SimpleAction::new("open", None);
+        let picker = Rc::clone(picker);
+        open_action.connect_activate(move |_, _| picker());
+        action_group.add_action(&open_action);
+        label.insert_action_group("reaction", Some(&action_group));
+
+        let menu = gtk::gio::Menu::new();
+        menu.append(Some("Reaction"), Some("reaction.open"));
+        label.set_extra_menu(Some(&menu));
+    }
+
     label
 }
 
@@ -3612,7 +4011,9 @@ fn group_key(m: &StoredMessage) -> String {
 fn body_text(m: &StoredMessage) -> String {
     match (&m.text, &m.associated_guid) {
         (Some(t), _) if !strip_marker(t).is_empty() => strip_marker(t),
-        (_, Some(_)) => format!("reacted ({}) to a message", m.associated_type.unwrap_or(0)),
+        // Tapback rows are rendered as reaction chips on the target message;
+        // suppress the placeholder bubble body.
+        (_, Some(_)) => String::new(),
         _ => "(no text)".to_string(),
     }
 }
@@ -3658,6 +4059,17 @@ fn clear_box(b: &gtk::Box) {
     while let Some(child) = b.first_child() {
         b.remove(&child);
     }
+}
+
+/// Extract the wire-level `ams` text for a reaction from a stored message.
+/// Prefers the message body text, falls back to the first attachment's
+/// filename, and returns `""` when both are absent.
+fn extract_target_text(m: &StoredMessage) -> String {
+    m.text
+        .clone()
+        .filter(|t| !t.is_empty())
+        .or_else(|| m.attachments.first().and_then(|a| a.name.clone()))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -3819,5 +4231,243 @@ mod clipboard_image_tests {
 
         let _ = std::fs::remove_file(&p1);
         let _ = std::fs::remove_file(&p2);
+    }
+}
+
+/// A single entry in the Apple tapback reaction table.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+struct ReactionEntry {
+    emoji: &'static str,
+    label: &'static str,
+}
+
+/// The 6 standard Apple tapback reactions, indexed 0..=5.
+/// Add codes are 2000 + index; remove codes are 3000 + index.
+#[allow(dead_code)]
+const REACTIONS: [ReactionEntry; 6] = [
+    ReactionEntry { emoji: "\u{2764}\u{FE0F}",  label: "Loved" },
+    ReactionEntry { emoji: "\u{1F44D}\u{FE0F}", label: "Liked" },
+    ReactionEntry { emoji: "\u{1F44E}\u{FE0F}", label: "Disliked" },
+    ReactionEntry { emoji: "\u{1F604}\u{FE0F}", label: "Laughed at" },
+    ReactionEntry { emoji: "\u{203C}\u{FE0F}",  label: "Emphasized" },
+    ReactionEntry { emoji: "\u{2753}\u{FE0F}",  label: "Questioned" },
+];
+
+/// Look up the emoji string for an Apple tapback code.
+/// Accepts both add (2000..=2005) and remove (3000..=3005) codes.
+#[allow(dead_code)]
+fn code_to_emoji(code: i64) -> Option<&'static str> {
+    let idx = match code {
+        2000..=2005 => code - 2000,
+        3000..=3005 => code - 3000,
+        _ => return None,
+    };
+    Some(REACTIONS[idx as usize].emoji)
+}
+
+/// Look up the friendly label for an Apple tapback code.
+/// Accepts both add (2000..=2005) and remove (3000..=3005) codes.
+#[allow(dead_code)]
+fn code_to_label(code: i64) -> Option<&'static str> {
+    let idx = match code {
+        2000..=2005 => code - 2000,
+        3000..=3005 => code - 3000,
+        _ => return None,
+    };
+    Some(REACTIONS[idx as usize].label)
+}
+
+#[cfg(test)]
+mod reaction_tests {
+    use super::*;
+
+    #[test]
+    fn reaction_table() {
+        // Apple code 2000 + index is "add reaction"; 3000 + index is "remove reaction".
+        // Each entry: (add_code, emoji_str, label). The emoji string always
+        // carries the U+FE0F variation selector — required for ‼ (U+203C) and
+        // ❓ (U+2753) to render as emoji rather than text, and conventional
+        // for the other four.
+        let add_expected: [(i64, &str, &str); 6] = [
+            (2000, "\u{2764}\u{FE0F}",  "Loved"),       // heart + VS
+            (2001, "\u{1F44D}\u{FE0F}", "Liked"),       // thumbs up + VS
+            (2002, "\u{1F44E}\u{FE0F}", "Disliked"),    // thumbs down + VS
+            (2003, "\u{1F604}\u{FE0F}", "Laughed at"),  // smile/laugh + VS
+            (2004, "\u{203C}\u{FE0F}",  "Emphasized"),  // double exclamation + VS (required)
+            (2005, "\u{2753}\u{FE0F}",  "Questioned"),  // question mark + VS (required)
+        ];
+
+        // 1. Lookup of add codes (2000-2005) returns the correct emoji and a non-empty label.
+        for (code, emoji, expected_label) in add_expected.iter().copied() {
+            assert_eq!(
+                code_to_emoji(code),
+                Some(emoji),
+                "code_to_emoji({}) should return {:?}",
+                code,
+                emoji,
+            );
+            let label = code_to_label(code)
+                .unwrap_or_else(|| panic!("code_to_label({}) returned None", code));
+            assert!(
+                !label.is_empty(),
+                "code_to_label({}) returned an empty label",
+                code,
+            );
+            assert_eq!(
+                label, expected_label,
+                "code_to_label({}) mismatch",
+                code,
+            );
+        }
+
+        // 2. Lookup of remove codes (3000-3005) returns the SAME emoji as the
+        //    corresponding add code, and a non-empty label. This pins the
+        //    2000/3000 unification behavior.
+        for (add_code, emoji, _) in add_expected.iter().copied() {
+            let remove_code = add_code + 1000;
+            assert_eq!(
+                code_to_emoji(remove_code),
+                Some(emoji),
+                "code_to_emoji({}) should match the add-code emoji {:?}",
+                remove_code,
+                emoji,
+            );
+            let label = code_to_label(remove_code)
+                .unwrap_or_else(|| panic!("code_to_label({}) returned None", remove_code));
+            assert!(
+                !label.is_empty(),
+                "code_to_label({}) returned an empty label",
+                remove_code,
+            );
+        }
+
+        // 3. Out-of-range codes return None (both helpers must reject them).
+        for &bad in &[1999i64, 2006, 2999, 3006, 0, 9999] {
+            assert_eq!(
+                code_to_emoji(bad),
+                None,
+                "code_to_emoji({}) should be None",
+                bad,
+            );
+            assert_eq!(
+                code_to_label(bad),
+                None,
+                "code_to_label({}) should be None",
+                bad,
+            );
+        }
+
+        // 4. All 6 labels are distinct.
+        let labels: Vec<&str> = add_expected.iter().map(|(_, _, l)| *l).collect();
+        let mut sorted = labels.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            6,
+            "all 6 reaction labels should be distinct, got: {:?}",
+            labels,
+        );
+    }
+}
+
+#[cfg(test)]
+mod extract_target_text_tests {
+    //! Pins the pure helper that picks the wire-level `ams` (target text) for
+    //! a reaction. The iPhone uses `ams` to render the reaction chip in the
+    //! chat list, and `amk` (`p:N/{guid}`) to attach the chip to the right
+    //! target message part. The helper must prefer the message's own text,
+    //! fall back to the first attachment's filename, and produce `""` only
+    //! when both are missing.
+    use super::*;
+
+    /// Build a `StoredMessage` with only the fields the helper inspects set.
+    /// All other fields get the values a fresh, unstored message would have
+    /// (zero ids, `None` for optionals, empty strings, no is_sticker).
+    fn message_with(
+        text: Option<&str>,
+        attachments: Vec<StoredAttachment>,
+    ) -> StoredMessage {
+        StoredMessage {
+            id: 0,
+            guid: String::new(),
+            chat_id: 0,
+            sender: None,
+            is_from_me: false,
+            text: text.map(str::to_string),
+            subject: None,
+            service: None,
+            date: 0,
+            date_delivered: None,
+            date_read: None,
+            effect: None,
+            reply_to_guid: None,
+            reply_part: None,
+            associated_guid: None,
+            associated_type: None,
+            item_type: 0,
+            attachments,
+        }
+    }
+
+    /// Build a `StoredAttachment` with only `name` (and the `is_sticker`
+    /// default `false`) set. The other fields are irrelevant to the helper.
+    fn attachment(name: Option<&str>) -> StoredAttachment {
+        StoredAttachment {
+            mime: None,
+            name: name.map(str::to_string),
+            local_path: None,
+            is_sticker: false,
+        }
+    }
+
+    #[test]
+    fn extract_target_text_returns_text_when_no_attachments() {
+        let m = message_with(Some("Hello world"), vec![]);
+        assert_eq!(extract_target_text(&m), "Hello world");
+    }
+
+    #[test]
+    fn extract_target_text_prefers_text_over_attachment_name() {
+        // The message has a caption AND a filename; the helper should pick
+        // the caption (what the sender actually wrote) over the filename
+        // (the system-supplied attachment name).
+        let m = message_with(Some("Check this out"), vec![attachment(Some("photo.jpg"))]);
+        assert_eq!(extract_target_text(&m), "Check this out");
+    }
+
+    #[test]
+    fn extract_target_text_falls_back_to_attachment_name_when_text_is_none() {
+        // A media-only message (no caption) — the helper must still produce
+        // a non-empty `ams` for the iPhone by using the attachment's
+        // filename, so the reaction chip has something to display.
+        let m = message_with(None, vec![attachment(Some("photo.jpg"))]);
+        assert_eq!(extract_target_text(&m), "photo.jpg");
+    }
+
+    #[test]
+    fn extract_target_text_falls_back_to_attachment_name_when_text_is_empty() {
+        // An empty caption is semantically the same as no caption — must
+        // NOT be returned as a one-character-or-zero-length `ams`. Falls
+        // through to the filename so the chip renders something.
+        let m = message_with(Some(""), vec![attachment(Some("photo.jpg"))]);
+        assert_eq!(extract_target_text(&m), "photo.jpg");
+    }
+
+    #[test]
+    fn extract_target_text_returns_empty_when_text_none_and_attachment_has_no_name() {
+        // Last resort before the empty fallback: media with no caption and
+        // no filename. Returning `""` matches the pre-fix behavior, so the
+        // iPhone still gets a valid (if content-less) `ams` field rather
+        // than a missing one.
+        let m = message_with(None, vec![attachment(None)]);
+        assert_eq!(extract_target_text(&m), "");
+    }
+
+    #[test]
+    fn extract_target_text_returns_empty_when_no_text_and_no_attachments() {
+        let m = message_with(None, vec![]);
+        assert_eq!(extract_target_text(&m), "");
     }
 }

@@ -654,6 +654,32 @@ pub fn query_messages_from(
     Ok(messages)
 }
 
+/// All tapback/reaction rows for a chat, ordered by date ascending.
+/// Only rows with `associated_guid IS NOT NULL` are reactions.
+pub fn query_tapbacks_for_chat(c: &Connection, chat_id: i64) -> rusqlite::Result<Vec<Tapback>> {
+    let mut stmt = c.prepare(
+        "SELECT m.guid, h.address, m.is_from_me, m.date,
+                m.associated_guid, m.associated_type, m.reply_part
+         FROM message m
+         LEFT JOIN handle h ON h.id = m.sender_handle_id
+         WHERE m.chat_id = ?1 AND m.associated_guid IS NOT NULL
+         ORDER BY m.date ASC, m.id ASC"
+    )?;
+    let rows = stmt.query_map(params![chat_id], |r| {
+        Ok(Tapback {
+            guid: r.get(0)?,
+            chat: ChatRef::default(),
+            sender: r.get(1)?,
+            is_from_me: r.get::<_, i64>(2)? != 0,
+            date: r.get(3)?,
+            associated_guid: r.get(4)?,
+            associated_type: r.get(5)?,
+            associated_part: r.get(6)?,
+        })
+    })?;
+    rows.collect()
+}
+
 // --- async wrapper (used by the app) ---
 
 /// Async handle to the message database. Cloneable; all clones share the one
@@ -747,6 +773,14 @@ impl Store {
         Ok(self
             .conn
             .call(move |c| Ok(query_messages_from(c, chat_id, since)?))
+            .await?)
+    }
+
+    /// All tapback/reaction rows for a chat, ordered by date ascending.
+    pub async fn tapbacks_for_chat(&self, chat_id: i64) -> Result<Vec<Tapback>> {
+        Ok(self
+            .conn
+            .call(move |c| Ok(query_tapbacks_for_chat(c, chat_id)?))
             .await?)
     }
 
@@ -1297,5 +1331,367 @@ mod tests {
             out[&("G-MULTI".into(), 1)].title.as_deref(),
             Some("Second")
         );
+    }
+
+    // --- live tapback set (cancellation/aggregation) ---
+
+    // Pin the cancellation/aggregation of live tapbacks. No DB, no env, no I/O:
+    // builds Tapback values directly and calls the helper.
+    //
+    // Helper contract: `pub fn live_tapbacks(tapbacks: &[Tapback]) -> Vec<LiveTapback>`
+    // where `LiveTapback` is:
+    //   pub struct LiveTapback {
+    //       pub target_guid: String,
+    //       pub target_part: Option<String>,
+    //       pub sender: Option<String>,
+    //       pub is_from_me: bool,
+    //       pub reaction_index: u8,   // 0..=5
+    //   }
+    //
+    // Cancellation rule: `associated_type` 2000..=2005 = add, 3000..=3005 = remove.
+    // The lower digit is the reaction index (0..=5). For each
+    // (target_guid, target_part, sender, reaction_index) the most recent event
+    // by `date` wins; an "add" followed by a "remove" from the same sender on
+    // the same target cancels out; a "remove" with no prior add produces no
+    // live entry. Assertions are order-independent (fingerprint via BTreeSet).
+    #[test]
+    fn tapbacks_live_set() {
+        use std::collections::BTreeSet;
+
+        let sender_a = Some("mailto:a@x.com".to_string());
+        let sender_b = Some("mailto:b@x.com".to_string());
+        let chat = chat_1to1();
+
+        // Build a Tapback with the fields the helper actually consults; the
+        // `chat` is shared and irrelevant to the cancellation logic.
+        let mk = |guid: &str,
+                  target: &str,
+                  part: Option<&str>,
+                  sender: Option<String>,
+                  is_from_me: bool,
+                  date: i64,
+                  kind: i64|
+         -> Tapback {
+            Tapback {
+                guid: guid.into(),
+                chat: chat.clone(),
+                sender,
+                is_from_me,
+                date,
+                associated_guid: target.into(),
+                associated_part: part.map(String::from),
+                associated_type: kind,
+            }
+        };
+
+        // Project a Vec<LiveTapback> to a BTreeSet so the assertions do not
+        // depend on the helper's output ordering.
+        let fingerprint = |v: &[LiveTapback]| -> BTreeSet<(String, Option<String>, Option<String>, bool, u8)> {
+            v.iter()
+                .map(|l| {
+                    (
+                        l.target_guid.clone(),
+                        l.target_part.clone(),
+                        l.sender.clone(),
+                        l.is_from_me,
+                        l.reaction_index,
+                    )
+                })
+                .collect()
+        };
+
+        // 1. Empty input -> empty live set.
+        assert!(live_tapbacks(&[]).is_empty(), "empty input -> empty live set");
+
+        // 2. A single "add" of reaction 0 (heart) from sender A on target T1
+        //    -> exactly one live entry with the right target/part/sender/idx.
+        let add_heart_a = mk("RA1", "T1", Some("0"), sender_a.clone(), false, 1000, 2000);
+        let live = live_tapbacks(&[add_heart_a.clone()]);
+        assert_eq!(live.len(), 1, "single add -> one live entry");
+        assert_eq!(live[0].target_guid, "T1");
+        assert_eq!(live[0].target_part.as_deref(), Some("0"));
+        assert_eq!(live[0].sender, sender_a);
+        assert!(!live[0].is_from_me, "is_from_me mirrors the winning event");
+        assert_eq!(live[0].reaction_index, 0, "lower digit of 2000 = 0");
+
+        // 3. "add" then later "remove" (same target/sender/idx) -> cancelled.
+        let rem_heart_a = mk("RR1", "T1", Some("0"), sender_a.clone(), false, 1100, 3000);
+        let live = live_tapbacks(&[add_heart_a.clone(), rem_heart_a.clone()]);
+        assert!(
+            live.is_empty(),
+            "add+remove on the same (target, sender, idx) cancels"
+        );
+
+        // 4. "remove" then later "add" -> one live entry (last event wins).
+        let live = live_tapbacks(&[rem_heart_a.clone(), add_heart_a.clone()]);
+        assert_eq!(
+            fingerprint(&live),
+            BTreeSet::from([(
+                "T1".to_string(),
+                Some("0".to_string()),
+                sender_a.clone(),
+                false,
+                0u8,
+            )]),
+            "remove+add on the same (target, sender, idx) -> live"
+        );
+
+        // 5. Multiple senders each adding the same reaction on the same target
+        //    -> one live entry per sender.
+        let add_heart_b = mk("RB1", "T1", Some("0"), sender_b.clone(), false, 1200, 2000);
+        let live = live_tapbacks(&[add_heart_a.clone(), add_heart_b.clone()]);
+        assert_eq!(live.len(), 2, "one live entry per sender");
+        assert_eq!(
+            fingerprint(&live),
+            BTreeSet::from([
+                ("T1".to_string(), Some("0".to_string()), sender_a.clone(), false, 0u8),
+                ("T1".to_string(), Some("0".to_string()), sender_b.clone(), false, 0u8),
+            ]),
+            "two senders, same target and reaction -> two live entries"
+        );
+
+        // 6. Same sender adding two different reactions on the same target
+        //    -> two live entries (different indices don't merge).
+        let add_thumb_a = mk("RA2", "T1", Some("0"), sender_a.clone(), false, 1300, 2002);
+        let live = live_tapbacks(&[add_heart_a.clone(), add_thumb_a.clone()]);
+        assert_eq!(
+            fingerprint(&live),
+            BTreeSet::from([
+                ("T1".to_string(), Some("0".to_string()), sender_a.clone(), false, 0u8),
+                ("T1".to_string(), Some("0".to_string()), sender_a.clone(), false, 2u8),
+            ]),
+            "different reaction indices don't merge"
+        );
+
+        // 7. Different targets are not merged.
+        let add_heart_t2 = mk("RA-T2", "T2", Some("0"), sender_a.clone(), false, 1400, 2000);
+        let live = live_tapbacks(&[add_heart_a.clone(), add_heart_t2.clone()]);
+        assert_eq!(
+            fingerprint(&live),
+            BTreeSet::from([
+                ("T1".to_string(), Some("0".to_string()), sender_a.clone(), false, 0u8),
+                ("T2".to_string(), Some("0".to_string()), sender_a.clone(), false, 0u8),
+            ]),
+            "different targets are not merged"
+        );
+
+        // 8. A "remove" with no prior add produces no live entry.
+        let orphan_remove = mk(
+            "R-ORPHAN",
+            "T3",
+            Some("0"),
+            sender_a.clone(),
+            false,
+            1500,
+            3000,
+        );
+        assert!(
+            live_tapbacks(&[orphan_remove]).is_empty(),
+            "remove with no prior add -> no live entry"
+        );
+    }
+
+    // --- per-target reaction summary (chat-timeline chips) ---
+
+    // Pin the per-target grouping of *live* tapbacks for the chat-timeline
+    // reaction-chip renderer. Pure data transformation: no DB, no env, no I/O.
+    // Builds `Tapback` values directly, runs them through `live_tapbacks` to
+    // apply add/remove cancellation, then hands the result to
+    // `group_tapbacks_by_target`.
+    //
+    // Helper contract:
+    //   pub struct LiveReactionSummary {
+    //       pub reaction_index: u8,  // 0..=5
+    //       pub count: usize,
+    //       pub my_reacted: bool,
+    //   }
+    //   pub fn group_tapbacks_by_target(
+    //       live: Vec<LiveTapback>
+    //   ) -> BTreeMap<String, Vec<LiveReactionSummary>>
+    //
+    // Grouping: by `target_guid` (outer map key), then by `reaction_index`
+    // (one entry per reaction type). `count` is the number of *distinct
+    // senders* in that group; `my_reacted` is true if any of them has
+    // `is_from_me: true`. Inner `Vec` ordering is implementation-defined, so
+    // assertions fingerprint rather than depend on order.
+    #[test]
+    fn group_tapbacks_by_target_chips() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let sender_a = Some("mailto:a@x.com".to_string());
+        let sender_b = Some("mailto:b@x.com".to_string());
+        let sender_me = Some("mailto:me@x.com".to_string());
+        let chat = chat_1to1();
+
+        // Same closure shape as in `tapbacks_live_set` for visual consistency.
+        let mk = |guid: &str,
+                  target: &str,
+                  part: Option<&str>,
+                  sender: Option<String>,
+                  is_from_me: bool,
+                  date: i64,
+                  kind: i64|
+         -> Tapback {
+            Tapback {
+                guid: guid.into(),
+                chat: chat.clone(),
+                sender,
+                is_from_me,
+                date,
+                associated_guid: target.into(),
+                associated_part: part.map(String::from),
+                associated_type: kind,
+            }
+        };
+
+        // Project the result to a BTreeSet of (target, reaction_index, count,
+        // my_reacted) tuples so assertions don't depend on the inner Vec's
+        // ordering. Outer BTreeMap keys are already sorted.
+        let fp = |m: &BTreeMap<String, Vec<LiveReactionSummary>>|
+         -> BTreeSet<(String, u8, usize, bool)> {
+            m.iter()
+                .flat_map(|(target, entries)| {
+                    entries
+                        .iter()
+                        .map(move |e| (target.clone(), e.reaction_index, e.count, e.my_reacted))
+                })
+                .collect()
+        };
+
+        // 1. Empty input -> empty map.
+        let out = group_tapbacks_by_target(Vec::new());
+        assert!(out.is_empty(), "empty input -> empty BTreeMap");
+
+        // 2. One target, one sender, one reaction -> one entry
+        //    {reaction_index: 0, count: 1, my_reacted: false}.
+        let a_heart_t1 = mk("R1", "T1", Some("0"), sender_a.clone(), false, 1000, 2000);
+        let out = group_tapbacks_by_target(live_tapbacks(&[a_heart_t1.clone()]));
+        assert_eq!(out.len(), 1, "one target with one reaction -> one map entry");
+        let v = out.get("T1").expect("target T1 is in the map");
+        assert_eq!(v.len(), 1, "one reaction type -> one inner entry");
+        assert_eq!(v[0].reaction_index, 0);
+        assert_eq!(v[0].count, 1);
+        assert!(!v[0].my_reacted);
+
+        // 3. One target, two senders, same reaction -> one entry,
+        //    count: 2, my_reacted: false.
+        let b_heart_t1 = mk("R2", "T1", Some("0"), sender_b.clone(), false, 1100, 2000);
+        let out =
+            group_tapbacks_by_target(live_tapbacks(&[a_heart_t1.clone(), b_heart_t1.clone()]));
+        assert_eq!(out.len(), 1, "still one target");
+        let v = &out["T1"];
+        assert_eq!(v.len(), 1, "two senders on same reaction type collapse to one entry");
+        assert_eq!(v[0].reaction_index, 0);
+        assert_eq!(v[0].count, 2);
+        assert!(!v[0].my_reacted);
+
+        // 4. One target, one sender, two different reactions -> two entries
+        //    with count: 1 each, distinct reaction_index.
+        let a_thumb_t1 = mk("R3", "T1", Some("0"), sender_a.clone(), false, 1200, 2002);
+        let out = group_tapbacks_by_target(live_tapbacks(&[a_heart_t1.clone(), a_thumb_t1.clone()]));
+        let v = &out["T1"];
+        assert_eq!(v.len(), 2, "two different reaction types -> two inner entries");
+        let by_idx: BTreeMap<u8, &LiveReactionSummary> =
+            v.iter().map(|e| (e.reaction_index, e)).collect();
+        assert_eq!(by_idx.len(), 2, "distinct reaction_index per entry");
+        for (idx, e) in &by_idx {
+            assert_eq!(e.count, 1, "one sender per reaction type");
+            assert!(!e.my_reacted);
+            assert!(*idx == 0 || *idx == 2, "only the two reaction types we sent");
+        }
+        assert!(by_idx.contains_key(&0) && by_idx.contains_key(&2));
+
+        // 5. Two different targets -> two map entries, not merged.
+        let a_heart_t2 = mk("R4", "T2", Some("0"), sender_a.clone(), false, 1300, 2000);
+        let out = group_tapbacks_by_target(live_tapbacks(&[
+            a_heart_t1.clone(),
+            a_heart_t2.clone(),
+        ]));
+        assert_eq!(out.len(), 2, "two targets -> two map keys");
+        assert!(out.contains_key("T1") && out.contains_key("T2"));
+        assert_eq!(
+            fp(&out),
+            BTreeSet::from([
+                ("T1".to_string(), 0u8, 1usize, false),
+                ("T2".to_string(), 0u8, 1usize, false),
+            ]),
+            "different targets are not merged"
+        );
+
+        // 6. my_reacted: true when the (only) sender is is_from_me.
+        let me_heart_t1 = mk("R5", "T1", Some("0"), sender_me.clone(), true, 1400, 2000);
+        let out = group_tapbacks_by_target(live_tapbacks(&[me_heart_t1.clone()]));
+        let v = &out["T1"];
+        assert_eq!(v.len(), 1);
+        assert!(v[0].my_reacted, "is_from_me -> my_reacted: true");
+        assert_eq!(v[0].count, 1);
+        assert_eq!(v[0].reaction_index, 0);
+
+        // 7. my_reacted: true when at least one of multiple senders is
+        //    is_from_me; entry collapses across the two senders.
+        let out = group_tapbacks_by_target(live_tapbacks(&[
+            a_heart_t1.clone(),
+            me_heart_t1.clone(),
+        ]));
+        let v = &out["T1"];
+        assert_eq!(v.len(), 1, "still one entry per reaction type");
+        assert_eq!(v[0].reaction_index, 0);
+        assert_eq!(v[0].count, 2, "two distinct senders -> count: 2");
+        assert!(
+            v[0].my_reacted,
+            "one of the senders is is_from_me -> my_reacted: true"
+        );
+    }
+
+    #[test]
+    fn tapbacks_for_chat_query() {
+        let mut c = db();
+        // Insert a base message so the chat exists.
+        apply_blocking(&mut c, Ingest::Message(msg("T1", 100))).unwrap();
+        let chat_id = query_chats(&c).unwrap()[0].id;
+
+        // Insert two tapback rows with different dates.
+        apply_blocking(
+            &mut c,
+            Ingest::Tapback(Tapback {
+                guid: "R1".into(),
+                chat: chat_1to1(),
+                sender: Some("mailto:a@x.com".into()),
+                is_from_me: false,
+                date: 150,
+                associated_guid: "T1".into(),
+                associated_part: Some("0".into()),
+                associated_type: 2000,
+            }),
+        )
+        .unwrap();
+        apply_blocking(
+            &mut c,
+            Ingest::Tapback(Tapback {
+                guid: "R2".into(),
+                chat: chat_1to1(),
+                sender: Some("mailto:b@x.com".into()),
+                is_from_me: true,
+                date: 160,
+                associated_guid: "T1".into(),
+                associated_part: Some("0".into()),
+                associated_type: 2002,
+            }),
+        )
+        .unwrap();
+
+        // Also insert a non-tapback message (no associated_guid) — should be excluded.
+        apply_blocking(&mut c, Ingest::Message(msg("T2", 200))).unwrap();
+
+        let tapbacks = query_tapbacks_for_chat(&c, chat_id).unwrap();
+        assert_eq!(tapbacks.len(), 2, "only tapback rows returned, not T2");
+        assert_eq!(tapbacks[0].date, 150, "ordered by date ASC");
+        assert_eq!(tapbacks[1].date, 160);
+        assert_eq!(tapbacks[0].associated_guid, "T1");
+        assert_eq!(tapbacks[0].associated_type, 2000);
+        assert_eq!(tapbacks[0].sender.as_deref(), Some("mailto:a@x.com"));
+        assert!(!tapbacks[0].is_from_me);
+        assert_eq!(tapbacks[1].associated_type, 2002);
+        assert!(tapbacks[1].is_from_me);
     }
 }

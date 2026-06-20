@@ -32,7 +32,7 @@ use rustpush::{
     CircleClientSession, ConversationData, DebugMutex, DefaultAnisetteProvider, IDSNGMIdentity,
     IDSUser, IMClient, IdmsAuthListener, IndexedMessagePart, LPLinkMetadata, LinkMeta,
     LoginState as RpLoginState, MMCSFile, Message, MessageInst, MessagePart, MessageParts,
-    MessageType, NormalMessage, Reaction, ReactMessageType, VerifyBody as RpVerifyBody,
+    MessageType, NormalMessage, ReactMessage, Reaction, ReactMessageType, VerifyBody as RpVerifyBody,
 };
 
 use crate::store::{
@@ -558,6 +558,33 @@ impl Backend for RustpushBackend {
             date,
             ..Default::default()
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_reaction(
+        &self,
+        c: &ImClient,
+        chat: &ChatRef,
+        my_handle: &str,
+        target_guid: &str,
+        target_part: Option<u64>,
+        target_text: &str,
+        reaction: &ReactMessageType,
+    ) -> Result<()> {
+        let imclient = client(c).clone();
+        let mut inst = build_react_message_inst(
+            chat,
+            my_handle,
+            target_guid,
+            target_part,
+            target_text,
+            reaction,
+        );
+        imclient
+            .send(&mut inst)
+            .await
+            .map_err(|e| anyhow::anyhow!("send reaction failed: {e:?}"))?;
+        Ok(())
     }
 
     async fn send_attachment(
@@ -1104,6 +1131,44 @@ fn is_incoming_content(inst: &MessageInst, handles: &[String]) -> bool {
     matches!(inst.message, Message::Message(_)) && !is_from_me(inst, handles)
 }
 
+/// Build a wire-level `ReactMessage` from the caller's parameters.
+fn build_react_message(
+    target_guid: &str,
+    target_part: Option<u64>,
+    to_text: &str,
+    reaction: &ReactMessageType,
+) -> ReactMessage {
+    ReactMessage {
+        to_uuid: target_guid.to_string(),
+        to_part: target_part.or(Some(0)),
+        reaction: reaction.clone(),
+        to_text: to_text.to_string(),
+        embedded_profile: None,
+    }
+}
+
+/// Generate a fresh GUID (uppercased UUID v4) for message identification.
+fn new_guid() -> String {
+    glib::uuid_string_random().to_string().to_uppercase()
+}
+
+/// Build a [`MessageInst`] ready to send as a reaction (tapback) to a target
+/// message. Sets `inst.id` to a fresh GUID so the receiver can correlate it.
+fn build_react_message_inst(
+    chat: &ChatRef,
+    my_handle: &str,
+    target_guid: &str,
+    target_part: Option<u64>,
+    target_text: &str,
+    reaction: &ReactMessageType,
+) -> MessageInst {
+    let conversation = conversation_from(chat);
+    let react = build_react_message(target_guid, target_part, target_text, reaction);
+    let mut inst = MessageInst::new(conversation, my_handle, Message::React(react));
+    inst.id = new_guid();
+    inst
+}
+
 /// Send a Delivered (`read=false`) or Read (`read=true`) receipt for `inst`,
 /// addressed from whichever of our `handles` is in the conversation.
 async fn send_receipt_for(
@@ -1131,5 +1196,225 @@ async fn send_receipt_for(
     match imclient.send(&mut receipt).await {
         Ok(_) => log::info!("→ sent {kind} receipt for {}", receipt.id),
         Err(e) => log::warn!("{kind} receipt error: {e:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for the `Backend` impl on `RustpushBackend` and its helper
+    //! functions. The whole module is gated by `--features rustpush`, so this
+    //! `mod tests` only compiles with the feature — matches the project's
+    //! existing per-module cfg convention.
+    use super::*;
+
+    /// Pin: the pure helper that builds the wire-level `ReactMessage` for
+    /// `send_reaction`:
+    ///
+    /// * carries the caller's `(target_guid, reaction)` straight through to
+    ///   `(to_uuid, reaction)` and leaves `embedded_profile` unset;
+    /// * **defaults `to_part` to `Some(0)`** when the caller passes `None`
+    ///   (matches Android OpenBubbles' `toPart: repPart ?? 0` so the iPhone
+    ///   can resolve the `p:N/` part prefix on the target message);
+    /// * passes through non-`None` `to_part` values unchanged (the default
+    ///   must not override an explicit part index);
+    /// * **threads `to_text` through** to the wire `ams` field (the iPhone
+    ///   uses `ams` to render the reaction chip in the chat list).
+    #[test]
+    fn build_react_message_field_mapping() {
+        // Case 1: `target_part = None` -> defaults to `Some(0)`; `to_text = "Hello world"` flows through.
+        // Heart reaction, `enable = true`. This is the bug-repro case: the
+        // pre-fix code passed `target_part = None` straight through, leaving
+        // the `amk` field as a bare GUID with no `p:0/` prefix, so the iPhone
+        // couldn't attach the reaction chip to the target message.
+        let r1 = build_react_message(
+            "target-guid-1",
+            None,
+            "Hello world",
+            &ReactMessageType::React {
+                reaction: Reaction::Heart,
+                enable: true,
+            },
+        );
+        assert_eq!(r1.to_uuid, "target-guid-1", "to_uuid should be the target_guid");
+        assert_eq!(
+            r1.to_part,
+            Some(0),
+            "to_part: None must default to Some(0) so the iPhone sees the p:0/ prefix"
+        );
+        assert_eq!(
+            r1.to_text, "Hello world",
+            "to_text should flow through to the wire field (ams)"
+        );
+        let (reaction, enable) = match r1.reaction.clone() {
+            ReactMessageType::React { reaction, enable } => (reaction, enable),
+            _ => panic!("expected ReactMessageType::React variant"),
+        };
+        assert!(
+            matches!(reaction, Reaction::Heart),
+            "reaction should be Heart"
+        );
+        assert!(enable, "enable should be true");
+        assert!(
+            r1.embedded_profile.is_none(),
+            "embedded_profile should be None"
+        );
+
+        // Case 2: explicit `target_part = Some(0)` stays `Some(0)`; `to_text = ""` stays empty.
+        // Like reaction, `enable = false`. Pins that the defaulting doesn't
+        // re-default a part the caller already set, and that the empty
+        // "last-resort" `to_text` value is preserved (the iPhone still has a
+        // valid `ams` field, just an empty one).
+        let r2 = build_react_message(
+            "target-guid-2",
+            Some(0),
+            "",
+            &ReactMessageType::React {
+                reaction: Reaction::Like,
+                enable: false,
+            },
+        );
+        assert_eq!(r2.to_uuid, "target-guid-2", "to_uuid should be the target_guid");
+        assert_eq!(
+            r2.to_part,
+            Some(0),
+            "to_part: Some(0) should stay Some(0); the default must not override an explicit value"
+        );
+        assert!(
+            r2.to_text.is_empty(),
+            "to_text should stay empty when the caller passes \"\""
+        );
+        let (reaction, enable) = match r2.reaction.clone() {
+            ReactMessageType::React { reaction, enable } => (reaction, enable),
+            _ => panic!("expected ReactMessageType::React variant"),
+        };
+        assert!(
+            matches!(reaction, Reaction::Like),
+            "reaction should be Like"
+        );
+        assert!(!enable, "enable should be false");
+        assert!(
+            r2.embedded_profile.is_none(),
+            "embedded_profile should be None"
+        );
+
+        // Case 3: explicit non-zero `target_part = Some(3)` is preserved.
+        // Confirms the defaulting logic doesn't clobber a caller-supplied
+        // part index (matters for multi-part messages where the part index
+        // disambiguates which balloon the reaction targets).
+        let r3 = build_react_message(
+            "target-guid-3",
+            Some(3),
+            "Caption text",
+            &ReactMessageType::React {
+                reaction: Reaction::Heart,
+                enable: true,
+            },
+        );
+        assert_eq!(
+            r3.to_part,
+            Some(3),
+            "to_part: Some(3) must be preserved, not overwritten with the default Some(0)"
+        );
+        assert_eq!(
+            r3.to_text, "Caption text",
+            "to_text should flow through to the wire field (ams)"
+        );
+    }
+
+    /// Pin: the pure helper that builds the `MessageInst` for
+    /// `send_reaction`:
+    ///
+    /// * sets `inst.id` to a non-empty, unique value (regression guard: the
+    ///   pre-fix code path built the `MessageInst` inline and never assigned
+    ///   `inst.id`, so reactions arrived at the receiver without a way to
+    ///   attach to the target message);
+    /// * wraps the caller's `(target_guid, target_part, reaction)` into a
+    ///   `Message::React(...)` payload, **defaulting `target_part = None` to
+    ///   `Some(0)`** in the wire payload;
+    /// * **threads `target_text` through** to `inst.message`'s
+    ///   `ReactMessage.to_text` field (the `ams` field the iPhone uses to
+    ///   render the reaction chip);
+    /// * carries `my_handle` through to `inst.sender`.
+    ///
+    /// Two calls must produce distinct ids — a correct implementation uses
+    /// `new_guid()` (or an equivalent per-call GUID generator), not a
+    /// hardcoded constant.
+    #[test]
+    fn build_react_message_inst_sets_id_and_payload() {
+        let chat = ChatRef {
+            participants: vec!["mailto:a@icloud.com".into()],
+            display_name: None,
+            service: Some("iMessage".into()),
+        };
+        let my_handle = "mailto:me@icloud.com";
+        let reaction = ReactMessageType::React {
+            reaction: Reaction::Heart,
+            enable: true,
+        };
+
+        // Call with `target_part = None` (the UI's actual call site) — the
+        // helper must default it to `Some(0)`, and `target_text` must reach
+        // the wire `ams` field. Both are part of the fix.
+        let inst = build_react_message_inst(
+            &chat,
+            my_handle,
+            "target-guid",
+            None,
+            "Hello world",
+            &reaction,
+        );
+
+        // 1. inst.id is non-empty — regression guard for the bug.
+        assert!(
+            !inst.id.is_empty(),
+            "inst.id should be a freshly-generated GUID, not empty"
+        );
+
+        // 4. inst.sender carries the my_handle argument through.
+        assert_eq!(
+            inst.sender.as_deref(),
+            Some(my_handle),
+            "inst.sender should equal the my_handle argument"
+        );
+
+        // 3. inst.message is a Message::React carrying the caller's payload.
+        // NOTE: `rustpush::Message` has only `Display`, no `Debug` — the
+        // panic on a non-React variant must use `{other}`, not `{other:?}`.
+        match &inst.message {
+            Message::React(react) => {
+                assert_eq!(react.to_uuid, "target-guid", "to_uuid should be target_guid");
+                assert_eq!(
+                    react.to_part,
+                    Some(0),
+                    "to_part: None must default to Some(0) on the wire payload"
+                );
+                assert_eq!(
+                    react.to_text, "Hello world",
+                    "to_text should flow through to inst.message's React payload (ams field)"
+                );
+                let (r, enable) = match react.reaction.clone() {
+                    ReactMessageType::React { reaction, enable } => (reaction, enable),
+                    _ => panic!("expected ReactMessageType::React variant"),
+                };
+                assert!(matches!(r, Reaction::Heart), "reaction payload should be Heart");
+                assert!(enable, "enable should be true");
+            }
+            other => panic!("expected Message::React, got {other}"),
+        }
+
+        // 2. Two calls produce distinct ids — guards against hardcoding
+        //    the fix to a constant GUID.
+        let inst2 = build_react_message_inst(
+            &chat,
+            my_handle,
+            "target-guid",
+            None,
+            "Hello world",
+            &reaction,
+        );
+        assert_ne!(
+            inst.id, inst2.id,
+            "two calls to build_react_message_inst must produce distinct ids"
+        );
     }
 }

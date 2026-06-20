@@ -173,6 +173,22 @@ impl Backend for StubBackend {
             ..Default::default()
         })
     }
+
+    #[cfg(feature = "rustpush")]
+    #[allow(clippy::too_many_arguments)]
+    async fn send_reaction(
+        &self,
+        _client: &ImClient,
+        _chat: &ChatRef,
+        _my_handle: &str,
+        _target_guid: &str,
+        _target_part: Option<u64>,
+        _target_text: &str,
+        _reaction: &rustpush::ReactMessageType,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     async fn send_attachment(
         &self,
         _client: &ImClient,
@@ -274,6 +290,46 @@ mod tests {
 
         assert_eq!(result.text, None, "text should be None when no caption is provided");
         assert_eq!(result.attachments.len(), 1, "should have exactly one attachment");
+    }
+
+    #[cfg(feature = "rustpush")]
+    #[tokio::test]
+    async fn send_reaction_returns_ok() {
+        // Pin: the `Backend::send_reaction` method exists on `StubBackend` with
+        // this exact signature, and the stub returns `Ok(())` for any reaction
+        // payload (the whole point of the stub is offline iteration, so the
+        // reaction send is a no-op success).
+        use rustpush::{ReactMessageType, Reaction};
+
+        let backend = StubBackend;
+        let client = ImClient::new(());
+        let chat = sample_chat_ref();
+        let my_handle = "tel:+15555550123";
+        let target_guid = "target-guid-abc";
+        let target_part: Option<u64> = Some(0);
+        let reaction = ReactMessageType::React {
+            reaction: Reaction::Heart,
+            enable: true,
+        };
+
+        let target_text = "Hello world";
+
+        let result = backend
+            .send_reaction(
+                &client,
+                &chat,
+                my_handle,
+                target_guid,
+                target_part,
+                target_text,
+                &reaction,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "StubBackend::send_reaction should return Ok(()) for any inputs, got {result:?}"
+        );
     }
 
     #[tokio::test]

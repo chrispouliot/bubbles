@@ -223,6 +223,126 @@ impl MessageLinkPreview {
     }
 }
 
+/// A live (non-cancelled) tapback/reaction on a message.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveTapback {
+    pub target_guid: String,
+    pub target_part: Option<String>,
+    pub sender: Option<String>,
+    pub is_from_me: bool,
+    /// Reaction index 0..=5 (heart, thumb up, thumb down, haha, exclamation, question).
+    pub reaction_index: u8,
+}
+
+/// Given a slice of raw `Tapback` rows, return the **live set** after applying
+/// add/remove cancellation semantics.
+///
+/// The cancellation key is `(target_guid, target_part, sender, reaction_index)`:
+/// for each key the last event in the slice wins.
+///
+/// * "add" events = `associated_type` 2000..=2005 (lower digit = reaction index).
+/// * "remove" events = `associated_type` 3000..=3005 (same lower-digit index).
+/// * An add followed by a later remove cancels out — no live entry.
+/// * A remove with no prior add produces no live entry.
+/// * Different senders, targets, or reaction indices each get their own entry.
+/// * `is_from_me` on the live entry is the value from the winning event.
+///
+/// The output order is unspecified (the caller can sort / fingerprint as needed).
+#[allow(dead_code)]
+pub fn live_tapbacks(tapbacks: &[Tapback]) -> Vec<LiveTapback> {
+    use std::collections::HashMap;
+
+    /// Cancellation key: (target_guid, target_part, sender, reaction_index).
+    type Key<'a> = (&'a str, Option<&'a str>, Option<&'a str>, u8);
+
+    // Map from cancellation-key components to the most recent tapback
+    // and whether it was an "add" (true) or "remove" (false).
+    let mut latest: HashMap<Key<'_>, (&Tapback, bool)> = HashMap::new();
+
+    for t in tapbacks {
+        let is_add = (2000..=2005).contains(&t.associated_type);
+        let is_remove = (3000..=3005).contains(&t.associated_type);
+        if !is_add && !is_remove {
+            continue;
+        }
+        let idx = (t.associated_type % 10) as u8;
+        let key = (
+            t.associated_guid.as_str(),
+            t.associated_part.as_deref(),
+            t.sender.as_deref(),
+            idx,
+        );
+        // Last occurrence in the slice wins (position-based ordering).
+        latest.insert(key, (t, is_add));
+    }
+
+    latest
+        .into_values()
+        .filter_map(|(t, is_add)| {
+            if is_add {
+                Some(LiveTapback {
+                    target_guid: t.associated_guid.clone(),
+                    target_part: t.associated_part.clone(),
+                    sender: t.sender.clone(),
+                    is_from_me: t.is_from_me,
+                    reaction_index: (t.associated_type % 10) as u8,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Summary of live reactions on one target message, grouped by reaction type.
+/// Returned by [`group_tapbacks_by_target`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveReactionSummary {
+    pub reaction_index: u8,  // 0..=5
+    pub count: usize,
+    pub my_reacted: bool,
+}
+
+/// Group live tapbacks by target GUID, then by reaction index.
+///
+/// For each (target, reaction_index) group, `count` is the number of distinct
+/// senders, and `my_reacted` is true if any sender has `is_from_me: true`.
+pub fn group_tapbacks_by_target(
+    live: Vec<LiveTapback>,
+) -> std::collections::BTreeMap<String, Vec<LiveReactionSummary>> {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    /// Accumulator: set of distinct senders + whether any is_from_me.
+    type Group = (HashSet<Option<String>>, bool);
+
+    // Aggregate: (target_guid, reaction_index) -> Group
+    let mut groups: HashMap<(String, u8), Group> = HashMap::new();
+
+    for tb in live {
+        let entry = groups.entry((tb.target_guid, tb.reaction_index)).or_default();
+        entry.0.insert(tb.sender);
+        if tb.is_from_me {
+            entry.1 = true;
+        }
+    }
+
+    let mut result: BTreeMap<String, Vec<LiveReactionSummary>> = BTreeMap::new();
+    // Sort for deterministic output order.
+    let mut pairs: Vec<_> = groups.into_iter().collect();
+    pairs.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+
+    for ((target, idx), (senders, my_reacted)) in pairs {
+        result.entry(target).or_default().push(LiveReactionSummary {
+            reaction_index: idx,
+            count: senders.len(),
+            my_reacted,
+        });
+    }
+
+    result
+}
+
 /// A URL-keyed, fetched preview. Distinct from [`MessageLinkPreview`]: that one
 /// is message-scoped, sender-supplied, and immutable. This one is keyed by URL
 /// (so re-opening the same link reuses the result), TTL'd, and the result of

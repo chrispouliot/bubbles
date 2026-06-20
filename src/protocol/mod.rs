@@ -15,6 +15,9 @@ use async_trait::async_trait;
 pub mod stub;
 
 #[cfg(feature = "rustpush")]
+use rustpush::ReactMessageType;
+
+#[cfg(feature = "rustpush")]
 pub mod rustpush_backend;
 
 pub use anyhow::Result;
@@ -318,6 +321,20 @@ pub trait Backend: Send + Sync {
         text: String,
         guid: String,
     ) -> Result<IncomingMessage>;
+
+    /// Send a tapback (reaction) to a target message in `chat`.
+    #[cfg(feature = "rustpush")]
+    #[allow(clippy::too_many_arguments)]
+    async fn send_reaction(
+        &self,
+        client: &ImClient,
+        chat: &ChatRef,
+        my_handle: &str,
+        target_guid: &str,
+        target_part: Option<u64>,
+        target_text: &str,
+        reaction: &ReactMessageType,
+    ) -> Result<()>;
 
     /// Upload a file to MMCS and send it as an attachment. Returns the locally
     /// persistable record (with a cached `local_path`) on success.
