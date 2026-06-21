@@ -18,9 +18,9 @@ use regex::Regex;
 use crate::gtk_bridge;
 use crate::protocol::{Backend, Connection, ImClient, RecvEvent};
 use crate::store::{
-    group_tapbacks_by_target, live_tapbacks, AttachmentRecord, ChatRef, ChatSummary,
-    IncomingMessage, Ingest, LiveReactionSummary, MessageLinkPreview, Store, StoredAttachment,
-    StoredMessage,
+    group_tapbacks_by_target, live_tapbacks, AttachmentKind, AttachmentRecord, ChatRef,
+    ChatSummary, IncomingMessage, Ingest, LiveReactionSummary, MessageLinkPreview, Store,
+    StoredAttachment, StoredMessage,
 };
 #[cfg(feature = "rustpush")]
 use crate::store::Tapback;
@@ -3254,13 +3254,20 @@ fn message_body(
         .build();
 
     for att in &m.attachments {
-        if att.is_image() {
-            if let Some(path) = att.local_path.as_deref() {
-                col.append(&image_widget(path));
+        match att.kind() {
+            AttachmentKind::Image => {
+                if let Some(path) = att.local_path.as_deref() {
+                    col.append(&image_widget(path));
+                }
             }
-            // No local path → no widget for this attachment.
-        } else {
-            col.append(&file_chip(att, own));
+            AttachmentKind::Video => {
+                if let Some(path) = att.local_path.as_deref() {
+                    col.append(&video_widget(path));
+                }
+            }
+            AttachmentKind::Other => {
+                col.append(&file_chip(att, own));
+            }
         }
     }
 
@@ -3440,6 +3447,84 @@ fn image_widget(path: &str) -> gtk::Widget {
     pic.upcast()
 }
 
+/// A video thumbnail widget that decodes a single frame on a background thread
+/// and swaps in the finished texture when ready.  Returns a placeholder with a
+/// centered play-button overlay immediately so the chat opens without blocking.
+fn video_widget(path: &str) -> gtk::Widget {
+    const CHAT_THUMBNAIL_MAX_EDGE: u32 = 1024;
+
+    let pic = gtk::Picture::new();
+    let (max_w, max_h) = (260.0, 340.0);
+    pic.set_size_request(max_w as i32, max_h as i32);
+    pic.set_content_fit(gtk::ContentFit::Contain);
+    pic.set_overflow(gtk::Overflow::Hidden);
+    pic.add_css_class("attachment-image");
+    pic.set_cursor_from_name(Some("pointer"));
+
+    // Play-button overlay on top of the thumbnail.
+    let play_icon = gtk::Image::from_icon_name("media-playback-start-symbolic");
+    play_icon.set_pixel_size(48);
+    play_icon.set_can_target(false);
+
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&pic));
+    overlay.add_overlay(&play_icon);
+    play_icon.set_halign(gtk::Align::Center);
+    play_icon.set_valign(gtk::Align::Center);
+
+    // Schedule background decode via the video scheduler.
+    let weak = pic.downgrade();
+    crate::video::schedule_video_thumbnails(
+        vec![std::path::PathBuf::from(path)],
+        CHAT_THUMBNAIL_MAX_EDGE,
+        {
+            move |result| {
+                if let Some(pic) = weak.upgrade() {
+                    if let Ok(decoded) = result {
+                        let w = decoded.width as i32;
+                        let h = decoded.height as i32;
+                        let bytes = glib::Bytes::from_owned(decoded.pixels);
+                        let texture = gtk::gdk::MemoryTexture::new(
+                            w,
+                            h,
+                            gtk::gdk::MemoryFormat::R8g8b8a8,
+                            &bytes,
+                            w as usize * 4,
+                        )
+                        .upcast::<gtk::gdk::Texture>();
+                        pic.set_paintable(Some(&texture));
+                        // Re-size based on actual image dimensions, capped.
+                        let scale = (max_w / w.max(1) as f64)
+                            .min(max_h / h.max(1) as f64)
+                            .min(1.0);
+                        pic.set_size_request(
+                            (w as f64 * scale).round() as i32,
+                            (h as f64 * scale).round() as i32,
+                        );
+                    }
+                    // On failure, leave the placeholder empty.
+                }
+            }
+        },
+    );
+
+    // Click to enlarge: find the lightbox host overlay and call the video
+    // lightbox (which is a stub for now — Unit C replaces the body).
+    let gesture = gtk::GestureClick::new();
+    let path_owned = path.to_string();
+    let overlay_weak = overlay.downgrade();
+    gesture.connect_released(move |_, _, _, _| {
+        if let Some(overlay) = overlay_weak.upgrade() {
+            if let Some(host) = find_lightbox_host(overlay.upcast_ref()) {
+                show_video_lightbox(&host, &path_owned);
+            }
+        }
+    });
+    overlay.add_controller(gesture);
+
+    overlay.upcast()
+}
+
 /// Walk up from `w` to the named overlay we wrap the messaging UI in.
 fn find_lightbox_host(w: &gtk::Widget) -> Option<gtk::Overlay> {
     let mut cur = w.parent();
@@ -3490,6 +3575,108 @@ fn show_lightbox(host: &gtk::Overlay, path: &str) {
     let dim_k = dim.clone();
     keys.connect_key_pressed(move |_, key, _, _| {
         if key == gtk::gdk::Key::Escape {
+            host_k.remove_overlay(&dim_k);
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    dim.add_controller(keys);
+
+    host.add_overlay(&dim);
+    dim.grab_focus();
+}
+
+/// Open the fullscreen viewer for a video at `path`. Auto-plays with audio.
+/// Click the video to toggle play/pause. Click outside (dim area) or press
+/// Escape to dismiss (stopping the audio pipeline).
+fn show_video_lightbox(host: &gtk::Overlay, path: &str) {
+    use gstreamer as gst;
+    use gst::prelude::{ElementExt, ElementExtManual};
+
+    // Initialise gstreamer and register the static gtk4paintablesink plugin
+    // exactly once per process (see src/video.rs).
+    crate::video::ensure_gst_init();
+
+    // Build a playbin pipeline that auto-demuxes and handles audio.  The
+    // video sink is a gtk4paintablesink whose Paintable feeds our Picture.
+    let playbin = gst::ElementFactory::make("playbin")
+        .name("playbin")
+        .build()
+        .expect("Failed to create playbin");
+
+    // Simple file:// URI — see note in render(), not worth a url crate dep.
+    let uri = format!("file://{}", path);
+    playbin.set_property("uri", &uri);
+
+    let video_sink = gst::ElementFactory::make("gtk4paintablesink")
+        .name("video-sink")
+        .build()
+        .expect("Failed to create gtk4paintablesink");
+    playbin.set_property("video-sink", &video_sink);
+
+    // Obtain the Paintable that the sink renders into.
+    let paintable: gtk::gdk::Paintable = video_sink.property("paintable");
+
+    // --- UI: dim layer + picture + dismissal pattern (mirrors show_lightbox) ---
+
+    let dim = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    dim.add_css_class("lightbox-dim");
+    dim.set_hexpand(true);
+    dim.set_vexpand(true);
+    dim.set_focusable(true);
+
+    let pic = gtk::Picture::new();
+    pic.set_paintable(Some(&paintable));
+    pic.set_content_fit(gtk::ContentFit::ScaleDown);
+    pic.set_can_shrink(true);
+    pic.set_hexpand(true);
+    pic.set_vexpand(true);
+    pic.set_margin_top(32);
+    pic.set_margin_bottom(32);
+    pic.set_margin_start(32);
+    pic.set_margin_end(32);
+    dim.append(&pic);
+
+    // Auto-play.
+    playbin
+        .set_state(gst::State::Playing)
+        .expect("Failed to start video playback");
+
+    // Click on the video picture toggles play/pause.
+    let toggle_gesture = gtk::GestureClick::new();
+    toggle_gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let pb_toggle = playbin.clone();
+    toggle_gesture.connect_released(move |_, _, _, _| {
+        let new_state = match pb_toggle.current_state() {
+            gst::State::Playing => gst::State::Paused,
+            _ => gst::State::Playing,
+        };
+        let _ = pb_toggle.set_state(new_state);
+    });
+    pic.add_controller(toggle_gesture);
+
+    // Click on the dim background (outside the picture) dismisses.
+    // Default Bubble phase fires for clicks on the dim's empty area;
+    // clicks on the picture are caught in Capture phase by toggle_gesture above.
+    let dismiss_gesture = gtk::GestureClick::new();
+    let host_c = host.clone();
+    let dim_c = dim.clone();
+    let pb_dismiss = playbin.clone();
+    dismiss_gesture.connect_released(move |_, _, _, _| {
+        let _ = pb_dismiss.set_state(gst::State::Null);
+        host_c.remove_overlay(&dim_c);
+    });
+    dim.add_controller(dismiss_gesture);
+
+    // Escape key dismisses.
+    let keys = gtk::EventControllerKey::new();
+    let host_k = host.clone();
+    let dim_k = dim.clone();
+    let pb_esc = playbin.clone();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            let _ = pb_esc.set_state(gst::State::Null);
             host_k.remove_overlay(&dim_k);
             glib::Propagation::Stop
         } else {

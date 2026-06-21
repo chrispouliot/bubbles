@@ -62,6 +62,11 @@ rustls = { version = "0.23", features = ["ring"] }
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 log = "0.4"
 regex = "1"
+gstreamer = "0.25.2"
+gstreamer-video = "0.25.2"
+gstreamer-app = "0.25.2"
+gstreamer-pbutils = "0.25.2"
+gst-plugin-gtk4 = { version = "0.15", features = ["gtk_v4_12"] }
 
 [dev-dependencies]
 tempfile = "3"

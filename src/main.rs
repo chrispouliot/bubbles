@@ -10,6 +10,7 @@ mod tray;
 mod ui;
 mod window_state;
 mod demo;
+mod video;
 
 #[cfg(feature = "rustpush")]
 mod api;

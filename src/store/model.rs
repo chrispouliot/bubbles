@@ -167,11 +167,47 @@ pub struct StoredAttachment {
 }
 
 impl StoredAttachment {
+    #[allow(clippy::unnecessary_map_or)]
     pub fn is_image(&self) -> bool {
         self.mime
             .as_deref()
             .map_or(false, |m| m.starts_with("image/"))
     }
+
+    #[allow(dead_code, clippy::unnecessary_map_or)]
+    pub fn is_video(&self) -> bool {
+        self.mime
+            .as_deref()
+            .map_or(false, |m| m.starts_with("video/"))
+    }
+}
+
+impl StoredAttachment {
+    /// Which kind of widget to render this attachment as.
+    /// Image takes precedence over Video (in the rare case a MIME matches both).
+    pub fn kind(&self) -> AttachmentKind {
+        if self.is_image() {
+            AttachmentKind::Image
+        } else if self.is_video() {
+            AttachmentKind::Video
+        } else {
+            AttachmentKind::Other
+        }
+    }
+}
+
+/// Which kind of widget to render this attachment as.
+/// Image takes precedence over Video (in the rare case a MIME matches both).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AttachmentKind {
+    Image,
+    Video,
+    Other,
+}
+
+/// Free-function wrapper that the unit tests pin directly.
+pub fn attachment_kind(att: &StoredAttachment) -> AttachmentKind {
+    att.kind()
 }
 
 /// A sender-generated URL preview, attached to a specific message. This is the
@@ -362,4 +398,281 @@ pub struct LinkPreview {
     /// 0 = ok, 1 = failed (so a 404 isn't re-hit every render).
     pub status: i64,
     pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------
+    // is_video() — real video MIME types
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn is_video_returns_true_for_video_mp4() {
+        let att = StoredAttachment {
+            mime: Some("video/mp4".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert!(att.is_video());
+    }
+
+    #[test]
+    fn is_video_returns_true_for_video_quicktime() {
+        let att = StoredAttachment {
+            mime: Some("video/quicktime".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert!(att.is_video());
+    }
+
+    #[test]
+    fn is_video_returns_true_for_video_hevc() {
+        let att = StoredAttachment {
+            mime: Some("video/hevc".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert!(att.is_video());
+    }
+
+    #[test]
+    fn is_video_returns_true_for_video_heic() {
+        let att = StoredAttachment {
+            mime: Some("video/heic".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert!(att.is_video());
+    }
+
+    // -------------------------------------------------------------------
+    // is_video() — image MIME types must NOT be classified as video
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn is_video_returns_false_for_image_jpeg() {
+        let att = StoredAttachment {
+            mime: Some("image/jpeg".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert!(!att.is_video());
+    }
+
+    #[test]
+    fn is_video_returns_false_for_image_png() {
+        let att = StoredAttachment {
+            mime: Some("image/png".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert!(!att.is_video());
+    }
+
+    #[test]
+    fn is_video_returns_false_for_image_heic_still() {
+        // image/heic is the still-image variant; it must NOT be classified as video.
+        let att = StoredAttachment {
+            mime: Some("image/heic".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert!(!att.is_video());
+    }
+
+    // -------------------------------------------------------------------
+    // is_video() — arbitrary non-video MIME types
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn is_video_returns_false_for_application_pdf() {
+        let att = StoredAttachment {
+            mime: Some("application/pdf".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert!(!att.is_video());
+    }
+
+    #[test]
+    fn is_video_returns_false_for_text_plain() {
+        let att = StoredAttachment {
+            mime: Some("text/plain".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert!(!att.is_video());
+    }
+
+    #[test]
+    fn is_video_returns_false_for_audio_mpeg() {
+        let att = StoredAttachment {
+            mime: Some("audio/mpeg".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert!(!att.is_video());
+    }
+
+    // -------------------------------------------------------------------
+    // is_video() — None MIME
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn is_video_returns_false_for_none_mime() {
+        let att = StoredAttachment {
+            mime: None,
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert!(!att.is_video());
+    }
+
+    // -------------------------------------------------------------------
+    // Regression: is_image() must still work correctly
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn is_image_still_returns_true_for_image_jpeg() {
+        let att = StoredAttachment {
+            mime: Some("image/jpeg".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert!(att.is_image());
+    }
+
+    #[test]
+    fn is_image_returns_false_for_video_mp4() {
+        let att = StoredAttachment {
+            mime: Some("video/mp4".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert!(!att.is_image());
+    }
+
+    // -------------------------------------------------------------------
+    // attachment_kind() — dispatch to widget kind
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn attachment_kind_returns_image_for_image_jpeg() {
+        let att = StoredAttachment {
+            mime: Some("image/jpeg".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert_eq!(attachment_kind(&att), AttachmentKind::Image);
+    }
+
+    #[test]
+    fn attachment_kind_returns_video_for_video_mp4() {
+        let att = StoredAttachment {
+            mime: Some("video/mp4".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert_eq!(attachment_kind(&att), AttachmentKind::Video);
+    }
+
+    #[test]
+    fn attachment_kind_returns_video_for_video_quicktime() {
+        let att = StoredAttachment {
+            mime: Some("video/quicktime".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert_eq!(attachment_kind(&att), AttachmentKind::Video);
+    }
+
+    #[test]
+    fn attachment_kind_returns_video_for_video_hevc() {
+        let att = StoredAttachment {
+            mime: Some("video/hevc".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert_eq!(attachment_kind(&att), AttachmentKind::Video);
+    }
+
+    #[test]
+    fn attachment_kind_returns_other_for_application_pdf() {
+        let att = StoredAttachment {
+            mime: Some("application/pdf".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert_eq!(attachment_kind(&att), AttachmentKind::Other);
+    }
+
+    #[test]
+    fn attachment_kind_returns_other_for_audio_mpeg() {
+        let att = StoredAttachment {
+            mime: Some("audio/mpeg".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert_eq!(attachment_kind(&att), AttachmentKind::Other);
+    }
+
+    #[test]
+    fn attachment_kind_returns_other_for_none_mime() {
+        let att = StoredAttachment {
+            mime: None,
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert_eq!(attachment_kind(&att), AttachmentKind::Other);
+    }
+
+    #[test]
+    fn attachment_kind_returns_image_for_image_heic() {
+        // image/heic is the still-image variant; must be Image, not Video or Other.
+        let att = StoredAttachment {
+            mime: Some("image/heic".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert_eq!(attachment_kind(&att), AttachmentKind::Image);
+    }
+
+    #[test]
+    fn attachment_kind_returns_image_for_image_png() {
+        let att = StoredAttachment {
+            mime: Some("image/png".into()),
+            name: None,
+            local_path: None,
+            is_sticker: false,
+        };
+        assert_eq!(attachment_kind(&att), AttachmentKind::Image);
+    }
 }

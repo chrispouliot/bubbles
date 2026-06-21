@@ -68,6 +68,29 @@
           pango
           openssl # for OPENSSL_NO_VENDOR=1 if you ever drop vendored
           libheif # libheif-rs decode path for image/heic and image/heif
+
+          # GStreamer for video previews (Unit A) + lightbox playback (Unit C).
+          # The gstreamer*/gst-* attribute names below are the C libraries the
+          # Rust crates `gstreamer`, `gstreamer-video`, `gstreamer-app`, and
+          # `gstreamer-pbutils` link against — they provide the .pc files the
+          # crates' build scripts look up via pkg-config. The gst-plugins-*
+          # bundles supply the *plugin elements* (decodebin, videoconvert,
+          # videoscale, qtdemux, …) the pipelines actually run at runtime:
+          # without them `gst::ElementFactory::make("decodebin")` returns None
+          # and the decode path in src/video.rs fails before it gets to the
+          # media. gst-libav is the ffmpeg-based codec bundle — it is the one
+          # that decodes H.264 / HEVC / ProRes / AAC out of MP4 and MOV, which
+          # is what iMessage ships. gst-plugins-rs.gst-plugin-gtk4 is the
+          # rust-written gstreamer plugin that provides the GTK4 paintable
+          # sink (`gtk4paintablesink`) used by Unit C's lightbox — without
+          # this, the `gst-plugin-gtk4` Rust crate's build script can't find
+          # the C plugin to link against, and the lightbox can't render
+          # video frames.
+          gst_all_1.gstreamer
+          gst_all_1.gst-plugins-base
+          gst_all_1.gst-plugins-good
+          gst_all_1.gst-libav
+          gst_all_1.gst-plugins-rs
         ];
       in
       {
@@ -159,6 +182,17 @@
             openssl
             librsvg
             libheif # libheif-rs decode path for image/heic and image/heif
+
+            # GStreamer — same rationale as the devshell's buildInputs above.
+            # Must be mirrored here so `nix build` produces a closure that
+            # actually contains the plugin bundles, otherwise the runtime
+            # gstreamer init in src/video.rs will fail to find decodebin /
+            # qtdemux / avdec_h264 etc. on a real install.
+            gst_all_1.gstreamer
+            gst_all_1.gst-plugins-base
+            gst_all_1.gst-plugins-good
+            gst_all_1.gst-libav
+            gst_all_1.gst-plugins-rs
           ];
 
           postInstall = ''
@@ -208,6 +242,24 @@
             # Make GSettings schemas (gtk4 + libadwaita) resolvable so the app
             # runs from the devshell without schema-not-found warnings.
             export XDG_DATA_DIRS="${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}:${pkgs.libadwaita}/share/gsettings-schemas/${pkgs.libadwaita.name}:${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:''${XDG_DATA_DIRS:-}"
+
+            # GStreamer plugin discovery. Each gstreamer plugin bundle
+            # (gst-plugins-base, gst-plugins-good, gst-libav, gst-plugins-rs)
+            # installs its plugin .so files under $out/lib/gstreamer-1.0/;
+            # gstreamer looks in the colon-separated GST_PLUGIN_PATH to
+            # populate its element registry. Without this, calls like
+            # `gst::ElementFactory::make("playbin")` or `gst::ElementFactory
+            # ::make("gtk4paintablesink")` (used by the Unit C lightbox)
+            # return None and the video pipeline fails to construct.
+            export GST_PLUGIN_PATH="${
+              pkgs.gst_all_1.gst-plugins-base
+            }/lib/gstreamer-1.0:${
+              pkgs.gst_all_1.gst-plugins-good
+            }/lib/gstreamer-1.0:${
+              pkgs.gst_all_1.gst-libav
+            }/lib/gstreamer-1.0:${
+              pkgs.gst_all_1.gst-plugins-rs
+            }/lib/gstreamer-1.0:''${GST_PLUGIN_PATH:-}"
 
             echo "openbubbles-gtk devshell · $(rustc --version)"
           '';
