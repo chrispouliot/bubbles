@@ -251,6 +251,22 @@ fn open_uri(uri: &str) {
     }
 }
 
+/// Maps target message guid → ChipEntry. Populated after every populate_messages
+/// rebuild and after every append/prepend, used by `reload_messages` to apply
+/// `UpdateChips` in place without rebuilding the view.
+#[derive(Clone)]
+struct ChipEntry {
+    /// The bubble widget, or — if the message currently has a chip — the
+    /// `gtk::Overlay` wrapping the bubble. Used to find the bubble in the
+    /// "add first chip" case (where the bubble is still a plain Box) and to
+    /// find the overlay in the "update/remove chip" cases.
+    bubble: gtk::Widget,
+    /// The chip widget, if the message currently has reactions. `None` means
+    /// the message was rendered without a chip and we'd need to add one (the
+    /// "add first chip" case).
+    chip: Option<gtk::Widget>,
+}
+
 /// Cheap-to-clone bundle the UI closures share.
 #[derive(Clone)]
 struct Ui {
@@ -340,6 +356,24 @@ struct Ui {
     /// Swaps the content pane between the empty-state illustration (no chat
     /// open) and the timeline + compose view.
     content_stack: gtk::Stack,
+    /// Guids of non-tapback messages currently rendered as bubbles, in order.
+    /// Used by `plan_chat_update` to decide between Noop / Append / UpdateReceipt /
+    /// Rebuild. Updated after every populate_messages call and after every in-place
+    /// update path.
+    rendered_guids: Rc<RefCell<Vec<String>>>,
+    /// Text currently shown in the receipt label, or `None` if no label is shown.
+    /// The placeholder ("\u{200b}") counts as `Some("\u{200b}")`.
+    current_receipt_text: Rc<RefCell<Option<String>>>,
+    /// Handle to the receipt label widget currently in msg_container, or `None` if
+    /// no label is shown. Used for in-place text updates and for removal.
+    receipt_label: Rc<RefCell<Option<gtk::Label>>>,
+    /// Maps target message guid → ChipEntry. Populated after every populate_messages
+    /// rebuild and after every append/prepend, used by `reload_messages` to apply
+    /// `UpdateChips` in place without rebuilding the view.
+    current_chips: Rc<RefCell<std::collections::HashMap<String, ChipEntry>>>,
+    /// Snapshot of the `LiveReactionSummary` maps currently rendered. Used to
+    /// compute chip changes (prev_reactions) in `reload_messages`.
+    current_reactions: Rc<RefCell<std::collections::BTreeMap<String, Vec<LiveReactionSummary>>>>,
 }
 
 /// Swap the window over to the messaging UI and start receiving. Called once a
@@ -599,6 +633,11 @@ pub fn enter_messaging(
         pending_chip_icon,
         compose_outer: compose_outer.clone(),
         content_stack: content_stack.clone(),
+        rendered_guids: Rc::new(RefCell::new(Vec::new())),
+        current_receipt_text: Rc::new(RefCell::new(None)),
+        receipt_label: Rc::new(RefCell::new(None)),
+        current_chips: Rc::new(RefCell::new(std::collections::HashMap::new())),
+        current_reactions: Rc::new(RefCell::new(std::collections::BTreeMap::new())),
     };
 
     // Sync the compose bar visibility with the split view's content panel.
@@ -1885,11 +1924,20 @@ impl Ui {
 
                 let anchor = first.as_ref().map(|(g, _)| g.as_str());
                 let on_reaction = ui.make_reaction_handler();
-                let marker = populate_messages(&ui.msg_container, &msgs, is_group, anchor, &previews, &ui.preview_cards, on_reaction.as_ref(), &reactions);
+                let (marker, chip_map) = populate_messages(&ui.msg_container, &msgs, is_group, anchor, &previews, &ui.preview_cards, on_reaction.as_ref(), &reactions);
+                *ui.current_chips.borrow_mut() = chip_map;
+                *ui.current_reactions.borrow_mut() = reactions.clone();
                 *ui.unread_marker_shown.borrow_mut() = marker.is_some();
                 *ui.unread_marker.borrow_mut() = marker.clone();
                 ui.update_unread_pill();
                 ui.refresh_typing_row(is_group);
+                sync_tracked_state_after_rebuild(
+                    &ui.msg_container,
+                    &msgs,
+                    &ui.rendered_guids,
+                    &ui.current_receipt_text,
+                    &ui.receipt_label,
+                );
 
                 let to = match &marker {
                     Some(w) => ScrollTo::Widget(w.clone()),
@@ -1958,35 +2006,193 @@ impl Ui {
                 let adj = ui.scroller.vadjustment();
                 let at_bottom = adj.value() + adj.page_size() >= adj.upper() - 80.0;
                 let prev = adj.value();
-                let anchor = ui.unread.borrow().as_ref().map(|(g, _)| g.clone());
-                let on_reaction = ui.make_reaction_handler();
-                let marker = populate_messages(
-                    &ui.msg_container,
+
+                // Read tracked state and decide how to update the view.
+                let prev_guids = ui.rendered_guids.borrow().clone();
+                let prev_receipt = ui.current_receipt_text.borrow().clone();
+                let prev_reactions = ui.collect_current_reactions();
+                let plan = plan_chat_update(
+                    &prev_guids,
+                    prev_receipt.as_deref(),
+                    &prev_reactions,
                     &msgs,
-                    is_group,
-                    anchor.as_deref(),
-                    &previews,
-                    &ui.preview_cards,
-                    on_reaction.as_ref(),
                     &reactions,
                 );
-                *ui.unread_marker_shown.borrow_mut() = marker.is_some();
-                *ui.unread_marker.borrow_mut() = marker.clone();
-                ui.update_unread_pill();
-                ui.refresh_typing_row(is_group);
-                // If this rebuild is the message that superseded the typing dots,
-                // fade the newly-arrived bubble in where the dots were.
-                if ui.morph_pending.replace(false) {
-                    if let Some(last) = ui.msg_container.last_child() {
-                        last.add_css_class("bubble-appear");
+
+                // Remove any stale typing row that was left in the container by
+                // the typing-indicator path.  For the Rebuild path this is a no-op
+                // (clear_box handles it), for the in-place paths it is essential.
+                ui.remove_typing_row();
+
+                match plan {
+                    ChatUpdatePlan::Noop => {
+                        ui.refresh_typing_row(is_group);
+                        ui.update_unread_pill();
+                    }
+                    ChatUpdatePlan::UpdateReceipt { new_text } => {
+                        if let Some(label) = ui.receipt_label.borrow().as_ref() {
+                            label.set_text(&new_text);
+                        }
+                        *ui.current_receipt_text.borrow_mut() = Some(new_text);
+                        ui.refresh_typing_row(is_group);
+                        ui.update_unread_pill();
+                        let to = if at_bottom {
+                            ScrollTo::Bottom
+                        } else {
+                            ScrollTo::Value(prev)
+                        };
+                        ui.scroll_to(to);
+                    }
+                    ChatUpdatePlan::Append { new_tail, receipt } => {
+                        let on_reaction = ui.make_reaction_handler();
+                        // Seed the group state from the last previously-rendered
+                        // message so the first appended widget gets correct spacing.
+                        let prev_msg = prev_guids
+                            .last()
+                            .and_then(|g| msgs.iter().find(|m| &m.guid == g));
+                        let (widgets, _marker, chip_map) = build_message_widgets(
+                            &new_tail,
+                            is_group,
+                            None,
+                            &previews,
+                            &ui.preview_cards,
+                            on_reaction.as_ref(),
+                            &reactions,
+                            prev_msg,
+                        );
+                        ui.current_chips.borrow_mut().extend(chip_map);
+                        *ui.current_reactions.borrow_mut() = reactions.clone();
+                        for w in &widgets {
+                            ui.msg_container.append(w);
+                        }
+                        // Handle the receipt action.
+                        match receipt {
+                            ReceiptAction::Keep => {}
+                            ReceiptAction::Set(text) => {
+                                if let Some(old) = ui.receipt_label.borrow_mut().take() {
+                                    ui.msg_container.remove(&old);
+                                }
+                                *ui.receipt_label.borrow_mut() = None;
+                                *ui.current_receipt_text.borrow_mut() = None;
+                                let label_widget = receipt_label(&text);
+                                ui.msg_container.append(&label_widget);
+                                if let Ok(label) =
+                                    label_widget.downcast::<gtk::Label>()
+                                {
+                                    *ui.receipt_label.borrow_mut() = Some(label);
+                                }
+                                *ui.current_receipt_text.borrow_mut() = Some(text);
+                            }
+                            ReceiptAction::Remove => {
+                                if let Some(old) = ui.receipt_label.borrow_mut().take() {
+                                    ui.msg_container.remove(&old);
+                                }
+                                *ui.receipt_label.borrow_mut() = None;
+                                *ui.current_receipt_text.borrow_mut() = None;
+                            }
+                        }
+                        // Update the rendered-guid list to include the new messages.
+                        let mut new_guids = prev_guids;
+                        for m in &new_tail {
+                            new_guids.push(m.guid.clone());
+                        }
+                        *ui.rendered_guids.borrow_mut() = new_guids;
+                        ui.refresh_typing_row(is_group);
+                        ui.update_unread_pill();
+                        // morph_pending: if the typing dots were superseded by
+                        // an incoming message, fade the newly-arrived bubble in.
+                        if ui.morph_pending.replace(false) {
+                            if let Some(last_msg) = widgets.last() {
+                                last_msg.add_css_class("bubble-appear");
+                            }
+                        }
+                        let to = if at_bottom {
+                            ScrollTo::Bottom
+                        } else {
+                            ScrollTo::Value(prev)
+                        };
+                        ui.scroll_to(to);
+                    }
+                    ChatUpdatePlan::UpdateChips { changes } => {
+                        // Build a quick guid → is_from_me lookup from the new message list.
+                        let own_lookup: std::collections::HashMap<String, bool> = msgs.iter()
+                            .filter(|m| m.associated_guid.is_none())
+                            .map(|m| (m.guid.clone(), m.is_from_me))
+                            .collect();
+
+                        // Snapshot the chip map so we can iterate without holding the borrow.
+                        let chips_snapshot: Vec<(String, gtk::Widget)> = ui.current_chips.borrow()
+                            .iter()
+                            .map(|(g, e)| (g.clone(), e.bubble.clone()))
+                            .collect();
+
+                        for change in changes {
+                            let target = &change.target_guid;
+                            let bubble_or_overlay = chips_snapshot.iter()
+                                .find(|(g, _)| g == target)
+                                .map(|(_, w)| w.clone());
+                            if let Some(bubble) = bubble_or_overlay {
+                                let is_from_me = own_lookup.get(target).copied().unwrap_or(false);
+                                apply_chip_change(
+                                    target,
+                                    &change.new_chips,
+                                    &bubble,
+                                    is_from_me,
+                                    &ui.current_chips,
+                                );
+                            } else {
+                                // First reaction on a message we don't have a bubble for.
+                                // This shouldn't normally happen if the chip map is kept
+                                // in sync (every message in view has a bubble entry). If
+                                // it does, just log and skip.
+                                eprintln!("UpdateChips: no bubble entry for {target}, skipping");
+                            }
+                        }
+                        // Update tracked reactions so the next plan correctly computes
+                        // prev_reactions for removal detection.
+                        *ui.current_reactions.borrow_mut() = reactions.clone();
+                        ui.refresh_typing_row(is_group);
+                        ui.update_unread_pill();
+                    }
+                    ChatUpdatePlan::Rebuild => {
+                        let anchor = ui.unread.borrow().as_ref().map(|(g, _)| g.clone());
+                        let on_reaction = ui.make_reaction_handler();
+                        let (marker, chip_map) = populate_messages(
+                            &ui.msg_container,
+                            &msgs,
+                            is_group,
+                            anchor.as_deref(),
+                            &previews,
+                            &ui.preview_cards,
+                            on_reaction.as_ref(),
+                            &reactions,
+                        );
+                        *ui.current_chips.borrow_mut() = chip_map;
+                        *ui.current_reactions.borrow_mut() = reactions.clone();
+                        *ui.unread_marker_shown.borrow_mut() = marker.is_some();
+                        *ui.unread_marker.borrow_mut() = marker.clone();
+                        ui.update_unread_pill();
+                        ui.refresh_typing_row(is_group);
+                        sync_tracked_state_after_rebuild(
+                            &ui.msg_container,
+                            &msgs,
+                            &ui.rendered_guids,
+                            &ui.current_receipt_text,
+                            &ui.receipt_label,
+                        );
+                        if ui.morph_pending.replace(false) {
+                            if let Some(last) = ui.msg_container.last_child() {
+                                last.add_css_class("bubble-appear");
+                            }
+                        }
+                        let to = if at_bottom {
+                            ScrollTo::Bottom
+                        } else {
+                            ScrollTo::Value(prev)
+                        };
+                        ui.scroll_to(to);
                     }
                 }
-                let to = if at_bottom {
-                    ScrollTo::Bottom
-                } else {
-                    ScrollTo::Value(prev)
-                };
-                ui.scroll_to(to);
             },
         );
     }
@@ -2086,7 +2292,7 @@ impl Ui {
                 // and the floating pill is dismissed.
                 let anchor = ui.unread.borrow().as_ref().map(|(g, _)| g.clone());
                 let on_reaction = ui.make_reaction_handler();
-                let (widgets, marker) = build_message_widgets(
+                let (widgets, marker, chip_map) = build_message_widgets(
                     &older,
                     is_group,
                     anchor.as_deref(),
@@ -2094,7 +2300,10 @@ impl Ui {
                     &ui.preview_cards,
                     on_reaction.as_ref(),
                     &reactions,
+                    None,
                 );
+                ui.current_chips.borrow_mut().extend(chip_map);
+                *ui.current_reactions.borrow_mut() = reactions.clone();
                 for w in widgets.into_iter().rev() {
                     ui.msg_container.prepend(&w);
                 }
@@ -2229,7 +2438,7 @@ impl Ui {
                 *ui.page_has_more.borrow_mut() = true;
                 *ui.page_loading.borrow_mut() = false;
                 let on_reaction = ui.make_reaction_handler();
-                let marker = populate_messages(
+                let (marker, chip_map) = populate_messages(
                     &ui.msg_container,
                     &msgs,
                     is_group,
@@ -2239,10 +2448,19 @@ impl Ui {
                     on_reaction.as_ref(),
                     &reactions,
                 );
+                *ui.current_chips.borrow_mut() = chip_map;
+                *ui.current_reactions.borrow_mut() = reactions.clone();
                 *ui.unread_marker_shown.borrow_mut() = marker.is_some();
                 *ui.unread_marker.borrow_mut() = marker.clone();
                 ui.update_unread_pill();
                 ui.refresh_typing_row(is_group);
+                sync_tracked_state_after_rebuild(
+                    &ui.msg_container,
+                    &msgs,
+                    &ui.rendered_guids,
+                    &ui.current_receipt_text,
+                    &ui.receipt_label,
+                );
                 let to = match &marker {
                     Some(w) => ScrollTo::Widget(w.clone()),
                     None => ScrollTo::Bottom,
@@ -2425,9 +2643,9 @@ impl Ui {
                 ui.reload_messages(chat_id, is_group);
                 ui.reload_chats(|_| {});
                 // Fire the network send in the background. The optimistic row
-                // already carries the final guid, so the echo dedupes and there
-                // is nothing to re-render on completion — avoiding a redundant
-                // rebuild (and the scroll stutter it caused) a beat after send.
+                // already carries the final guid, so the echo dedupes and the
+                // plan-based refresh (Noop) skips the rebuild, avoiding any
+                // scroll stutter or thumbnail flash a beat after send.
                 let guid_fail = guid.clone();
                 let store_fail = store_for_network.clone();
                 let ui_fail = ui.clone();
@@ -2562,6 +2780,12 @@ impl Ui {
                 eprintln!("reaction {} send skipped (rustpush feature disabled)", index);
             }))
         }
+    }
+
+    /// Snapshot the current reactions map for computing chip changes on the
+    /// next refresh. Returns a clone of the internal map.
+    fn collect_current_reactions(&self) -> std::collections::BTreeMap<String, Vec<LiveReactionSummary>> {
+        self.current_reactions.borrow().clone()
     }
 
     /// Ack the newest unread inbound message (implicitly marking earlier ones read).
@@ -2849,7 +3073,13 @@ impl Ui {
 /// Build the row widgets for a message slice with intra-slice grouping/spacing.
 /// Inserts the "new messages" divider before the message whose guid matches
 /// `unread_anchor` (if present in this slice). No receipt indicator. Used to
-/// prepend an older page; returns the divider widget if it landed here.
+/// prepend an older page or to append new messages; returns the divider widget
+/// if it landed here.
+///
+/// When `prev` is `Some`, the group state is seeded from that message so the
+/// first widget in the batch gets the correct spacing relative to its actual
+/// predecessor (not a default "new batch" gap). Used by the `Append` path.
+#[allow(clippy::too_many_arguments)]
 fn build_message_widgets(
     msgs: &[StoredMessage],
     is_group: bool,
@@ -2858,12 +3088,15 @@ fn build_message_widgets(
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
     on_reaction: Option<&Rc<ReactionHandler>>,
     reactions: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
-) -> (Vec<gtk::Widget>, Option<gtk::Widget>) {
+    prev: Option<&StoredMessage>,
+) -> (Vec<gtk::Widget>, Option<gtk::Widget>, std::collections::HashMap<String, ChipEntry>) {
     let mut out = Vec::with_capacity(msgs.len());
     let mut marker: Option<gtk::Widget> = None;
-    let mut last_key: Option<String> = None;
-    let mut last_date = 0i64;
-    let mut last_from_me: Option<bool> = None;
+    let mut chip_map: std::collections::HashMap<String, ChipEntry> = std::collections::HashMap::new();
+    let (mut last_key, mut last_date, mut last_from_me) = match prev {
+        Some(p) => (Some(group_key(p)), p.date, Some(p.is_from_me)),
+        None => (None, 0i64, None),
+    };
     for m in msgs {
         if marker.is_none() && unread_anchor == Some(m.guid.as_str()) {
             let mk = unread_marker();
@@ -2895,12 +3128,68 @@ fn build_message_widgets(
         let chip = reactions
             .get(&m.guid)
             .map(|chips| reaction_chips_row(chips));
-        out.push(message_widget(m, show_header, is_group, top, previews, preview_cards, on_reaction, chip.as_ref()));
+        let (row, bubble_or_overlay) = message_widget(m, show_header, is_group, top, previews, preview_cards, on_reaction, chip.as_ref());
+        let bubble_widget = match &bubble_or_overlay {
+            Some(b) => b.clone(),
+            None => row.clone(),
+        };
+        out.push(row);
+
+        // Record chip entry for in-place update support.
+        let entry = ChipEntry {
+            bubble: bubble_widget,
+            chip: chip.clone(),
+        };
+        chip_map.insert(m.guid.clone(), entry);
+
         last_key = Some(key);
         last_date = m.date;
         last_from_me = Some(m.is_from_me);
     }
-    (out, marker)
+    (out, marker, chip_map)
+}
+
+/// After a full `populate_messages` rebuild, resync the tracked state to
+/// match the new container. `msgs` is the full message list the container
+/// was built from (including tapback rows; we filter them).
+fn sync_tracked_state_after_rebuild(
+    container: &gtk::Box,
+    msgs: &[StoredMessage],
+    rendered_guids: &Rc<RefCell<Vec<String>>>,
+    current_receipt_text: &Rc<RefCell<Option<String>>>,
+    receipt_label: &Rc<RefCell<Option<gtk::Label>>>,
+) {
+    // The old receipt_label handle is now stale (the widget was destroyed by
+    // clear_box). Drop it before re-extracting.
+    *receipt_label.borrow_mut() = None;
+    *current_receipt_text.borrow_mut() = None;
+    *rendered_guids.borrow_mut() = msgs
+        .iter()
+        .filter(|m| m.associated_guid.is_none())
+        .map(|m| m.guid.clone())
+        .collect();
+    if let Some(label) = extract_receipt_label(container) {
+        let text = label.text().to_string();
+        *receipt_label.borrow_mut() = Some(label);
+        *current_receipt_text.borrow_mut() = Some(text);
+    }
+}
+
+/// Walk msg_container to find the receipt label. The typing indicator row
+/// is a `gtk::Box`, not a `gtk::Label`, so downcasting is sufficient to
+/// distinguish them.
+fn extract_receipt_label(container: &gtk::Box) -> Option<gtk::Label> {
+    let mut child = container.last_child();
+    while let Some(c) = child {
+        // Clone before downcast so we can still walk to prev_sibling.
+        if let Ok(label) = c.clone().downcast::<gtk::Label>() {
+            if label.has_css_class("dim-label") && label.has_css_class("caption") {
+                return Some(label);
+            }
+        }
+        child = c.prev_sibling();
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2913,7 +3202,7 @@ fn populate_messages(
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
     on_reaction: Option<&Rc<ReactionHandler>>,
     reactions: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
-) -> Option<gtk::Widget> {
+) -> (Option<gtk::Widget>, std::collections::HashMap<String, ChipEntry>) {
     clear_box(container);
     // Stale card handles from the previous render are about to be destroyed
     // when their old container is cleared. Drop them so `refresh_link_card`
@@ -2923,6 +3212,7 @@ fn populate_messages(
     let mut last_date = 0i64;
     let mut last_from_me: Option<bool> = None;
     let mut marker: Option<gtk::Widget> = None;
+    let mut chip_map: std::collections::HashMap<String, ChipEntry> = std::collections::HashMap::new();
     // The single message that carries the Delivered/Read indicator.
     // Skip tapback rows — they render as chips on the target message.
     let last_sent_idx = msgs.iter().rposition(|m| m.is_from_me && m.associated_guid.is_none());
@@ -2970,7 +3260,7 @@ fn populate_messages(
         let chip = reactions
             .get(&m.guid)
             .map(|chips| reaction_chips_row(chips));
-        container.append(&message_widget(
+        let (row, bubble_or_overlay) = message_widget(
             m,
             show_header,
             is_group,
@@ -2979,7 +3269,19 @@ fn populate_messages(
             preview_cards,
             on_reaction,
             chip.as_ref(),
-        ));
+        );
+        let bubble_widget = match &bubble_or_overlay {
+            Some(b) => b.clone(),
+            None => row.clone(),
+        };
+        container.append(&row);
+
+        // Record chip entry for in-place update support.
+        let entry = ChipEntry {
+            bubble: bubble_widget,
+            chip: chip.clone(),
+        };
+        chip_map.insert(m.guid.clone(), entry);
 
         // Delivered/Read indicator: only under the most recent sent message, so
         // it moves forward as new messages are sent and never lingers on older ones.
@@ -3000,7 +3302,7 @@ fn populate_messages(
         last_date = m.date;
         last_from_me = Some(m.is_from_me);
     }
-    marker
+    (marker, chip_map)
 }
 
 /// A row of small reaction chips overlaid on a message bubble corner. Each chip
@@ -3013,6 +3315,17 @@ fn reaction_chips_row(chips: &[LiveReactionSummary]) -> gtk::Widget {
         .margin_top(0)
         .margin_bottom(0)
         .build();
+    row.add_css_class("reaction-chips");
+    populate_chips_row(&row, chips);
+    row.upcast()
+}
+
+/// Clear `row` and re-populate it with one `gtk::Label` per chip.
+/// Used for in-place updates when the chip widget already exists.
+fn populate_chips_row(row: &gtk::Box, chips: &[LiveReactionSummary]) {
+    while let Some(child) = row.first_child() {
+        row.remove(&child);
+    }
     for chip in chips {
         let emoji = code_to_emoji(2000 + chip.reaction_index as i64).unwrap_or("?");
         let text = if chip.count > 1 {
@@ -3030,8 +3343,6 @@ fn reaction_chips_row(chips: &[LiveReactionSummary]) -> gtk::Widget {
         }
         row.append(&label);
     }
-
-    row.upcast()
 }
 
 /// "Read 16:06" if read, else "Delivered" if delivered, else nothing.
@@ -3357,6 +3668,7 @@ fn chat_row(c: &ChatSummary, handles: &[String]) -> gtk::ListBoxRow {
 /// messages; the renderer reads synchronously from it, so we never hit the
 /// store on the GTK main thread. `preview_cards` is the live-widget registry
 /// that `refresh_link_card` uses to swap a card in place without rebuilding.
+/// Returns `(row_widget, bubble_or_overlay)`.
 fn message_widget(
     m: &StoredMessage,
     show_header: bool,
@@ -3366,7 +3678,7 @@ fn message_widget(
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
     on_reaction: Option<&Rc<dyn Fn(String, usize, String)>>,
     chip: Option<&gtk::Widget>,
-) -> gtk::Widget {
+) -> (gtk::Widget, Option<gtk::Widget>) {
     if m.is_from_me {
         own_message(m, show_header, top, previews, preview_cards, chip)
     } else {
@@ -3377,6 +3689,7 @@ fn message_widget(
 /// Left: grey bubble, with an avatar + sender name in group chats only.
 /// On incoming messages, a right-click gesture opens a popover with the 6
 /// standard tapback emoji buttons.
+/// Returns `(row_widget, bubble_or_overlay)`.
 fn incoming_message(
     m: &StoredMessage,
     show_header: bool,
@@ -3386,7 +3699,7 @@ fn incoming_message(
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
     on_reaction: Option<&Rc<ReactionHandler>>,
     chip: Option<&gtk::Widget>,
-) -> gtk::Widget {
+) -> (gtk::Widget, Option<gtk::Widget>) {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -3482,14 +3795,15 @@ fn incoming_message(
         picker
     });
 
-    line.append(&message_body(
+    let (body_col, bubble_or_overlay) = message_body(
         m,
         false,
         previews,
         preview_cards,
         show_picker.as_ref(),
         chip,
-    ));
+    );
+    line.append(&body_col);
     if show_header {
         line.append(&time_label(m));
     }
@@ -3497,10 +3811,11 @@ fn incoming_message(
 
     row.append(&col);
 
-    row.upcast()
+    (row.upcast(), bubble_or_overlay)
 }
 
 /// Right: blue bubble, time to its left on the first bubble of a group.
+/// Returns `(row_widget, bubble_or_overlay)`.
 fn own_message(
     m: &StoredMessage,
     show_header: bool,
@@ -3508,7 +3823,7 @@ fn own_message(
     previews: &std::collections::HashMap<(String, i64), MessageLinkPreview>,
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
     chip: Option<&gtk::Widget>,
-) -> gtk::Widget {
+) -> (gtk::Widget, Option<gtk::Widget>) {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .margin_start(56)
@@ -3541,10 +3856,11 @@ fn own_message(
         line.append(&icon);
     }
 
-    line.append(&message_body(m, true, previews, preview_cards, None, chip));
+    let (body_col, bubble_or_overlay) = message_body(m, true, previews, preview_cards, None, chip);
+    line.append(&body_col);
 
     row.append(&line);
-    row.upcast()
+    (row.upcast(), bubble_or_overlay)
 }
 
 /// The visual content of a message: image attachments stacked above an optional
@@ -3552,6 +3868,10 @@ fn own_message(
 /// (iMessage rich link) is appended below the bubble when the renderer has one
 /// in its in-memory map; the card is registered in `preview_cards` so
 /// `refresh_link_card` can swap it in place on a placeholder→fillin.
+///
+/// Returns `(col_widget, bubble_or_overlay)` where the second element is `Some`
+/// if a text bubble (with or without chip overlay) was created, `None` for
+/// attachment-only messages with no text.
 fn message_body(
     m: &StoredMessage,
     own: bool,
@@ -3559,7 +3879,7 @@ fn message_body(
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
     show_picker: Option<&Rc<dyn Fn()>>,
     chip: Option<&gtk::Widget>,
-) -> gtk::Widget {
+) -> (gtk::Widget, Option<gtk::Widget>) {
     let col = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(3)
@@ -3593,15 +3913,21 @@ fn message_body(
         .as_deref()
         .map_or(false, |t| !strip_marker(t).is_empty());
     let is_tapback = m.associated_guid.is_some();
-    if has_text || is_tapback {
+    let bubble_or_overlay: Option<gtk::Widget> = if has_text || is_tapback {
         let bubble = bubble_box(own);
         bubble.append(&bubble_label(&body_text(m), show_picker));
-        col.append(&bubble_with_chip(&bubble, own, chip));
+        let result = bubble_with_chip(&bubble, own, chip);
+        col.append(&result);
+        Some(result)
     } else if m.attachments.is_empty() {
         let bubble = bubble_box(own);
         bubble.append(&bubble_label("(no text)", show_picker));
-        col.append(&bubble_with_chip(&bubble, own, chip));
-    }
+        let result = bubble_with_chip(&bubble, own, chip);
+        col.append(&result);
+        Some(result)
+    } else {
+        None
+    };
 
     // Sender-generated link preview (iMessage rich link). The store already
     // cached the thumbnail on disk; the renderer loads it from `image_path`
@@ -3616,7 +3942,7 @@ fn message_body(
         col.append(&card);
     }
 
-    col.upcast()
+    (col.upcast(), bubble_or_overlay)
 }
 
 /// iMessage marks attachment positions in the text stream with U+FFFC; drop it
@@ -4315,6 +4641,133 @@ fn bubble_with_chip(bubble: &gtk::Box, own: bool, chip: Option<&gtk::Widget>) ->
     });
 
     overlay.upcast()
+}
+
+/// Wrap `bubble` in a `gtk::Overlay` with `chip` as an overlay child positioned
+/// at the bubble's top corner (top-right for incoming, top-left for sent).
+/// This is the same logic as `bubble_with_chip` but takes a generic `gtk::Widget`
+/// for the bubble (not just `gtk::Box`) so it can work on the in-place update path.
+#[allow(deprecated, clippy::unnecessary_cast)]
+fn wrap_bubble_in_overlay(bubble: &gtk::Widget, chip: &gtk::Widget, own: bool) -> gtk::Widget {
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(bubble));
+    overlay.set_hexpand(false);
+    overlay.set_halign(if own {
+        gtk::Align::End
+    } else {
+        gtk::Align::Start
+    });
+    chip.set_valign(gtk::Align::Start);
+    chip.set_halign(if own {
+        gtk::Align::Start
+    } else {
+        gtk::Align::End
+    });
+    overlay.add_overlay(chip);
+    overlay.set_measure_overlay(chip, false);
+    overlay.set_clip_overlay(chip, false);
+
+    // Position the chip so its center is at the bubble's top edge corner.
+    let own_side = own;
+    let bubble_for_closure = bubble.clone();
+    overlay.connect_get_child_position(move |_overlay, child| {
+        let (_, chip_w, _, _) = child.measure(gtk::Orientation::Horizontal, -1);
+        let (_, chip_h, _, _) = child.measure(gtk::Orientation::Vertical, -1);
+        let bubble_w = {
+            let a = bubble_for_closure.allocated_width();
+            if a > 0 {
+                a as i32
+            } else {
+                let (_, natural, _, _) =
+                    bubble_for_closure.measure(gtk::Orientation::Horizontal, -1);
+                natural
+            }
+        };
+        let y = -(chip_h / 2);
+        let x = if own_side {
+            -(chip_w / 2)
+        } else {
+            bubble_w - chip_w / 2
+        };
+        Some(gtk::gdk::Rectangle::new(x, y, chip_w, chip_h))
+    });
+
+    overlay.upcast()
+}
+
+/// Replace `old` widget with `new` widget in the parent container, preserving
+/// the same position among siblings.
+fn replace_in_parent(old: &gtk::Widget, new: &gtk::Widget) {
+    let parent = old.parent().expect("replace_in_parent: old widget has no parent");
+    let prev_sibling = old.prev_sibling();
+    // The parent should be a gtk::Box for the message-body `col` container.
+    let parent_box = parent.downcast_ref::<gtk::Box>()
+        .expect("replace_in_parent: parent must be a gtk::Box");
+    parent_box.remove(old);
+    match prev_sibling {
+        Some(ref sibling) => parent_box.insert_child_after(new, Some(sibling)),
+        None => parent_box.prepend(new),
+    }
+}
+
+/// Apply a single `ChipChange` in place. The `bubble_or_overlay` is the
+/// widget currently in the container for `target_guid` (either the bare
+/// bubble Box, or the overlay wrapping the bubble if a chip already exists).
+/// `current_chips` is updated to reflect the new state.
+fn apply_chip_change(
+    target_guid: &str,
+    new_chips: &[LiveReactionSummary],
+    bubble_or_overlay: &gtk::Widget,
+    is_from_me: bool,
+    current_chips: &Rc<RefCell<std::collections::HashMap<String, ChipEntry>>>,
+) {
+    let mut chips = current_chips.borrow_mut();
+
+    use std::collections::hash_map::Entry;
+    match chips.entry(target_guid.to_string()) {
+        Entry::Occupied(mut o) => {
+            let has_chip = o.get().chip.is_some();
+            let chips_empty = new_chips.is_empty();
+
+            match (has_chip, chips_empty) {
+                // "Add first chip" — no chip yet, now has reactions.
+                (false, false) => {
+                    let chip = reaction_chips_row(new_chips);
+                    let overlay = wrap_bubble_in_overlay(bubble_or_overlay, &chip, is_from_me);
+                    replace_in_parent(bubble_or_overlay, &overlay);
+                    o.insert(ChipEntry {
+                        bubble: overlay,
+                        chip: Some(chip),
+                    });
+                }
+                // "Update existing chip" — had chip, reactions changed.
+                (true, false) => {
+                    if let Some(chip_widget) = &o.get().chip {
+                        if let Some(box_) = chip_widget.downcast_ref::<gtk::Box>() {
+                            populate_chips_row(box_, new_chips);
+                        }
+                    }
+                }
+                // "Remove last chip" — had chip, no more reactions.
+                (true, true) => {
+                    if let Some(chip_widget) = &o.get().chip {
+                        if let Some(box_) = chip_widget.downcast_ref::<gtk::Box>() {
+                            populate_chips_row(box_, &[]); // clear
+                        }
+                    }
+                }
+                // "Noop / state mismatch" — no chip, no chips to show (shouldn't occur)
+                (false, true) => {
+                    // Nothing to do.
+                }
+            }
+        }
+        Entry::Vacant(_) => {
+            // Message not found in chip map. This shouldn't happen if the chip map
+            // is kept in sync. Log and skip.
+            eprintln!("apply_chip_change: no chip entry for {target_guid}, skipping");
+        }
+    }
 }
 
 /// A vertical bubble container for the text label. The reaction chip (if any)
@@ -5108,6 +5561,169 @@ mod reaction_tests {
     }
 }
 
+// ── chat-update plan types and stub ──────────────────────────────────
+
+/// What to do with the chat-bubble container on the next refresh.
+///
+/// The caller (the GTK refresh path) inspects this and applies the minimal
+/// update needed instead of rebuilding the entire bubble list from scratch.
+#[derive(Debug)]
+pub enum ChatUpdatePlan {
+    Noop,
+    UpdateReceipt { new_text: String },
+    UpdateChips { changes: Vec<ChipChange> },
+    Append {
+        new_tail: Vec<StoredMessage>,
+        receipt: ReceiptAction,
+    },
+    Rebuild,
+}
+
+/// A single reaction-chip update for one target message.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct ChipChange {
+    pub target_guid: String,
+    pub new_chips: Vec<LiveReactionSummary>,
+}
+
+/// What to do with the existing receipt label underneath the last sent
+/// message.
+#[derive(Debug)]
+pub enum ReceiptAction {
+    Keep,
+    Set(String),
+    Remove,
+}
+
+/// Decide what display update is needed given the previously-rendered state
+/// and the new message list from the DB.
+///
+/// This is the pure decision function that lets the chat view avoid a full
+/// rebuild when messages are merely appended or receipts change.  The caller
+/// (the GTK refresh path) acts on the returned action.
+pub fn plan_chat_update(
+    prev_guids: &[String],
+    prev_receipt: Option<&str>,
+    prev_reactions: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
+    new_msgs: &[StoredMessage],
+    new_reactions: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
+) -> ChatUpdatePlan {
+    // 1. Compute the non-tapback guid set from new_msgs.
+    let new_guids: Vec<String> = new_msgs
+        .iter()
+        .filter(|m| m.associated_guid.is_none())
+        .map(|m| m.guid.clone())
+        .collect();
+
+    // 2. Compute desired new receipt state.
+    let new_receipt = compute_receipt_state(new_msgs);
+
+    // 3. Compute chip changes.
+    let chip_changes = compute_chip_changes(prev_reactions, new_reactions);
+
+    let prev_len = prev_guids.len();
+
+    // 4. Decision tree.
+    if prev_guids.is_empty() && !new_guids.is_empty() {
+        return ChatUpdatePlan::Rebuild;
+    }
+
+    if new_guids == prev_guids {
+        // Same set of non-tapback guids → in-place update possible.
+        let receipt_changed = new_receipt.as_deref() != prev_receipt;
+        let chips_changed = !chip_changes.is_empty();
+        match (receipt_changed, chips_changed) {
+            (false, false) => ChatUpdatePlan::Noop,
+            (true, false) => match new_receipt {
+                Some(text) => ChatUpdatePlan::UpdateReceipt { new_text: text },
+                None => ChatUpdatePlan::Rebuild,
+            },
+            (false, true) => ChatUpdatePlan::UpdateChips {
+                changes: chip_changes,
+            },
+            (true, true) => ChatUpdatePlan::Rebuild,
+        }
+    } else if new_guids.len() > prev_len
+        && new_guids[..prev_len]
+            .iter()
+            .zip(prev_guids.iter())
+            .all(|(a, b)| a == b)
+    {
+        // Strict extension at the end: new_guids starts with prev_guids and
+        // has more items.  Chip changes are IGNORED per spec (documented
+        // limitation — the chip update will be picked up on the next refresh).
+        let new_tail: Vec<StoredMessage> = new_msgs
+            .iter()
+            .filter(|m| m.associated_guid.is_none())
+            .skip(prev_len)
+            .cloned()
+            .collect();
+
+        let receipt = match (prev_receipt, new_receipt.as_deref()) {
+            (Some(_), None) => ReceiptAction::Remove,
+            (None, Some(text)) => ReceiptAction::Set(text.to_string()),
+            (Some(old), Some(new)) if old != new => ReceiptAction::Set(new.to_string()),
+            _ => ReceiptAction::Keep,
+        };
+
+        ChatUpdatePlan::Append { new_tail, receipt }
+    } else {
+        ChatUpdatePlan::Rebuild
+    }
+}
+
+/// Compare two reaction-chip maps and produce a list of changes.
+///
+/// An entry in `new` that is absent from `prev` (or has different chips) is a
+/// change with the new chips.  An entry present only in `prev` is a removal
+/// (empty chips).  The order of the returned vector is unspecified — callers
+/// sort it when asserting.
+fn compute_chip_changes(
+    prev: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
+    new: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
+) -> Vec<ChipChange> {
+    let mut changes = Vec::new();
+    // Check for new or changed chips.
+    for (guid, new_chips) in new {
+        let prev_chips = prev.get(guid);
+        if prev_chips != Some(new_chips) {
+            changes.push(ChipChange {
+                target_guid: guid.clone(),
+                new_chips: new_chips.clone(),
+            });
+        }
+    }
+    // Check for removed chips (target guid no longer in new).
+    for guid in prev.keys() {
+        if !new.contains_key(guid) {
+            changes.push(ChipChange {
+                target_guid: guid.clone(),
+                new_chips: vec![],
+            });
+        }
+    }
+    changes
+}
+
+/// Compute the desired receipt state from the full message list (including
+/// any trailing tapback rows). Mirrors the logic in `populate_messages`.
+fn compute_receipt_state(msgs: &[StoredMessage]) -> Option<String> {
+    let last_sent_idx = msgs
+        .iter()
+        .rposition(|m| m.is_from_me && m.associated_guid.is_none())?;
+    let m = &msgs[last_sent_idx];
+    if let Some(text) = receipt_status(m) {
+        return Some(text);
+    }
+    // No real receipt yet. Placeholder only if the last sent is the very
+    // last message in the list (including any trailing tapbacks).
+    if last_sent_idx == msgs.len() - 1 {
+        Some("\u{200b}".to_string())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod extract_target_text_tests {
     //! Pins the pure helper that picks the wire-level `ams` (target text) for
@@ -5366,3 +5982,466 @@ mod new_chat_payload_tests {
         assert_eq!(msg.item_type, 0, "item_type must be 0 for normal text");
     }
 }
+
+#[cfg(test)]
+mod plan_chat_update_tests {
+    //! Pins the behaviour of [`super::plan_chat_update`] — the pure decision
+    //! function that compares previously-rendered state against the new message
+    //! list and returns one of four actions so the GTK side can avoid a full
+    //! rebuild.
+    //!
+    //! All tests construct their own fixtures and call
+    //! [`super::plan_chat_update`] directly.  No GTK initialisation needed.
+    use super::*;
+    use std::collections::BTreeMap;
+
+    // ── test helpers ────────────────────────────────────────────────
+
+    /// Minimum `StoredMessage` with the identity-relevant fields set to
+    /// something useful; everything else zero / `None`.
+    fn m(guid: &str, is_from_me: bool, date: i64) -> StoredMessage {
+        StoredMessage {
+            id: 0,
+            guid: guid.to_string(),
+            chat_id: 0,
+            sender: None,
+            is_from_me,
+            text: None,
+            subject: None,
+            service: None,
+            date,
+            date_delivered: None,
+            date_read: None,
+            effect: None,
+            reply_to_guid: None,
+            reply_part: None,
+            associated_guid: None,
+            associated_type: None,
+            item_type: 0,
+            send_error: None,
+            attachments: vec![],
+        }
+    }
+
+    fn delivered(mut m: StoredMessage, date: i64) -> StoredMessage {
+        m.date_delivered = Some(date);
+        m
+    }
+
+    fn read(mut m: StoredMessage, date: i64) -> StoredMessage {
+        m.date_read = Some(date);
+        m
+    }
+
+    fn tapback(mut m: StoredMessage, target: &str) -> StoredMessage {
+        m.associated_guid = Some(target.to_string());
+        m
+    }
+
+    /// Shorthand to build a `Vec<String>` from string slices.
+    fn guids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Empty reaction map shorthand.
+    fn no_reactions() -> BTreeMap<String, Vec<LiveReactionSummary>> {
+        BTreeMap::new()
+    }
+
+    // ── tests ──────────────────────────────────────────────────────
+
+    // ── assertion helpers ──────────────────────────────────────────
+
+    /// Assert the result is `Noop`.
+    fn assert_noop(result: ChatUpdatePlan) {
+        assert!(matches!(result, ChatUpdatePlan::Noop), "expected Noop, got {result:?}");
+    }
+
+    /// Assert the result is `Rebuild`.
+    fn assert_rebuild(result: ChatUpdatePlan) {
+        assert!(matches!(result, ChatUpdatePlan::Rebuild), "expected Rebuild, got {result:?}");
+    }
+
+    /// Assert the result is `UpdateReceipt` with exactly `expected_text`.
+    fn assert_update_receipt(result: ChatUpdatePlan, expected_text: &str) {
+        match result {
+            ChatUpdatePlan::UpdateReceipt { new_text } => {
+                assert_eq!(new_text, expected_text, "UpdateReceipt text mismatch");
+            }
+            other => panic!("expected UpdateReceipt, got {other:?}"),
+        }
+    }
+
+    /// Assert the result is `Append` with the given tail guids and
+    /// `ReceiptAction::Keep`.
+    fn assert_append_keep(result: ChatUpdatePlan, expected_tail_guids: &[&str]) {
+        match result {
+            ChatUpdatePlan::Append { new_tail, receipt } => {
+                let tail_guids: Vec<&str> =
+                    new_tail.iter().map(|m| m.guid.as_str()).collect();
+                assert_eq!(tail_guids, expected_tail_guids, "Append tail guids mismatch");
+                assert!(
+                    matches!(receipt, ReceiptAction::Keep),
+                    "expected Keep receipt, got {receipt:?}",
+                );
+            }
+            other => panic!("expected Append, got {other:?}"),
+        }
+    }
+
+    /// Assert the result is `Append` with the given tail guids and
+    /// `ReceiptAction::Set(expected)`.
+    fn assert_append_set(result: ChatUpdatePlan, expected_tail_guids: &[&str], expected_text: &str) {
+        match result {
+            ChatUpdatePlan::Append { new_tail, receipt } => {
+                let tail_guids: Vec<&str> =
+                    new_tail.iter().map(|m| m.guid.as_str()).collect();
+                assert_eq!(tail_guids, expected_tail_guids, "Append tail guids mismatch");
+                match receipt {
+                    ReceiptAction::Set(text) => {
+                        assert_eq!(text, expected_text, "Append Set receipt text mismatch");
+                    }
+                    other => panic!("expected Set({expected_text:?}), got {other:?}"),
+                }
+            }
+            other => panic!("expected Append, got {other:?}"),
+        }
+    }
+
+    /// Assert the result is `Append` with the given tail guids and
+    /// `ReceiptAction::Remove`.
+    fn assert_append_remove(result: ChatUpdatePlan, expected_tail_guids: &[&str]) {
+        match result {
+            ChatUpdatePlan::Append { new_tail, receipt } => {
+                let tail_guids: Vec<&str> =
+                    new_tail.iter().map(|m| m.guid.as_str()).collect();
+                assert_eq!(tail_guids, expected_tail_guids, "Append tail guids mismatch");
+                assert!(
+                    matches!(receipt, ReceiptAction::Remove),
+                    "expected Remove receipt, got {receipt:?}",
+                );
+            }
+            other => panic!("expected Append, got {other:?}"),
+        }
+    }
+
+    // ── individual tests ───────────────────────────────────────────
+
+    #[test]
+    fn plan_chat_update_noop_when_guids_and_receipt_unchanged() {
+        let prev = guids(&["A", "B"]);
+        let new = vec![
+            m("A", false, 1000),
+            delivered(m("B", true, 2000), 3000),
+        ];
+        assert_noop(plan_chat_update(&prev, Some("Delivered"), &no_reactions(), &new, &no_reactions()));
+    }
+
+    #[test]
+    fn plan_chat_update_update_receipt_from_none_to_delivered() {
+        let prev = guids(&["A", "B"]);
+        let new = vec![
+            m("A", false, 1000),
+            delivered(m("B", true, 2000), 3000),
+        ];
+        // prev_receipt was the zero-width placeholder (sent message at bottom
+        // with no real receipt yet).
+        assert_update_receipt(
+            plan_chat_update(&prev, Some("\u{200b}"), &no_reactions(), &new, &no_reactions()),
+            "Delivered",
+        );
+    }
+
+    #[test]
+    fn plan_chat_update_update_receipt_delivered_to_read() {
+        let prev = guids(&["A", "B"]);
+        let new = vec![
+            m("A", false, 1000),
+            read(delivered(m("B", true, 2000), 3000), 4000),
+        ];
+        match plan_chat_update(&prev, Some("Delivered"), &no_reactions(), &new, &no_reactions()) {
+            ChatUpdatePlan::UpdateReceipt { new_text } => {
+                assert!(
+                    new_text.starts_with("Read "),
+                    "expected Read …, got {new_text:?}",
+                );
+                assert!(!new_text.is_empty(), "Read text must not be empty");
+            }
+            other => panic!("expected UpdateReceipt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_chat_update_append_incoming_message_keeps_receipt_when_last_sent_unchanged() {
+        let prev = guids(&["A", "B"]);
+        let new = vec![
+            m("A", false, 1000),
+            delivered(m("B", true, 2000), 3000),
+            m("C", false, 4000),
+        ];
+        assert_append_keep(
+            plan_chat_update(&prev, Some("Delivered"), &no_reactions(), &new, &no_reactions()),
+            &["C"],
+        );
+    }
+
+    #[test]
+    fn plan_chat_update_append_sent_message_adds_placeholder() {
+        let prev = guids(&["A"]);
+        let new = vec![m("A", false, 1000), m("B", true, 2000)];
+        assert_append_set(
+            plan_chat_update(&prev, None, &no_reactions(), &new, &no_reactions()),
+            &["B"],
+            "\u{200b}",
+        );
+    }
+
+    #[test]
+    fn plan_chat_update_append_removes_placeholder_when_new_incoming_after_last_sent() {
+        let prev = guids(&["A", "B"]);
+        let new = vec![
+            m("A", false, 1000),
+            m("B", true, 2000),  // last sent, no real receipt, was at end → placeholder
+            m("C", false, 3000), // new incoming after last sent
+        ];
+        assert_append_remove(
+            plan_chat_update(&prev, Some("\u{200b}"), &no_reactions(), &new, &no_reactions()),
+            &["C"],
+        );
+    }
+
+    #[test]
+    fn plan_chat_update_append_multiple_new_messages() {
+        let prev = guids(&["A"]);
+        let new = vec![
+            m("A", false, 1000),
+            m("B", false, 2000),
+            m("C", false, 3000),
+            m("D", false, 4000),
+        ];
+        assert_append_keep(
+            plan_chat_update(&prev, None, &no_reactions(), &new, &no_reactions()),
+            &["B", "C", "D"],
+        );
+    }
+
+    #[test]
+    fn plan_chat_update_rebuild_on_deletion() {
+        let prev = guids(&["A", "B", "C"]);
+        let new = vec![m("A", false, 1000), m("C", false, 3000)];
+        assert_rebuild(plan_chat_update(&prev, None, &no_reactions(), &new, &no_reactions()));
+    }
+
+    #[test]
+    fn plan_chat_update_rebuild_on_reorder() {
+        let prev = guids(&["A", "B"]);
+        let new = vec![m("B", false, 2000), m("A", false, 1000)];
+        assert_rebuild(plan_chat_update(&prev, None, &no_reactions(), &new, &no_reactions()));
+    }
+
+    #[test]
+    fn plan_chat_update_edit_in_middle_is_noop_limitation() {
+        // The plan function only compares guid sets + receipt state.  A
+        // message body change (edit) does NOT affect either, so the function
+        // returns Noop.  This is a known limitation: the user will see the
+        // edit on the next real refresh.  The test documents this behaviour
+        // rather than asserting Rebuild, because the plan is intentionally
+        // guid-based and edits are invisible to it.
+        let prev = guids(&["A", "B", "C"]);
+        // Same guids but different text on B — the plan can't see text
+        // changes by design.
+        let new = vec![
+            m("A", false, 1000),
+            m("B", false, 2000),
+            m("C", false, 3000),
+        ];
+        assert_noop(plan_chat_update(&prev, None, &no_reactions(), &new, &no_reactions()));
+    }
+
+    #[test]
+    fn plan_chat_update_rebuild_when_prev_guids_empty_with_messages() {
+        let prev: Vec<String> = vec![];
+        let new = vec![m("A", false, 1000), m("B", false, 2000)];
+        assert_rebuild(plan_chat_update(&prev, None, &no_reactions(), &new, &no_reactions()));
+    }
+
+    #[test]
+    fn plan_chat_update_noop_when_new_list_has_only_extra_tapback_rows() {
+        // Tapback rows (associated_guid.is_some()) are filtered out of the
+        // guid set.  Adding only tapbacks leaves the non-tapback guid set
+        // unchanged, so the plan is Noop.  The reaction chips themselves are
+        // not detected by this function — they will be stale until the next
+        // real refresh, which is acceptable for the send-flash fix.
+        let prev = guids(&["A", "B"]);
+        let new = vec![
+            delivered(m("A", false, 1000), 0),
+            delivered(m("B", true, 2000), 3000),
+            tapback(m("T1", false, 1500), "A"),
+        ];
+        assert_noop(plan_chat_update(&prev, Some("Delivered"), &no_reactions(), &new, &no_reactions()));
+    }
+
+    #[test]
+    fn plan_chat_update_append_tapback_does_not_show_in_tail() {
+        // A tapback row in new_msgs does not count as a non-tapback message,
+        // so it must not appear in Append's new_tail.
+        let prev = guids(&["A"]);
+        let new = vec![
+            m("A", false, 1000),
+            m("B", false, 2000),
+            tapback(m("T1", false, 1500), "A"),
+        ];
+        assert_append_keep(
+            plan_chat_update(&prev, None, &no_reactions(), &new, &no_reactions()),
+            &["B"],
+        );
+    }
+
+    // ── reaction helpers ──────────────────────────────────────────────
+
+    /// Build a single `LiveReactionSummary`.
+    fn chip(index: u8, count: usize, my: bool) -> LiveReactionSummary {
+        LiveReactionSummary {
+            reaction_index: index,
+            count,
+            my_reacted: my,
+        }
+    }
+
+    /// Build a reaction map from a slice of (guid, chips) pairs.
+    fn rmap(pairs: &[(&str, Vec<LiveReactionSummary>)]) -> BTreeMap<String, Vec<LiveReactionSummary>> {
+        pairs.iter().map(|(g, c)| (g.to_string(), c.clone())).collect()
+    }
+
+    /// Assert the result is `UpdateChips` with the given changes (order-insensitive).
+    fn assert_update_chips(result: ChatUpdatePlan, expected: Vec<ChipChange>) {
+        match result {
+            ChatUpdatePlan::UpdateChips { mut changes } => {
+                changes.sort_by(|a, b| a.target_guid.cmp(&b.target_guid));
+                let mut expected = expected;
+                expected.sort_by(|a, b| a.target_guid.cmp(&b.target_guid));
+                assert_eq!(changes, expected, "UpdateChips changes mismatch");
+            }
+            other => panic!("expected UpdateChips, got {other:?}"),
+        }
+    }
+
+    // ── reaction chip tests ───────────────────────────────────────────
+
+    #[test]
+    fn plan_chat_update_update_chips_only_when_reactions_change() {
+        // prev has reactions empty, new has a reaction on A — chips differ.
+        let prev = guids(&["A", "B"]);
+        let new = vec![
+            m("A", false, 1000),
+            m("B", false, 2000),
+        ];
+        let prev_r = no_reactions();
+        let new_r = rmap(&[("A", vec![chip(0, 1, false)])]);
+        assert_update_chips(
+            plan_chat_update(&prev, None, &prev_r, &new, &new_r),
+            vec![ChipChange {
+                target_guid: "A".to_string(),
+                new_chips: vec![chip(0, 1, false)],
+            }],
+        );
+    }
+
+    #[test]
+    fn plan_chat_update_update_chips_when_existing_chip_gains_reaction() {
+        let prev = guids(&["A"]);
+        let new = vec![m("A", false, 1000)];
+        let prev_r = rmap(&[("A", vec![chip(0, 1, false)])]);
+        let new_r = rmap(&[("A", vec![chip(0, 1, false), chip(1, 1, false)])]);
+        assert_update_chips(
+            plan_chat_update(&prev, None, &prev_r, &new, &new_r),
+            vec![ChipChange {
+                target_guid: "A".to_string(),
+                new_chips: vec![chip(0, 1, false), chip(1, 1, false)],
+            }],
+        );
+    }
+
+    #[test]
+    fn plan_chat_update_update_chips_when_reaction_removed() {
+        let prev = guids(&["A"]);
+        let new = vec![m("A", false, 1000)];
+        let prev_r = rmap(&[("A", vec![chip(0, 1, false)])]);
+        // Key is absent in new_reactions — should treat as empty.
+        let new_r = no_reactions();
+        assert_update_chips(
+            plan_chat_update(&prev, None, &prev_r, &new, &new_r),
+            vec![ChipChange {
+                target_guid: "A".to_string(),
+                new_chips: vec![],
+            }],
+        );
+    }
+
+    #[test]
+    fn plan_chat_update_noop_when_reactions_unchanged() {
+        let prev = guids(&["A"]);
+        let new = vec![m("A", false, 1000)];
+        let r = rmap(&[("A", vec![chip(0, 1, false)])]);
+        assert_noop(plan_chat_update(&prev, None, &r, &new, &r));
+    }
+
+    #[test]
+    fn plan_chat_update_update_chips_multiple_targets() {
+        let prev = guids(&["A", "B"]);
+        let new = vec![
+            m("A", false, 1000),
+            m("B", false, 2000),
+        ];
+        let prev_r = rmap(&[("A", vec![chip(0, 1, false)])]);
+        let new_r = rmap(&[("A", vec![chip(0, 1, false)]), ("B", vec![chip(1, 2, true)])]);
+        // Only B changed (A is the same).
+        assert_update_chips(
+            plan_chat_update(&prev, None, &prev_r, &new, &new_r),
+            vec![ChipChange {
+                target_guid: "B".to_string(),
+                new_chips: vec![chip(1, 2, true)],
+            }],
+        );
+    }
+
+    #[test]
+    fn plan_chat_update_rebuild_when_both_receipt_and_chips_change() {
+        // Guids unchanged, but both receipt (Delivered→Read) and chips (added
+        // laugh) changed.  The safe fallback is Rebuild.
+        let prev = guids(&["A", "B"]);
+        let new = vec![
+            m("A", false, 1000),
+            read(delivered(m("B", true, 2000), 3000), 4000),
+        ];
+        let prev_r = rmap(&[("A", vec![chip(0, 1, false)])]);
+        let new_r = rmap(&[("A", vec![chip(0, 1, false), chip(3, 1, false)])]);
+        assert_rebuild(plan_chat_update(
+            &prev,
+            Some("Delivered"),
+            &prev_r,
+            &new,
+            &new_r,
+        ));
+    }
+
+    #[test]
+    fn plan_chat_update_append_ignores_chip_changes() {
+        // A new message B arrives.  Even though chips changed on A, the plan
+        // should return Append (not Rebuild, not UpdateChips).  Chip changes
+        // in the Append case are ignored per spec — they will be picked up on
+        // the next refresh.
+        let prev = guids(&["A"]);
+        let new = vec![
+            m("A", false, 1000),
+            m("B", false, 2000),
+        ];
+        let prev_r = rmap(&[("A", vec![chip(0, 1, false)])]);
+        let new_r = rmap(&[("A", vec![chip(0, 1, false), chip(1, 1, false)])]);
+        assert_append_keep(
+            plan_chat_update(&prev, None, &prev_r, &new, &new_r),
+            &["B"],
+        );
+    }
+} // mod plan_chat_update_tests
+
