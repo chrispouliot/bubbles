@@ -446,6 +446,12 @@ pub fn apply_blocking(c: &mut Connection, ingest: Ingest) -> rusqlite::Result<()
                 }
             }
         }
+        Ingest::SendFailed { guid, category } => {
+            tx.execute(
+                "UPDATE message SET error = ?1 WHERE guid = ?2",
+                params![category as i64, guid],
+            )?;
+        }
         Ingest::Ignored(_) => {}
     }
     tx.commit()
@@ -511,7 +517,7 @@ pub fn query_chats(c: &Connection) -> rusqlite::Result<Vec<ChatSummary>> {
 /// Columns selected for a `StoredMessage`, in the order [`map_message_row`] expects.
 const MSG_COLS: &str = "m.id, m.guid, m.chat_id, h.address, m.is_from_me, m.text, m.subject, \
      m.service, m.date, m.date_delivered, m.date_read, m.effect, m.reply_to_guid, m.reply_part, \
-     m.associated_guid, m.associated_type, m.item_type";
+     m.associated_guid, m.associated_type, m.item_type, m.error";
 
 fn map_message_row(r: &rusqlite::Row) -> rusqlite::Result<StoredMessage> {
     Ok(StoredMessage {
@@ -532,6 +538,7 @@ fn map_message_row(r: &rusqlite::Row) -> rusqlite::Result<StoredMessage> {
         associated_guid: r.get(14)?,
         associated_type: r.get(15)?,
         item_type: r.get(16)?,
+        send_error: SendErrorCategory::from_i64(r.get::<_, Option<i64>>(17)?),
         attachments: Vec::new(),
     })
 }
@@ -1693,5 +1700,42 @@ mod tests {
         assert!(!tapbacks[0].is_from_me);
         assert_eq!(tapbacks[1].associated_type, 2002);
         assert!(tapbacks[1].is_from_me);
+    }
+
+    #[test]
+    fn send_failed() {
+        let mut c = db();
+        // Each sub-case creates its own outgoing message (unique guid) then marks
+        // it as failed and asserts the round-trip.  All share the same chat (from
+        // the `sent()` helper) so `chat_id` is obtained once.
+        apply_blocking(&mut c, Ingest::Message(sent("BASE", 0))).unwrap();
+        let chat_id = query_chats(&c).unwrap()[0].id;
+
+        let cases: [(i64, &str, SendErrorCategory); 3] = [
+            (1000, "SEND-FAIL-TIMEOUT",       SendErrorCategory::Timeout),
+            (2000, "SEND-FAIL-CONNECTION",    SendErrorCategory::ConnectionLost),
+            (3000, "SEND-FAIL-OTHER",         SendErrorCategory::Other),
+        ];
+        for (date, guid, category) in cases {
+            apply_blocking(&mut c, Ingest::Message(sent(guid, date))).unwrap();
+
+            apply_blocking(
+                &mut c,
+                Ingest::SendFailed {
+                    guid: guid.into(),
+                    category,
+                },
+            )
+            .unwrap();
+
+            let msgs = query_messages(&c, chat_id).unwrap();
+            let msg = msgs.iter().find(|m| m.guid == guid).unwrap();
+            assert_eq!(msg.send_error, Some(category));
+        }
+
+        // A message that never received a SendFailed has send_error: None.
+        let msgs = query_messages(&c, chat_id).unwrap();
+        let base = msgs.iter().find(|m| m.guid == "BASE").unwrap();
+        assert_eq!(base.send_error, None);
     }
 }

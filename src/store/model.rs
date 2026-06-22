@@ -75,6 +75,32 @@ pub enum Receipt {
     Read { guid: String, date: i64 },
 }
 
+/// Category of send failure stored on an outgoing message.
+///
+/// Persisted in `message.error` as a small integer:
+///   * 0 / NULL = no error
+///   * 1 = [`Timeout`]
+///   * 2 = [`ConnectionLost`]
+///   * 3 = [`Other`]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendErrorCategory {
+    Timeout = 1,
+    ConnectionLost = 2,
+    Other = 3,
+}
+
+impl SendErrorCategory {
+    /// Convert from the wire value stored in the DB.
+    pub fn from_i64(v: Option<i64>) -> Option<Self> {
+        match v? {
+            1 => Some(Self::Timeout),
+            2 => Some(Self::ConnectionLost),
+            3 => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+
 /// A tapback/reaction. Stored as a message row carrying `associated_*`.
 #[derive(Clone, Debug, Default)]
 pub struct Tapback {
@@ -100,6 +126,12 @@ pub enum Ingest {
     /// A sender-supplied link preview (iMessage rich link). Persisted in
     /// `message_link_preview`, upserted on `(message_guid, part_idx)`.
     LinkPreview(MessageLinkPreview),
+    /// Mark an outgoing message as having failed to send, with a category
+    /// describing the failure mode.
+    SendFailed {
+        guid: String,
+        category: SendErrorCategory,
+    },
     /// A recognized-but-unstored control event; the &str names the variant.
     #[allow(dead_code)]
     Ignored(&'static str),
@@ -153,6 +185,7 @@ pub struct StoredMessage {
     pub associated_guid: Option<String>,
     pub associated_type: Option<i64>,
     pub item_type: i64,
+    pub send_error: Option<SendErrorCategory>,
     pub attachments: Vec<StoredAttachment>,
 }
 

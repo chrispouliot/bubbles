@@ -22,7 +22,7 @@ pub mod rustpush_backend;
 
 pub use anyhow::Result;
 
-use crate::store::{ChatRef, IncomingMessage, Store};
+use crate::store::{ChatRef, IncomingMessage, SendErrorCategory, Store};
 
 /// Generates an opaque, cheaply-cloneable, `Send + Sync` handle type.
 macro_rules! opaque_handle {
@@ -370,4 +370,87 @@ pub trait Backend: Send + Sync {
 
     /// Wipe the persisted login so the next launch starts at onboarding.
     fn sign_out(&self);
+}
+
+/// Walk the error chain and return the [`SendErrorCategory`] that best
+/// describes the failure. Used both for persistence and for friendly messages.
+///
+///  * `TimedOut` → [`SendErrorCategory::Timeout`]
+///  * `ConnectionReset`, `ConnectionAborted`, `BrokenPipe`, `UnexpectedEof`
+///    → [`SendErrorCategory::ConnectionLost`]
+///  * Everything else → [`SendErrorCategory::Other`]
+pub fn categorize_send_error(err: &anyhow::Error) -> SendErrorCategory {
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            match io_err.kind() {
+                std::io::ErrorKind::TimedOut => return SendErrorCategory::Timeout,
+                std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof => {
+                    return SendErrorCategory::ConnectionLost;
+                }
+                _ => {}
+            }
+        }
+    }
+    SendErrorCategory::Other
+}
+
+/// Map a [`SendErrorCategory`] to a short, user-facing string suitable for a
+/// popover or tooltip.
+pub fn friendly_category_message(cat: SendErrorCategory) -> String {
+    match cat {
+        SendErrorCategory::Timeout => "Connection timed out. Please try again.".into(),
+        SendErrorCategory::ConnectionLost => "Lost connection. Please try again.".into(),
+        SendErrorCategory::Other => "Couldn't send. Please try again.".into(),
+    }
+}
+
+/// Map a send error to a short, user-facing string suitable for a popover or
+/// toast. Distinguishes three categories:
+///
+///  * Timeout-shaped errors (`TimedOut`) → "Connection timed out. Please try again."
+///  * Disconnect-shaped errors (`ConnectionReset`, `ConnectionAborted`,
+///    `BrokenPipe`, `UnexpectedEof`) → "Lost connection. Please try again."
+///  * Everything else → "Couldn't send. Please try again."
+pub fn friendly_send_error(err: &anyhow::Error) -> String {
+    friendly_category_message(categorize_send_error(err))
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Error;
+
+    /// Pins the three user-facing strings for `super::friendly_send_error`.
+    ///
+    /// The function maps a send failure to a short popover-appropriate string.
+    /// Three categories are distinguished: timeout-shaped errors,
+    /// disconnect-shaped errors, and everything else.
+    #[test]
+    fn friendly_send_error() {
+        let cases: Vec<(Error, &str)> = vec![
+            (
+                anyhow::Error::from(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out",
+                )),
+                "Connection timed out. Please try again.",
+            ),
+            (
+                anyhow::Error::from(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "connection reset",
+                )),
+                "Lost connection. Please try again.",
+            ),
+            (
+                anyhow::anyhow!("unknown send failure"),
+                "Couldn't send. Please try again.",
+            ),
+        ];
+        for (err, expected) in &cases {
+            assert_eq!(super::friendly_send_error(err), *expected);
+        }
+    }
 }

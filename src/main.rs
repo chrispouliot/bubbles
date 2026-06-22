@@ -1,6 +1,7 @@
 mod gtk_bridge;
 mod image;
 mod protocol;
+mod retry;
 mod runtime;
 mod setup;
 mod store;
@@ -9,6 +10,7 @@ mod time_format;
 mod tray;
 mod ui;
 mod window_state;
+mod attachment_cache;
 mod demo;
 mod video;
 

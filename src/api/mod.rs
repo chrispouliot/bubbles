@@ -7,6 +7,8 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
 
+pub mod buffered_conn;
+use buffered_conn::BufferedApsConn;
 pub mod runtime;
 use crate::api::runtime::init_logger;
 
@@ -337,22 +339,23 @@ pub fn config_from_encoded(encoded: Vec<u8>) -> anyhow::Result<JoinedOSConfig> {
     })))
 }
 
-pub async fn setup_push(config: &JoinedOSConfig, identity: &IDSNGMIdentity, state: Option<APSState>, state_path: String) -> (APSConnection, Option<PushError>) {
+pub async fn setup_push(config: &JoinedOSConfig, identity: &IDSNGMIdentity, state: Option<APSState>, state_path: String) -> (Arc<BufferedApsConn>, Option<PushError>) {
     let state_path = PathBuf::from_str(&state_path).unwrap().join("hw_info.plist");
     let (conn, error) = APSConnectionResource::new(config.config(), state).await;
+    let buffered = BufferedApsConn::new(conn);
 
     let saved_identity = identity.save("openbubbles").expect("failed to save");
     if error.is_none() {
         let state = SavedHardwareState {
-            push: conn.state.read().await.clone(),
+            push: buffered.inner().state.read().await.clone(),
             os_config: config.clone(),
             identity: saved_identity.clone().into(),
         };
         std::fs::write(&state_path, plist_to_string(&state).unwrap()).unwrap();
     }
 
-    let mut to_refresh = conn.generated_signal.subscribe();
-    let reconn_conn = Arc::downgrade(&conn);
+    let mut to_refresh = buffered.inner().generated_signal.subscribe();
+    let reconn_conn = Arc::downgrade(buffered.inner());
     let config_ref = config.clone();
     tokio::spawn(async move {
         loop {
@@ -373,7 +376,7 @@ pub async fn setup_push(config: &JoinedOSConfig, identity: &IDSNGMIdentity, stat
         }
     });
 
-    (conn, error)
+    (buffered, error)
 }
 
 pub async fn make_anisette(path: String, config: &JoinedOSConfig, conn: &APSConnection) -> ArcAnisetteClient<DefaultAnisetteProvider> {
@@ -382,12 +385,12 @@ pub async fn make_anisette(path: String, config: &JoinedOSConfig, conn: &APSConn
     default_provider(get_login_config(&dir, config, conn).await, dir.join("anisette_test"))
 }
 
-pub fn subscribe_conn(conn: &APSConnection) -> broadcast::Receiver<APSMessage> {
-    conn.messages_cont.subscribe()
+pub fn subscribe_conn(conn: &Arc<BufferedApsConn>) -> broadcast::Receiver<APSMessage> {
+    conn.subscribe()
 }
 
-pub async fn make_idms(conn: &APSConnection) -> Arc<IdmsAuthListener> {
-    IdmsAuthListener::new(conn.clone()).await.into()
+pub async fn make_idms(conn: &Arc<BufferedApsConn>) -> Arc<IdmsAuthListener> {
+    IdmsAuthListener::new(conn.inner().clone()).await.into()
 }
 
 async fn get_login_config(conf_dir: &PathBuf, conf: &JoinedOSConfig, conn: &APSConnection) -> LoginClientInfo {

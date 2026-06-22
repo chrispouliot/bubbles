@@ -16,7 +16,7 @@ use adw::prelude::*;
 use regex::Regex;
 
 use crate::gtk_bridge;
-use crate::protocol::{Backend, Connection, ImClient, RecvEvent};
+use crate::protocol::{Backend, Connection, ImClient, RecvEvent, friendly_category_message};
 use crate::store::{
     group_tapbacks_by_target, live_tapbacks, AttachmentKind, AttachmentRecord, ChatRef,
     ChatSummary, IncomingMessage, Ingest, LiveReactionSummary, MessageLinkPreview, Store,
@@ -88,6 +88,13 @@ const CSS: &str = "
    (128px) so the artwork reads as a proper hero graphic, not an icon. */
 statuspage.empty-hero > scrolledwindow > viewport > box > clamp > box > .icon {
   -gtk-icon-size: 256px;
+}
+/* Hide the built-in pencil/edit icon on AdwEntryRow — the rows are clearly
+   editable, and the icon is a hard-coded widget in the template with no
+   Rust API to disable. `-gtk-icon-source: none` doesn't work because the
+   icon is set via GtkImage's `icon-name` property, so we use opacity. */
+row.entry image.edit-icon {
+  opacity: 0;
 }
 .unread-pill {
   padding: 4px 14px;
@@ -389,10 +396,15 @@ pub fn enter_messaging(
         .tooltip_text("Main Menu")
         .menu_model(&main_menu)
         .build();
+    // Plus button for new chat at the start of the sidebar header.
+    let plus_button = gtk::Button::from_icon_name("list-add-symbolic");
+    plus_button.add_css_class("flat");
+    plus_button.set_tooltip_text(Some("New Chat"));
     let sidebar = page(
         "Messages",
         &scrolled(&chat_list),
         None,
+        Some(plus_button.upcast_ref()),
         Some(menu_button.upcast_ref()),
     );
 
@@ -414,6 +426,7 @@ pub fn enter_messaging(
     let msg_container_click = gtk::GestureClick::new();
     msg_container_click.set_propagation_phase(gtk::PropagationPhase::Bubble);
     msg_container_click.connect_released(move |_gesture, _n, _x, _y| {
+        log::debug!("msg_container click fired");
         deselect_all_labels();
         defocus_entry(&entry_for_msg);
     });
@@ -531,6 +544,7 @@ pub fn enter_messaging(
         "Select a chat",
         &content_stack,
         Some(compose_outer.upcast_ref()),
+        None,
         Some(rename_button.upcast_ref()),
     );
 
@@ -617,6 +631,12 @@ pub fn enter_messaging(
     {
         let ui = ui.clone();
         rename_button.connect_clicked(move |_| ui.prompt_rename());
+    }
+
+    // New Chat button in the sidebar header.
+    {
+        let ui = ui.clone();
+        plus_button.connect_clicked(move |_| ui.show_new_chat_dialog());
     }
 
     // Close button on the pending-attachment chip clears it.
@@ -876,7 +896,7 @@ pub fn enter_messaging(
         .build();
     nav.replace(&[host]);
 
-    ui.reload_chats();
+    ui.reload_chats(|_| {});
 
     // Receive loop -> persist -> pulse -> refresh.
     let (tx, rx) = async_channel::unbounded::<RecvEvent>();
@@ -1054,7 +1074,7 @@ impl Ui {
         glib::Propagation::Proceed
     }
 
-    fn reload_chats(&self) {
+    fn reload_chats(&self, on_chats: impl FnOnce(&[ChatSummary]) + 'static) {
         let store = self.store.clone();
         let ui = self.clone();
         gtk_bridge::spawn(async move { store.chats().await }, move |res| {
@@ -1062,6 +1082,7 @@ impl Ui {
                 eprintln!("chats load error: {e:#}");
                 Vec::new()
             });
+            on_chats(&chats);
             clear(&ui.chat_list);
             for c in &chats {
                 ui.chat_list.append(&chat_row(c, &ui.handles));
@@ -1094,6 +1115,265 @@ impl Ui {
             }
             *ui.chats.borrow_mut() = chats;
         });
+    }
+
+    /// Open the "New Chat" dialog.
+    fn show_new_chat_dialog(&self) {
+        let to_row = adw::EntryRow::new();
+        to_row.set_title("To");
+        to_row.set_input_purpose(gtk::InputPurpose::Phone);
+        to_row.set_show_apply_button(false);
+
+        let name_row = adw::EntryRow::new();
+        name_row.set_title("Name");
+        name_row.set_show_apply_button(false);
+
+        let msg_row = adw::EntryRow::new();
+        msg_row.set_title("Message");
+        msg_row.set_activates_default(true);
+        msg_row.set_show_apply_button(false);
+
+        let group = adw::PreferencesGroup::new();
+        group.add(&to_row);
+        group.add(&name_row);
+        group.add(&msg_row);
+
+        // Error label shown when the recipient is invalid.
+        let error_label = gtk::Label::new(Some("Enter a valid phone number or email"));
+        error_label.add_css_class("error");
+        error_label.set_halign(gtk::Align::Start);
+        error_label.set_margin_start(12);
+        error_label.set_margin_end(12);
+        error_label.set_margin_top(4);
+        error_label.set_visible(false);
+        group.add(&error_label);
+
+        let dialog = adw::AlertDialog::new(Some("New Chat"), Some("Start a conversation with a new contact."));
+        dialog.set_extra_child(Some(&group));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("send", "Send");
+        dialog.set_response_appearance("send", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("send"));
+        dialog.set_close_response("cancel");
+        dialog.set_response_enabled("send", false);
+
+        // Send is enabled only when both fields are non-empty AND the recipient
+        // is a valid phone or email. This runs on every keystroke (no debounce)
+        // so the button can't be re-enabled by typing in the message field while
+        // the To field holds invalid input. The debounce below only governs
+        // when the error *label* becomes visible.
+        let update_send_sensitivity = {
+            let dialog = dialog.clone();
+            move |to: &str, msg: &str| {
+                let to_trimmed = to.trim();
+                let recipient_ok =
+                    to_trimmed.is_empty() || normalize_recipient(to_trimmed).is_some();
+                dialog.set_response_enabled(
+                    "send",
+                    recipient_ok && !msg.is_empty(),
+                );
+            }
+        };
+
+        // Debounced error-label visibility: the label only shows after the
+        // user stops typing for `DEBOUNCE_MS`, not on every keystroke. The
+        // pending source is cancelled and replaced on each change.
+        let debounce_source: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        const DEBOUNCE_MS: u64 = 600;
+
+          // Enable/disable the Send button based on To + Message fields.
+        {
+            let to_row = to_row.clone();
+            let msg_row = msg_row.clone();
+            let update_send_sensitivity = update_send_sensitivity.clone();
+            let debounce_source = debounce_source.clone();
+            let error_label = error_label.clone();
+            to_row.clone().connect_changed(move |_| {
+                let to = to_row.text();
+                let msg = msg_row.text();
+                update_send_sensitivity(&to, &msg);
+
+                // Cancel any pending debounce; schedule a new one.
+                if let Some(src) = debounce_source.borrow_mut().take() {
+                    src.remove();
+                }
+                let to_row = to_row.clone();
+                let error_label = error_label.clone();
+                // Separate clone for the inner timeout closure so the outer
+                // `debounce_source` stays usable for `Some(src)` below.
+                let inner_source = debounce_source.clone();
+                let src = glib::timeout_add_local(
+                    std::time::Duration::from_millis(DEBOUNCE_MS),
+                    move || {
+                        *inner_source.borrow_mut() = None;
+                        let text = to_row.text();
+                        let trimmed = text.trim();
+                        let show_error = !trimmed.is_empty()
+                            && normalize_recipient(trimmed).is_none();
+                        error_label.set_visible(show_error);
+                        glib::ControlFlow::Break
+                    },
+                );
+                *debounce_source.borrow_mut() = Some(src);
+            });
+        }
+        {
+            let to_row = to_row.clone();
+            let msg_row = msg_row.clone();
+            let update_send_sensitivity = update_send_sensitivity.clone();
+            msg_row.clone().connect_changed(move |_| {
+                let to = to_row.text();
+                let msg = msg_row.text();
+                update_send_sensitivity(&to, &msg);
+            });
+        }
+
+        let ui = self.clone();
+        // `AlertDialog` auto-closes when any response fires, and libadwaita's
+        // Rust binding for `close-attempt` doesn't let us block it. So when
+        // validation fails, we let the dialog close and re-present it from
+        // the `closed` signal — the user sees a brief flicker but the error
+        // stays visible and their input is preserved.
+        let validation_failed = Rc::new(Cell::new(false));
+        let vf_response = validation_failed.clone();
+        dialog.connect_response(None, move |dlg, resp| {
+            if resp == "send" {
+                let recipient = to_row.text();
+                if normalize_recipient(&recipient).is_none() {
+                    error_label.set_visible(true);
+                    vf_response.set(true);
+                    return;
+                }
+                let name = name_row.text();
+                let text = msg_row.text();
+                // Clear fields before closing so the dialog is fresh if reopened.
+                to_row.set_text("");
+                name_row.set_text("");
+                msg_row.set_text("");
+                dlg.close();
+                let name_owned: Option<String> = if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_string())
+                };
+                ui.create_new_chat(&recipient, &text, name_owned);
+            } else {
+                dlg.close();
+            }
+        });
+
+        // Re-present the dialog if validation failed on the last Send click.
+        let vf_closed = validation_failed.clone();
+        let dialog_ref = dialog.clone();
+        let split = self.split.clone();
+        dialog.connect_closed(move |_| {
+            if vf_closed.replace(false) {
+                dialog_ref.present(Some(&split));
+            }
+        });
+
+        dialog.present(Some(&self.split));
+    }
+
+    /// Submit a new chat: ingest the optimistic message, set a custom name,
+    /// fire the network send, and open the chat in the messages view.
+    fn create_new_chat(&self, recipient: &str, text: &str, name: Option<String>) {
+        let my_handle = match self.handles.first().cloned() {
+            Some(h) => h,
+            None => {
+                eprintln!("no self handle; cannot create new chat");
+                return;
+            }
+        };
+
+        let (chat_ref, msg) = match new_chat_payload(recipient, text, &my_handle) {
+            Some(p) => p,
+            None => {
+                eprintln!("invalid recipient for new chat: {}", recipient);
+                return;
+            }
+        };
+
+        let new_key = chat_ref.key();
+        let guid = msg.guid.clone();
+        let text_owned = text.to_string();
+
+        // 1. Persist the optimistic message.
+        let store = self.store.clone();
+        let ui = self.clone();
+        gtk_bridge::spawn(
+            async move { store.apply(Ingest::Message(msg)).await },
+            move |res| {
+                if let Err(e) = res {
+                    eprintln!("optimistic insert failed for new chat: {e:#}");
+                    return;
+                }
+                // 2. Load chats and find the newly created one.
+                let store = ui.store.clone();
+                let ui = ui.clone();
+                gtk_bridge::spawn(
+                    async move { store.chats().await },
+                    move |res| {
+                        let chats = res.unwrap_or_else(|e| {
+                            eprintln!("chats load error: {e:#}");
+                            Vec::new()
+                        });
+                        let summary = match chats.iter().find(|c| c.key == new_key).cloned() {
+                            Some(s) => s,
+                            None => {
+                                eprintln!("new chat not found in store after insert");
+                                return;
+                            }
+                        };
+
+                        // 3. Optionally set custom name, then open the chat.
+                        if let Some(name_owned) = name {
+                            let store = ui.store.clone();
+                            let chat_id = summary.id;
+                            let ui = ui.clone();
+                            let summary = summary.clone();
+                            let name_for_ui = name_owned.clone();
+                            gtk_bridge::spawn(
+                                async move {
+                                    store
+                                        .set_chat_custom_name(chat_id, Some(name_owned))
+                                        .await
+                                },
+                                move |res| {
+                                    if let Err(e) = res {
+                                        eprintln!("set custom name failed: {e:#}");
+                                    }
+                                    let mut summary = summary;
+                                    summary.custom_name = Some(name_for_ui);
+                                    ui.reload_chats(|_| {});
+                                    ui.open_chat(&summary);
+                                },
+                            );
+                        } else {
+                            ui.reload_chats(|_| {});
+                            ui.open_chat(&summary);
+                        }
+                    },
+                );
+            },
+        );
+
+        // 4. Fire the network send in parallel (best-effort, matches send_text behavior).
+        let backend = self.backend.clone();
+        let client = self.client.clone();
+        gtk_bridge::spawn(
+            async move {
+                backend
+                    .send_text(&client, &chat_ref, &my_handle, text_owned, guid)
+                    .await?;
+                Ok::<(), anyhow::Error>(())
+            },
+            move |res| {
+                if let Err(e) = res {
+                    eprintln!("send failed for new chat: {e:#}");
+                }
+            },
+        );
     }
 
     /// A scaffold preferences dialog. The "Account" group hosts Sign Out; add
@@ -1258,7 +1538,7 @@ impl Ui {
 
     /// Reload the open chat messages and sidebar so the new preference takes effect.
     fn reload_open_chat(&self) {
-        self.reload_chats();
+        self.reload_chats(|_| {});
         if let Some(chat) = self.open_summary.borrow().as_ref() {
             self.reload_messages(chat.id, chat.is_group);
         }
@@ -1354,7 +1634,7 @@ impl Ui {
                                 .set_title(&chat_title(open, &ui2.handles));
                         }
                     }
-                    ui2.reload_chats();
+                    ui2.reload_chats(|_| {});
                 },
             );
         });
@@ -1626,7 +1906,7 @@ impl Ui {
                     }
                 }
                 // The chat is now read; refresh the sidebar to clear its badge.
-                ui.reload_chats();
+                ui.reload_chats(|_| {});
             },
         );
     }
@@ -2074,7 +2354,7 @@ impl Ui {
                         eprintln!("optimistic insert failed: {e:#}");
                     }
                     ui.reload_messages(chat_id, is_group);
-                    ui.reload_chats();
+                    ui.reload_chats(|_| {});
                     gtk_bridge::spawn(
                         async move {
                             backend
@@ -2135,6 +2415,7 @@ impl Ui {
         let backend = self.backend.clone();
         let client = self.client.clone();
         let ui = self.clone();
+        let store_for_network = store.clone();
         gtk_bridge::spawn(
             async move { store.apply(Ingest::Message(optimistic)).await },
             move |res| {
@@ -2142,11 +2423,14 @@ impl Ui {
                     eprintln!("optimistic insert failed: {e:#}");
                 }
                 ui.reload_messages(chat_id, is_group);
-                ui.reload_chats();
+                ui.reload_chats(|_| {});
                 // Fire the network send in the background. The optimistic row
                 // already carries the final guid, so the echo dedupes and there
                 // is nothing to re-render on completion — avoiding a redundant
                 // rebuild (and the scroll stutter it caused) a beat after send.
+                let guid_fail = guid.clone();
+                let store_fail = store_for_network.clone();
+                let ui_fail = ui.clone();
                 gtk_bridge::spawn(
                     async move {
                         backend
@@ -2156,7 +2440,24 @@ impl Ui {
                     },
                     move |res| {
                         if let Err(e) = res {
-                            eprintln!("send failed: {e:#}");
+                            let category = crate::protocol::categorize_send_error(&e);
+                            let store = store_fail.clone();
+                            let ui = ui_fail.clone();
+                            let guid = guid_fail;
+                            gtk_bridge::spawn(
+                                async move {
+                                    store
+                                        .apply(Ingest::SendFailed { guid, category })
+                                        .await
+                                },
+                                move |res2| {
+                                    if let Err(e2) = res2 {
+                                        eprintln!("persist send-failed error: {e2:#}");
+                                    }
+                                    ui.reload_messages(chat_id, is_group);
+                                    ui.reload_chats(|_| {});
+                                },
+                            );
                         }
                     },
                 );
@@ -2218,7 +2519,7 @@ impl Ui {
                     eprintln!("optimistic tapback insert failed: {e:#}");
                 }
                 ui.reload_messages(chat_id, is_group);
-                ui.reload_chats();
+                ui.reload_chats(|_| {});
                 gtk_bridge::spawn(
                     async move {
                         backend
@@ -2291,7 +2592,7 @@ impl Ui {
                 if let Some(guid) = guid {
                     backend.send_receipt(&client, &chat_ref, &my_handle, true, guid);
                     // Something was just marked read; clear its sidebar badge.
-                    ui.reload_chats();
+                    ui.reload_chats(|_| {});
                 }
             },
         );
@@ -2314,7 +2615,7 @@ impl Ui {
     }
 
     fn refresh(&self) {
-        self.reload_chats();
+        self.reload_chats(|_| {});
         self.process_notifications();
         let open = self.open_summary.borrow().clone();
         if let Some(chat) = open {
@@ -3224,6 +3525,22 @@ fn own_message(
     if show_header {
         line.append(&time_label(m));
     }
+
+    // Error indicator for failed-send messages.
+    if let Some(cat) = m.send_error {
+        let icon = gtk::Image::from_icon_name("dialog-error-symbolic");
+        icon.add_css_class("error");
+        // gtk::Tooltip is the right widget for hover-revealed info: it shows
+        // after a short delay, stays visible while the pointer is over the
+        // icon, and dismisses when the pointer leaves. A custom popover on
+        // an EventControllerMotion enter/leave flashes for a frame and
+        // disappears (the popover appearing next to the icon moves the
+        // pointer out of the icon's hit area, firing `leave` immediately).
+        let tip = friendly_category_message(cat);
+        icon.set_tooltip_text(Some(&tip));
+        line.append(&icon);
+    }
+
     line.append(&message_body(m, true, previews, preview_cards, None, chip));
 
     row.append(&line);
@@ -3313,8 +3630,9 @@ fn strip_marker(s: &str) -> String {
 /// to the decoded RGBA pixels before wrapping in a `MemoryTexture`.
 fn load_texture(path: &str) -> Option<gtk::gdk::Texture> {
     if is_heic_path(path) {
-        let decoded =
-            crate::image::decode_heic_to_rgba(std::path::Path::new(path)).ok()?;
+        let decoded = crate::image::decode_heic_to_rgba(std::path::Path::new(path))
+            .inspect_err(|e| log::warn!("load_texture: HEIC decode failed for {path}: {e}"))
+            .ok()?;
         let w = decoded.width;
         let h = decoded.height;
         let bytes = gtk::glib::Bytes::from_owned(decoded.pixels);
@@ -3330,14 +3648,28 @@ fn load_texture(path: &str) -> Option<gtk::gdk::Texture> {
 
     // JPEG (and other non-HEIC) path: decode to RGBA, read EXIF orientation,
     // apply the transform, and wrap in a MemoryTexture.
-    let file_bytes = std::fs::read(path).ok()?;
+    let file_bytes = std::fs::read(path)
+        .inspect_err(|e| log::warn!("load_texture: read failed for {path}: {e}"))
+        .ok()?;
     let orientation = crate::image::read_exif_orientation(&file_bytes).unwrap_or(1);
 
     // Decode from memory via gdk-pixbuf (handles JPEG, PNG, etc.)
     let loader = gtk::gdk_pixbuf::PixbufLoader::new();
-    loader.write(&file_bytes).ok()?;
-    loader.close().ok()?;
-    let pb = loader.pixbuf()?;
+    loader
+        .write(&file_bytes)
+        .inspect_err(|e| log::warn!("load_texture: pixbuf loader write failed for {path}: {e}"))
+        .ok()?;
+    loader
+        .close()
+        .inspect_err(|e| log::warn!("load_texture: pixbuf loader close failed for {path}: {e}"))
+        .ok()?;
+    let pb = match loader.pixbuf() {
+        Some(p) => p,
+        None => {
+            log::warn!("load_texture: pixbuf loader returned no pixbuf for {path}");
+            return None;
+        }
+    };
 
     let w = pb.width() as u32;
     let h = pb.height() as u32;
@@ -3399,34 +3731,40 @@ fn image_widget(path: &str) -> gtk::Widget {
     pic.add_css_class("attachment-image");
     pic.set_cursor_from_name(Some("pointer"));
 
+    // Owned for the 'static decode callback below.
+    let path_string = path.to_string();
+
     // Schedule background decode via the image scheduler.
     let weak = pic.downgrade();
     crate::image::schedule_image_loads(vec![std::path::PathBuf::from(path)], Some(CHAT_THUMBNAIL_MAX_EDGE), {
         move |result| {
             if let Some(pic) = weak.upgrade() {
-                if let Ok(decoded) = result {
-                    let w = decoded.width as i32;
-                    let h = decoded.height as i32;
-                    let bytes = glib::Bytes::from_owned(decoded.pixels);
-                    let texture = gtk::gdk::MemoryTexture::new(
-                        w,
-                        h,
-                        gtk::gdk::MemoryFormat::R8g8b8a8,
-                        &bytes,
-                        w as usize * 4,
-                    )
-                    .upcast::<gtk::gdk::Texture>();
-                    pic.set_paintable(Some(&texture));
-                    // Re-size based on actual image dimensions, capped.
-                    let scale = (max_w / w.max(1) as f64)
-                        .min(max_h / h.max(1) as f64)
-                        .min(1.0);
-                    pic.set_size_request(
-                        (w as f64 * scale).round() as i32,
-                        (h as f64 * scale).round() as i32,
-                    );
+                match result {
+                    Ok(decoded) => {
+                        let w = decoded.width as i32;
+                        let h = decoded.height as i32;
+                        let bytes = glib::Bytes::from_owned(decoded.pixels);
+                        let texture = gtk::gdk::MemoryTexture::new(
+                            w,
+                            h,
+                            gtk::gdk::MemoryFormat::R8g8b8a8,
+                            &bytes,
+                            w as usize * 4,
+                        )
+                        .upcast::<gtk::gdk::Texture>();
+                        pic.set_paintable(Some(&texture));
+                        // Re-size based on actual image dimensions, capped.
+                        let scale = (max_w / w.max(1) as f64)
+                            .min(max_h / h.max(1) as f64)
+                            .min(1.0);
+                        pic.set_size_request(
+                            (w as f64 * scale).round() as i32,
+                            (h as f64 * scale).round() as i32,
+                        );
+                        log::debug!("image thumbnail decoded: {w}x{h} for {path_string}");
+                    }
+                    Err(e) => log::warn!("image thumbnail decode failed for {path_string}: {e}"),
                 }
-                // On failure, leave the placeholder empty.
             }
         }
     });
@@ -3436,11 +3774,16 @@ fn image_widget(path: &str) -> gtk::Widget {
     let path_owned = path.to_string();
     let pic_weak = pic.downgrade();
     gesture.connect_released(move |_, _, _, _| {
-        if let Some(pic) = pic_weak.upgrade() {
-            if let Some(host) = find_lightbox_host(pic.upcast_ref()) {
-                show_lightbox(&host, &path_owned);
-            }
-        }
+        log::debug!("image click handler fired for {path_owned}");
+        let Some(pic) = pic_weak.upgrade() else {
+            log::debug!("image click: pic_weak.upgrade() returned None for {path_owned}");
+            return;
+        };
+        let Some(host) = find_lightbox_host(pic.upcast_ref()) else {
+            log::debug!("image click: find_lightbox_host returned None for {path_owned}");
+            return;
+        };
+        show_lightbox(&host, &path_owned);
     });
     pic.add_controller(gesture);
 
@@ -3474,35 +3817,40 @@ fn video_widget(path: &str) -> gtk::Widget {
 
     // Schedule background decode via the video scheduler.
     let weak = pic.downgrade();
+    // Owned for the 'static decode callback below.
+    let path_string = path.to_string();
     crate::video::schedule_video_thumbnails(
         vec![std::path::PathBuf::from(path)],
         CHAT_THUMBNAIL_MAX_EDGE,
         {
             move |result| {
                 if let Some(pic) = weak.upgrade() {
-                    if let Ok(decoded) = result {
-                        let w = decoded.width as i32;
-                        let h = decoded.height as i32;
-                        let bytes = glib::Bytes::from_owned(decoded.pixels);
-                        let texture = gtk::gdk::MemoryTexture::new(
-                            w,
-                            h,
-                            gtk::gdk::MemoryFormat::R8g8b8a8,
-                            &bytes,
-                            w as usize * 4,
-                        )
-                        .upcast::<gtk::gdk::Texture>();
-                        pic.set_paintable(Some(&texture));
-                        // Re-size based on actual image dimensions, capped.
-                        let scale = (max_w / w.max(1) as f64)
-                            .min(max_h / h.max(1) as f64)
-                            .min(1.0);
-                        pic.set_size_request(
-                            (w as f64 * scale).round() as i32,
-                            (h as f64 * scale).round() as i32,
-                        );
+                    match result {
+                        Ok(decoded) => {
+                            let w = decoded.width as i32;
+                            let h = decoded.height as i32;
+                            let bytes = glib::Bytes::from_owned(decoded.pixels);
+                            let texture = gtk::gdk::MemoryTexture::new(
+                                w,
+                                h,
+                                gtk::gdk::MemoryFormat::R8g8b8a8,
+                                &bytes,
+                                w as usize * 4,
+                            )
+                            .upcast::<gtk::gdk::Texture>();
+                            pic.set_paintable(Some(&texture));
+                            // Re-size based on actual image dimensions, capped.
+                            let scale = (max_w / w.max(1) as f64)
+                                .min(max_h / h.max(1) as f64)
+                                .min(1.0);
+                            pic.set_size_request(
+                                (w as f64 * scale).round() as i32,
+                                (h as f64 * scale).round() as i32,
+                            );
+                            log::debug!("video thumbnail decoded: {w}x{h} for {path_string}");
+                        }
+                        Err(e) => log::warn!("video thumbnail decode failed for {path_string}: {e}"),
                     }
-                    // On failure, leave the placeholder empty.
                 }
             }
         },
@@ -3514,11 +3862,16 @@ fn video_widget(path: &str) -> gtk::Widget {
     let path_owned = path.to_string();
     let overlay_weak = overlay.downgrade();
     gesture.connect_released(move |_, _, _, _| {
-        if let Some(overlay) = overlay_weak.upgrade() {
-            if let Some(host) = find_lightbox_host(overlay.upcast_ref()) {
-                show_video_lightbox(&host, &path_owned);
-            }
-        }
+        log::debug!("video click handler fired for {path_owned}");
+        let Some(overlay) = overlay_weak.upgrade() else {
+            log::debug!("video click: overlay_weak.upgrade() returned None for {path_owned}");
+            return;
+        };
+        let Some(host) = find_lightbox_host(overlay.upcast_ref()) else {
+            log::debug!("video click: find_lightbox_host returned None for {path_owned}");
+            return;
+        };
+        show_video_lightbox(&host, &path_owned);
     });
     overlay.add_controller(gesture);
 
@@ -3540,7 +3893,9 @@ fn find_lightbox_host(w: &gtk::Widget) -> Option<gtk::Overlay> {
 /// Layer a dimmed, centered, full-size image over the UI. Click anywhere or
 /// press Escape to dismiss.
 fn show_lightbox(host: &gtk::Overlay, path: &str) {
+    log::debug!("show_lightbox: opening {path}");
     let Some(texture) = load_texture(path) else {
+        log::warn!("show_lightbox: load_texture returned None for {path}");
         return;
     };
 
@@ -4025,15 +4380,19 @@ fn time_label(m: &StoredMessage) -> gtk::Label {
 // --- scaffolding helpers ---
 
 /// A toolbar-view page: header with `title`, `body` as content, optional bottom
-/// bar, and an optional widget packed at the end of the header.
+/// bar, and optional widgets packed at the start and end of the header.
 fn page(
     title: &str,
     body: &impl IsA<gtk::Widget>,
     bottom: Option<&gtk::Widget>,
+    header_start: Option<&gtk::Widget>,
     header_end: Option<&gtk::Widget>,
 ) -> adw::NavigationPage {
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
+    if let Some(w) = header_start {
+        header.pack_start(w);
+    }
     if let Some(w) = header_end {
         header.pack_end(w);
     }
@@ -4291,6 +4650,90 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Build a `(ChatRef, IncomingMessage)` for the "start a new chat" path.
+///
+/// Normalises the recipient string into a `mailto:` or `tel:` URI and returns
+/// an outbound message ready for `Ingest::Message`.
+/// Normalise a raw recipient string into a `mailto:` or `tel:` URI (or `None` if invalid).
+fn normalize_recipient(recipient: &str) -> Option<String> {
+    let recipient = recipient.trim();
+    if recipient.is_empty() {
+        return None;
+    }
+
+    if recipient.to_lowercase().starts_with("mailto:") {
+        // Strip prefix, lowercase the address, re-add `mailto:`
+        let addr = recipient["mailto:".len()..].to_lowercase();
+        Some(format!("mailto:{}", addr))
+    } else if recipient.contains('@') {
+        // Bare email — lowercase and wrap in `mailto:`
+        Some(format!("mailto:{}", recipient.to_lowercase()))
+    } else if recipient.to_lowercase().starts_with("tel:") {
+        // Strip `tel:` prefix, apply phone rules, re-add `tel:`
+        let phone = &recipient["tel:".len()..];
+        normalize_phone(phone)
+    } else {
+        // Phone path
+        normalize_phone(recipient)
+    }
+}
+
+fn new_chat_payload(
+    recipient: &str,
+    text: &str,
+    my_handle: &str,
+) -> Option<(ChatRef, IncomingMessage)> {
+    let normalized = normalize_recipient(recipient)?;
+
+    // Build participants list (sorted for stable key)
+    let mut participants = vec![my_handle.to_string(), normalized.clone()];
+    participants.sort();
+
+    let chat = ChatRef {
+        participants,
+        display_name: None,
+        service: None,
+    };
+
+    let msg = IncomingMessage {
+        guid: new_guid(),
+        chat,
+        sender: Some(my_handle.to_string()),
+        is_from_me: true,
+        text: Some(text.to_string()),
+        subject: None,
+        service: None,
+        date: now_ms(),
+        effect: None,
+        reply_to_guid: None,
+        reply_part: None,
+        item_type: 0,
+        attachments: Vec::new(),
+    };
+
+    Some((msg.chat.clone(), msg))
+}
+
+/// Normalise a raw phone string into a `tel:` URI (or `None` if invalid).
+fn normalize_phone(raw: &str) -> Option<String> {
+    let has_plus = raw.starts_with('+');
+    // Strip everything that isn't a digit (the leading + is handled separately)
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+
+    let phone = if has_plus {
+        format!("tel:+{}", digits)
+    } else if digits.len() == 10 {
+        format!("tel:+1{}", digits)
+    } else {
+        format!("tel:+{}", digits)
+    };
+
+    Some(phone)
 }
 
 fn group_key(m: &StoredMessage) -> String {
@@ -4700,6 +5143,7 @@ mod extract_target_text_tests {
             associated_guid: None,
             associated_type: None,
             item_type: 0,
+            send_error: None,
             attachments,
         }
     }
@@ -4762,5 +5206,163 @@ mod extract_target_text_tests {
     fn extract_target_text_returns_empty_when_no_text_and_no_attachments() {
         let m = message_with(None, vec![]);
         assert_eq!(extract_target_text(&m), "");
+    }
+}
+
+#[cfg(test)]
+mod new_chat_payload_tests {
+    use super::*;
+
+    // ── None cases ──────────────────────────────────────────────
+
+    #[test]
+    fn empty_string_returns_none() {
+        assert!(new_chat_payload("", "hi", "mailto:me@x.com").is_none());
+    }
+
+    #[test]
+    fn whitespace_string_returns_none() {
+        assert!(new_chat_payload("   ", "hi", "mailto:me@x.com").is_none());
+    }
+
+    #[test]
+    fn no_digits_no_at_returns_none() {
+        assert!(new_chat_payload("not-a-phone-or-email", "hi", "mailto:me@x.com").is_none());
+    }
+
+    // ── Phone: 10-digit US normalization ───────────────────────
+
+    #[test]
+    fn ten_digit_plain() {
+        let (_chat, msg) = new_chat_payload("5551234567", "hi", "mailto:me@x.com").unwrap();
+        assert!(msg.chat.participants.contains(&"tel:+15551234567".to_string()));
+    }
+
+    #[test]
+    fn ten_digit_with_parens_and_dash() {
+        let (_chat, msg) = new_chat_payload("(555) 123-4567", "hi", "mailto:me@x.com").unwrap();
+        assert!(msg.chat.participants.contains(&"tel:+15551234567".to_string()));
+    }
+
+    #[test]
+    fn ten_digit_with_spaces() {
+        let (_chat, msg) = new_chat_payload("555 123 4567", "hi", "mailto:me@x.com").unwrap();
+        assert!(msg.chat.participants.contains(&"tel:+15551234567".to_string()));
+    }
+
+    #[test]
+    fn ten_digit_with_dashes() {
+        let (_chat, msg) = new_chat_payload("555-123-4567", "hi", "mailto:me@x.com").unwrap();
+        assert!(msg.chat.participants.contains(&"tel:+15551234567".to_string()));
+    }
+
+    // ── Phone: already prefixed ────────────────────────────────
+
+    #[test]
+    fn phone_with_plus() {
+        let (_chat, msg) = new_chat_payload("+15551234567", "hi", "mailto:me@x.com").unwrap();
+        assert!(msg.chat.participants.contains(&"tel:+15551234567".to_string()));
+    }
+
+    #[test]
+    fn eleven_digit_with_dashes() {
+        // "1-555-123-4567" is 11 digits -> tel:+15551234567 (no double 1)
+        let (_chat, msg) = new_chat_payload("1-555-123-4567", "hi", "mailto:me@x.com").unwrap();
+        assert!(msg.chat.participants.contains(&"tel:+15551234567".to_string()));
+    }
+
+    #[test]
+    fn international_with_plus() {
+        let (_chat, msg) = new_chat_payload("+442071234567", "hi", "mailto:me@x.com").unwrap();
+        assert!(msg.chat.participants.contains(&"tel:+442071234567".to_string()));
+    }
+
+    #[test]
+    fn tel_prefix_ten_digit() {
+        let (_chat, msg) = new_chat_payload("tel:5551234567", "hi", "mailto:me@x.com").unwrap();
+        assert!(msg.chat.participants.contains(&"tel:+15551234567".to_string()));
+    }
+
+    #[test]
+    fn tel_prefix_with_plus() {
+        let (_chat, msg) = new_chat_payload("tel:+15551234567", "hi", "mailto:me@x.com").unwrap();
+        assert!(msg.chat.participants.contains(&"tel:+15551234567".to_string()));
+    }
+
+    // ── Email ──────────────────────────────────────────────────
+
+    #[test]
+    fn bare_email() {
+        let (_chat, msg) = new_chat_payload("foo@bar.com", "hi", "mailto:me@x.com").unwrap();
+        assert!(msg.chat.participants.contains(&"mailto:foo@bar.com".to_string()));
+    }
+
+    #[test]
+    fn uppercase_email_is_lowercased() {
+        let (_chat, msg) = new_chat_payload("FOO@BAR.COM", "hi", "mailto:me@x.com").unwrap();
+        assert!(msg.chat.participants.contains(&"mailto:foo@bar.com".to_string()));
+    }
+
+    #[test]
+    fn mailto_prefixed_email() {
+        let (_chat, msg) = new_chat_payload("mailto:foo@bar.com", "hi", "mailto:me@x.com").unwrap();
+        assert!(msg.chat.participants.contains(&"mailto:foo@bar.com".to_string()));
+    }
+
+    // ── IncomingMessage shape ──────────────────────────────────
+
+    #[test]
+    fn full_message_shape() {
+        let my_handle = "mailto:me@example.com";
+        let text = "hello";
+        let (_chat, msg) = new_chat_payload("5551234567", text, my_handle).unwrap();
+
+        // is_from_me
+        assert!(msg.is_from_me, "is_from_me must be true");
+
+        // sender
+        assert_eq!(msg.sender.as_deref(), Some(my_handle), "sender must match my_handle");
+
+        // text
+        assert_eq!(msg.text.as_deref(), Some(text), "text must match input");
+
+        // guid non-empty
+        assert!(!msg.guid.is_empty(), "guid must be non-empty");
+
+        // date within 60s of now
+        let now = now_ms();
+        let diff = (msg.date - now).abs();
+        assert!(
+            diff < 60_000,
+            "date must be within 60s of now_ms(), diff was {}ms",
+            diff,
+        );
+
+        // participants: exactly two, sorted, containing both handles
+        assert_eq!(
+            msg.chat.participants.len(),
+            2,
+            "participants must have exactly 2 entries",
+        );
+        assert!(
+            msg.chat.participants.contains(&my_handle.to_string()),
+            "participants must contain my_handle",
+        );
+        assert!(
+            msg.chat.participants.contains(&"tel:+15551234567".to_string()),
+            "participants must contain the normalized recipient",
+        );
+        // Verify ordering matches ChatRef::key() (sorted, lowercased, semicolon-joined)
+        let expected_key = "mailto:me@example.com;tel:+15551234567";
+        assert_eq!(msg.chat.key(), expected_key, "chat.key() must be stable sorted");
+
+        // display_name == None
+        assert!(msg.chat.display_name.is_none(), "display_name must be None for 1:1");
+
+        // service == None
+        assert!(msg.chat.service.is_none(), "chat.service must be None");
+
+        // item_type == 0
+        assert_eq!(msg.item_type, 0, "item_type must be 0 for normal text");
     }
 }

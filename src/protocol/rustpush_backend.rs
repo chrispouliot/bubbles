@@ -41,6 +41,7 @@ use crate::store::{
 };
 
 use crate::api;
+use crate::api::buffered_conn::BufferedApsConn;
 use crate::protocol::*;
 
 type Anis = ArcAnisetteClient<DefaultAnisetteProvider>;
@@ -49,7 +50,7 @@ type AppleAcct = Arc<DebugMutex<AppleAccount<DefaultAnisetteProvider>>>;
 
 /// Connection + the idms listener created alongside it (needed for 2FA verify).
 struct ConnHandle {
-    conn: APSConnection,
+    conn: Arc<BufferedApsConn>,
     idms: Arc<IdmsAuthListener>,
 }
 
@@ -181,7 +182,7 @@ impl Backend for RustpushBackend {
     }
 
     async fn make_anisette(&self, config: &Config, connection: &Connection) -> Result<Anisette> {
-        let a = api::make_anisette(self.state_path.clone(), cfg(config), &conn(connection).conn).await;
+        let a = api::make_anisette(self.state_path.clone(), cfg(config), conn(connection).conn.inner()).await;
         Ok(Anisette::new(a))
     }
 
@@ -197,7 +198,7 @@ impl Backend for RustpushBackend {
         let (account, state) = api::try_auth(
             self.state_path.clone(),
             cfg(config),
-            &conn(connection).conn,
+            conn(connection).conn.inner(),
             anis(anisette),
             creds,
         )
@@ -222,7 +223,7 @@ impl Backend for RustpushBackend {
         let ch = conn(connection);
         // Subscribe BEFORE sending so the verification push isn't missed.
         let watcher = api::subscribe_conn(&ch.conn);
-        let (session, state, _sid) = api::send_2fa_to_devices(acct(account), &ch.conn).await?;
+        let (session, state, _sid) = api::send_2fa_to_devices(acct(account), ch.conn.inner()).await?;
         let handle = CircleHandle {
             inner: Mutex::new((session, watcher)),
             idms: ch.idms.clone(),
@@ -311,7 +312,7 @@ impl Backend for RustpushBackend {
         let (new_users, alert) = api::register_ids(
             self.state_path.clone(),
             cfg(config),
-            &conn(connection).conn,
+            conn(connection).conn.inner(),
             ident(identity),
             users_vec,
         )
@@ -344,7 +345,7 @@ impl Backend for RustpushBackend {
             .collect();
         let c = api::make_imclient(
             self.state_path.clone(),
-            &conn(connection).conn,
+            conn(connection).conn.inner(),
             &users_vec,
             ident(identity),
         )
@@ -385,7 +386,7 @@ impl Backend for RustpushBackend {
 
         // Rehydrate the messaging client straight from the persisted
         // registration in id.plist — no re-register, no validation data needed.
-        let imclient = api::make_imclient(path.clone(), &conn, &users, &identity).await;
+        let imclient = api::make_imclient(path.clone(), conn.inner(), &users, &identity).await;
         let handles = api::get_handles(&imclient).await?;
 
         Ok(Some(RestoredSession {
@@ -447,7 +448,7 @@ impl Backend for RustpushBackend {
                             let mut ingest = ingest_from(&inst, &handles);
                             // Download any attachments and attach them to the record.
                             if let Ingest::Message(im) = &mut ingest {
-                                im.attachments = download_inbound(&inst, &conn, &im.guid).await;
+                                im.attachments = download_inbound(&inst, conn.inner(), &im.guid).await;
                             }
                             if let Err(e) = store.apply(ingest).await {
                                 log::warn!("store apply error: {e:#}");
@@ -544,10 +545,15 @@ impl Backend for RustpushBackend {
         let mut inst = MessageInst::new(conversation, my_handle, Message::Message(normal));
         inst.id = guid.clone();
         let date = now_ms();
-        imclient
-            .send(&mut inst)
-            .await
-            .map_err(|e| anyhow::anyhow!("send failed: {e:?}"))?;
+        let inst = Mutex::new(inst);
+        crate::retry::retry(3, std::time::Duration::from_millis(500), || async {
+            let mut guard = inst.lock().await;
+            imclient
+                .send(&mut *guard)
+                .await
+                .map_err(|e| anyhow::anyhow!("send failed: {e:?}"))
+        })
+        .await?;
         Ok(IncomingMessage {
             guid,
             chat: chat.clone(),
@@ -615,7 +621,7 @@ impl Backend for RustpushBackend {
             .map_err(|e| anyhow::anyhow!("prepare attachment: {e:?}"))?;
         file.rewind().map_err(|e| anyhow::anyhow!("rewind: {e}"))?;
         let attachment =
-            Attachment::new_mmcs(&aps, &prepared, file, &mime, &uti, &name, |_, _| {})
+            Attachment::new_mmcs(aps.inner(), &prepared, file, &mime, &uti, &name, |_, _| {})
                 .await
                 .map_err(|e| anyhow::anyhow!("upload attachment: {e:?}"))?;
 
@@ -881,7 +887,6 @@ async fn download_inbound(
     conn: &APSConnection,
     guid: &str,
 ) -> Vec<AttachmentRecord> {
-    use std::io::Write;
     let Message::Message(n) = &inst.message else {
         return Vec::new();
     };
@@ -901,16 +906,14 @@ async fn download_inbound(
         };
         let part_index = p.idx.unwrap_or(i) as i64;
         let path = dir.join(format!("{guid}_{part_index}{}", ext_for(&att.mime, &att.name)));
-        let mut file = match std::fs::File::create(&path) {
-            Ok(f) => f,
-            Err(e) => {
-                log::warn!("create {}: {e}", path.display());
-                continue;
-            }
-        };
-        match att.get_attachment(conn, &mut file, |_, _| {}).await {
+        let att_owned = att.clone();
+        let conn_owned = conn.clone();
+        match crate::attachment_cache::download_to_path(&path, move |file| {
+            Box::pin(async move {
+                att_owned.get_attachment(&conn_owned, file, |_, _| {}).await
+            })
+        }).await {
             Ok(()) => {
-                let _ = file.flush();
                 log::info!("↓ saved attachment {} ({})", att.name, att.mime);
                 out.push(AttachmentRecord {
                     guid: None,
@@ -922,9 +925,11 @@ async fn download_inbound(
                     is_sticker: false,
                 });
             }
-            Err(e) => {
+            Err(crate::attachment_cache::DownloadError::Download(e)) => {
                 log::warn!("download attachment {}: {e:?}", att.name);
-                let _ = std::fs::remove_file(&path);
+            }
+            Err(crate::attachment_cache::DownloadError::Io(e)) => {
+                log::warn!("io writing attachment {}: {e}", att.name);
             }
         }
     }
