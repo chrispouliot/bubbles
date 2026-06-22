@@ -17,18 +17,15 @@ use gtk::glib;
 /// assert_eq!(time_format::format_time(ms, time_format::TimeFormat::H24), "13:30");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum TimeFormat {
     /// 12-hour with AM/PM suffix — the default.
+    #[default]
     AmPm,
     /// 24-hour, zero-padded hour.
     H24,
 }
 
-impl Default for TimeFormat {
-    fn default() -> Self {
-        TimeFormat::AmPm
-    }
-}
 
 /// Default time format: 12-hour AM/PM.
 pub const DEFAULT: TimeFormat = TimeFormat::AmPm;
@@ -243,7 +240,7 @@ mod tests {
     fn corrupted_file_falls_back_to_default() {
         setup_isolated_data_dir();
         std::fs::create_dir_all(state_file_path().parent().unwrap()).unwrap();
-        std::fs::write(&state_file_path(), "garbage not a 0 or 1").unwrap();
+        std::fs::write(state_file_path(), "garbage not a 0 or 1").unwrap();
         assert_eq!(get(), TimeFormat::AmPm);
     }
 }

@@ -30,7 +30,7 @@ pub fn get() -> f64 {
         Err(_) => return DEFAULT_OFFSET,
     };
     let val: f64 = data.trim().parse().unwrap_or(DEFAULT_OFFSET);
-    if val >= MIN_OFFSET && val <= MAX_OFFSET {
+    if (MIN_OFFSET..=MAX_OFFSET).contains(&val) {
         val
     } else {
         DEFAULT_OFFSET
@@ -40,7 +40,7 @@ pub fn get() -> f64 {
 /// Save a text size offset (in points) to disk. Creates the parent directory
 /// if needed.
 pub fn set(val: f64) {
-    let clamped = val.max(MIN_OFFSET).min(MAX_OFFSET);
+    let clamped = val.clamp(MIN_OFFSET, MAX_OFFSET);
     let path = state_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);

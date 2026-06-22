@@ -2244,7 +2244,7 @@ impl Ui {
                     .open_summary
                     .borrow()
                     .as_ref()
-                    .map_or(false, |c| c.id == chat_id);
+                    .is_some_and(|c| c.id == chat_id);
                 if !still_open {
                     *ui.page_loading.borrow_mut() = false;
                     return;
@@ -2429,7 +2429,7 @@ impl Ui {
                     .open_summary
                     .borrow()
                     .as_ref()
-                    .map_or(false, |c| c.id == chat_id);
+                    .is_some_and(|c| c.id == chat_id);
                 if !still_open {
                     return;
                 }
@@ -3440,7 +3440,7 @@ const PREVIEW_CLASS: &str = "text-scale-preview";
 /// class, no matter how many times the dialog is opened.
 fn preview_provider_cell() -> Rc<RefCell<Option<gtk::CssProvider>>> {
     thread_local! {
-        static CELL: std::cell::OnceCell<Rc<RefCell<Option<gtk::CssProvider>>>> = std::cell::OnceCell::new();
+        static CELL: std::cell::OnceCell<Rc<RefCell<Option<gtk::CssProvider>>>> = const { std::cell::OnceCell::new() };
     }
     CELL.with(|c| {
         c.get_or_init(|| {
@@ -3911,7 +3911,7 @@ fn message_body(
     let has_text = m
         .text
         .as_deref()
-        .map_or(false, |t| !strip_marker(t).is_empty());
+        .is_some_and(|t| !strip_marker(t).is_empty());
     let is_tapback = m.associated_guid.is_some();
     let bubble_or_overlay: Option<gtk::Widget> = if has_text || is_tapback {
         let bubble = bubble_box(own);
@@ -4383,7 +4383,7 @@ fn host_caption(url: &str) -> String {
         .unwrap_or(url);
     // Drop the path, query, and fragment; keep the host (and optional :port).
     let host_port = after_scheme
-        .split(|c: char| c == '/' || c == '?' || c == '#')
+        .split(['/', '?', '#'])
         .next()
         .unwrap_or(after_scheme);
     if host_port.is_empty() {
@@ -4444,7 +4444,7 @@ fn link_preview_placeholder_card(p: &MessageLinkPreview) -> gtk::Widget {
 /// they're guaranteed fresh and small).
 fn link_preview_thumb(p: &MessageLinkPreview) -> gtk::Widget {
     if let Some(path) = p.image_path.as_deref() {
-        if let Some(texture) = gtk::gdk::Texture::from_filename(path).ok() {
+        if let Ok(texture) = gtk::gdk::Texture::from_filename(path) {
             let pic = gtk::Picture::new();
             pic.set_paintable(Some(&texture));
             // Cover-fit: thumbnail may be a different aspect ratio than the box.
@@ -4624,7 +4624,7 @@ fn bubble_with_chip(bubble: &gtk::Box, own: bool, chip: Option<&gtk::Widget>) ->
         let bubble_w = {
             let a = bubble_for_closure.allocated_width();
             if a > 0 {
-                a as i32
+                a
             } else {
                 let (_, natural, _, _) =
                     bubble_for_closure.measure(gtk::Orientation::Horizontal, -1);
@@ -4695,21 +4695,6 @@ fn wrap_bubble_in_overlay(bubble: &gtk::Widget, chip: &gtk::Widget, own: bool) -
     overlay.upcast()
 }
 
-/// Replace `old` widget with `new` widget in the parent container, preserving
-/// the same position among siblings.
-fn replace_in_parent(old: &gtk::Widget, new: &gtk::Widget) {
-    let parent = old.parent().expect("replace_in_parent: old widget has no parent");
-    let prev_sibling = old.prev_sibling();
-    // The parent should be a gtk::Box for the message-body `col` container.
-    let parent_box = parent.downcast_ref::<gtk::Box>()
-        .expect("replace_in_parent: parent must be a gtk::Box");
-    parent_box.remove(old);
-    match prev_sibling {
-        Some(ref sibling) => parent_box.insert_child_after(new, Some(sibling)),
-        None => parent_box.prepend(new),
-    }
-}
-
 /// Apply a single `ChipChange` in place. The `bubble_or_overlay` is the
 /// widget currently in the container for `target_guid` (either the bare
 /// bubble Box, or the overlay wrapping the bubble if a chip already exists).
@@ -4732,9 +4717,25 @@ fn apply_chip_change(
             match (has_chip, chips_empty) {
                 // "Add first chip" — no chip yet, now has reactions.
                 (false, false) => {
+                    // The bubble still has its old parent (the message's `col` Box).
+                    // GTK4's `gtk_overlay_set_child` asserts when the new child
+                    // has a parent that isn't the overlay itself, so we have to
+                    // unparent the bubble BEFORE wrapping it. Capture the position
+                    // first so the overlay lands in the same spot.
+                    let parent_box = bubble_or_overlay
+                        .parent()
+                        .and_then(|p| p.downcast_ref::<gtk::Box>().cloned())
+                        .expect("bubble must have a Box parent for in-place chip add");
+                    let prev_sibling = bubble_or_overlay.prev_sibling();
+                    parent_box.remove(bubble_or_overlay);
                     let chip = reaction_chips_row(new_chips);
                     let overlay = wrap_bubble_in_overlay(bubble_or_overlay, &chip, is_from_me);
-                    replace_in_parent(bubble_or_overlay, &overlay);
+                    match prev_sibling {
+                        Some(ref sibling) => {
+                            parent_box.insert_child_after(&overlay, Some(sibling))
+                        }
+                        None => parent_box.prepend(&overlay),
+                    }
                     o.insert(ChipEntry {
                         bubble: overlay,
                         chip: Some(chip),

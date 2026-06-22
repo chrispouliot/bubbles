@@ -374,7 +374,7 @@ mod tests {
         let has_ffmpeg = Command::new("ffmpeg")
             .arg("-version")
             .output()
-            .map_or(false, |o| o.status.success());
+            .is_ok_and(|o| o.status.success());
 
         if !has_ffmpeg {
             eprintln!("ffmpeg not found on PATH — skipping real MP4 test");

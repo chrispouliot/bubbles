@@ -286,7 +286,7 @@ fn read_image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         }
         let marker = bytes[pos + 1];
         match marker {
-            0xC0 | 0xC1 | 0xC2 => {
+            0xC0..=0xC2 => {
                 // SOF: marker(2) + length(2) + precision(1) + height(2) + width(2)
                 let seg_len =
                     u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;

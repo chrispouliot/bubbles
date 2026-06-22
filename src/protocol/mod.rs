@@ -130,8 +130,10 @@ pub struct RestoredSession {
 
 /// The login/2FA state machine, mirroring `rustpush`'s `LoginState`.
 #[derive(Clone, Debug)]
+#[derive(Default)]
 pub enum LoginState {
     /// Need an Apple ID + password.
+    #[default]
     NeedsLogin,
     /// Trusted-device 2FA must be triggered (push a code to Apple devices).
     NeedsDevice2Fa,
@@ -148,11 +150,6 @@ pub enum LoginState {
     LoggedIn,
 }
 
-impl Default for LoginState {
-    fn default() -> Self {
-        LoginState::NeedsLogin
-    }
-}
 
 /// The async surface over `rustpush`. The onboarding flow in [`crate::setup::flow`]
 /// is written purely against this trait, so the stub and the real backend are

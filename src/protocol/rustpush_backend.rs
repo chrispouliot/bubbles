@@ -549,7 +549,7 @@ impl Backend for RustpushBackend {
         crate::retry::retry(3, std::time::Duration::from_millis(500), || async {
             let mut guard = inst.lock().await;
             imclient
-                .send(&mut *guard)
+                .send(&mut guard)
                 .await
                 .map_err(|e| anyhow::anyhow!("send failed: {e:?}"))
         })

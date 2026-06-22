@@ -283,11 +283,11 @@ impl MessageLinkPreview {
         let title_blank = self
             .title
             .as_deref()
-            .map_or(true, |s| s.trim().is_empty());
+            .is_none_or(|s| s.trim().is_empty());
         let summary_blank = self
             .summary
             .as_deref()
-            .map_or(true, |s| s.trim().is_empty());
+            .is_none_or(|s| s.trim().is_empty());
         title_blank && summary_blank
     }
 }

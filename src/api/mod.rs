@@ -14,7 +14,7 @@ use crate::api::runtime::init_logger;
 
 
 
-use std::{borrow::{Borrow, BorrowMut}, collections::HashSet, fs::{self, File}, future::Future, io::{Cursor, Read, Write}, ops::Deref, panic, str::FromStr, sync::{Arc, OnceLock, Weak}, time::Duration, u64};
+use std::{borrow::{Borrow, BorrowMut}, collections::HashSet, fs::{self, File}, future::Future, io::{Cursor, Read, Write}, ops::Deref, panic, path::Path, str::FromStr, sync::{Arc, OnceLock, Weak}, time::Duration};
 pub use std::time::SystemTime;
 use anyhow::anyhow;
 #[cfg(not(target_os = "android"))]
@@ -349,7 +349,7 @@ pub async fn setup_push(config: &JoinedOSConfig, identity: &IDSNGMIdentity, stat
         let state = SavedHardwareState {
             push: buffered.inner().state.read().await.clone(),
             os_config: config.clone(),
-            identity: saved_identity.clone().into(),
+            identity: saved_identity.clone(),
         };
         std::fs::write(&state_path, plist_to_string(&state).unwrap()).unwrap();
     }
@@ -366,7 +366,7 @@ pub async fn setup_push(config: &JoinedOSConfig, identity: &IDSNGMIdentity, stat
                     let state = SavedHardwareState {
                         push: conn.state.read().await.clone(),
                         os_config: config_ref.clone(),
-                        identity: saved_identity.clone().into(),
+                        identity: saved_identity.clone(),
                     };
                     std::fs::write(&state_path, plist_to_string(&state).unwrap()).unwrap();
                 },
@@ -393,7 +393,7 @@ pub async fn make_idms(conn: &Arc<BufferedApsConn>) -> Arc<IdmsAuthListener> {
     IdmsAuthListener::new(conn.inner().clone()).await.into()
 }
 
-async fn get_login_config(conf_dir: &PathBuf, conf: &JoinedOSConfig, conn: &APSConnection) -> LoginClientInfo {
+async fn get_login_config(conf_dir: &Path, conf: &JoinedOSConfig, conn: &APSConnection) -> LoginClientInfo {
     let anisette_dir = conf_dir.join("anisette_test");
     let config_path = anisette_dir.join("state.plist");
 
@@ -416,7 +416,7 @@ pub async fn try_auth(path: String, conf: &JoinedOSConfig, conn: &APSConnection,
         reset_user(&path);
 
         let mut password_hasher = sha2::Sha256::new();
-        password_hasher.update(&password.as_bytes());
+        password_hasher.update(password.as_bytes());
         let hashed_password = password_hasher.finalize();
         (username, hashed_password.to_vec())
     } else {
@@ -438,7 +438,7 @@ pub async fn try_icloud_login(path: String, conf: &JoinedOSConfig, account: &Arc
     let pet = account.lock().await.get_pet();
     if let Some(_pet) = pet {
         info!("Here4");
-        let identity = do_login(path, &account, None, conf).await?;
+        let identity = do_login(path, account, None, conf).await?;
         info!("Here5");
         
         Ok(Some(identity))
@@ -546,14 +546,9 @@ pub async fn verify_2fa(path: String, client: &mut CircleClientSession<DefaultAn
     let mut login_state = tokio::time::timeout(Duration::from_secs(30), async {
         Ok::<_, PushError>(loop {
             let msg = watcher.recv().await.unwrap();
-            if let Some(test) = idms.handle(msg)? {
-                match test {
-                    IdmsMessage::CircleRequest(c, _) => {
-                        if let Some(state) = client.handle_circle_request(&c).await? {
-                            break state;
-                        }
-                    },
-                    _ => { }
+            if let Some(IdmsMessage::CircleRequest(c, _)) = idms.handle(msg)? {
+                if let Some(state) = client.handle_circle_request(&c).await? {
+                    break state;
                 }
             }
         })
@@ -562,7 +557,7 @@ pub async fn verify_2fa(path: String, client: &mut CircleClientSession<DefaultAn
     let mut user = None;
     let pet = account.lock().await.get_pet();
     if let Some(_pet) = pet {
-        let identity = do_login(path, &account, None, os_config).await?;
+        let identity = do_login(path, account, None, os_config).await?;
         user = Some(identity);
 
         // who needs extra steps when you have a PET, amirite?
@@ -600,7 +595,7 @@ pub async fn verify_2fa_sms(path: String, account_mut: &Arc<Mutex<AppleAccount<D
     let mut user = None;
     if let Some(_pet) = account.get_pet() {
         drop(account);
-        let identity = do_login(path, &account_mut, None, config).await?;
+        let identity = do_login(path, account_mut, None, config).await?;
         user = Some(identity);
 
         // who needs extra steps when you have a PET, amirite?
@@ -622,18 +617,18 @@ struct GSAConfig {
 
 impl GSAConfig {
     fn get_password(&self) -> Result<Vec<u8>, PushError> {
-        let key = AesKeystoreKey::ensure(&format!("gsa:password"), 256, KeystoreAccessRules {
+        let key = AesKeystoreKey::ensure("gsa:password", 256, KeystoreAccessRules {
             block_modes: vec![EncryptMode::Gcm],
             can_encrypt: true,
             can_decrypt: true,
             ..Default::default()
         })?;
-        let encoded = key.decrypt(self.encrypted_password.as_ref(), &mut EncryptMode::Gcm)?;
+        let encoded = key.decrypt(self.encrypted_password.as_ref(), &EncryptMode::Gcm)?;
         Ok(encoded)
     }
 
     fn encrypt(password: &[u8]) -> Result<Data, PushError> {
-        let key = AesKeystoreKey::ensure(&format!("gsa:password"), 256, KeystoreAccessRules {
+        let key = AesKeystoreKey::ensure("gsa:password", 256, KeystoreAccessRules {
             block_modes: vec![EncryptMode::Gcm],
             can_encrypt: true,
             can_decrypt: true,
@@ -701,7 +696,7 @@ pub async fn register_ids(path: String, config: &JoinedOSConfig, aps: &APSConnec
     Ok((Some(users), None))
 }
 
-pub async fn make_imclient(path: String, conn: &APSConnection, users: &Vec<IDSUser>, identity: &IDSNGMIdentity) -> Arc<IMClient> {
+pub async fn make_imclient(path: String, conn: &APSConnection, users: &[IDSUser], identity: &IDSNGMIdentity) -> Arc<IMClient> {
     let dir = PathBuf::from_str(&path).unwrap();
     let id_path = dir.join("id.plist");
 
@@ -713,7 +708,7 @@ pub async fn make_imclient(path: String, conn: &APSConnection, users: &Vec<IDSUs
         let _ = fs::File::create(incident_path);
     }
 
-    Arc::new(IMClient::new(conn.clone(), users.clone(), identity.clone(),
+    Arc::new(IMClient::new(conn.clone(), users.to_vec(), identity.clone(),
     &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE], dir.join("id_cache.plist"), conn.os_config.clone(), Box::new(move |updated_keys| {
         println!("updated keys!!!");
         std::fs::write(&id_path, plist_to_string(&updated_keys).unwrap()).unwrap();

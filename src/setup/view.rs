@@ -345,7 +345,7 @@ fn login_page(
     let content = column();
 
     let subtitle = gtk::Label::builder()
-        .label(&format!(
+        .label(format!(
             "Signing in as {} (macOS {})",
             device.name, device.os_version
         ))

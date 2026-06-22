@@ -884,7 +884,7 @@ mod tests {
 
         let chats = query_chats(&c).unwrap();
         assert_eq!(chats.len(), 1, "one chat");
-        assert_eq!(chats[0].is_group, false);
+        assert!(!chats[0].is_group);
         let msgs = query_messages(&c, chats[0].id).unwrap();
         assert_eq!(msgs.len(), 1, "duplicate guid collapsed to one row");
         assert_eq!(msgs[0].text.as_deref(), Some("Hello me"));
@@ -1413,7 +1413,7 @@ mod tests {
         // 2. A single "add" of reaction 0 (heart) from sender A on target T1
         //    -> exactly one live entry with the right target/part/sender/idx.
         let add_heart_a = mk("RA1", "T1", Some("0"), sender_a.clone(), false, 1000, 2000);
-        let live = live_tapbacks(&[add_heart_a.clone()]);
+        let live = live_tapbacks(std::slice::from_ref(&add_heart_a));
         assert_eq!(live.len(), 1, "single add -> one live entry");
         assert_eq!(live[0].target_guid, "T1");
         assert_eq!(live[0].target_part.as_deref(), Some("0"));
@@ -1572,7 +1572,7 @@ mod tests {
         // 2. One target, one sender, one reaction -> one entry
         //    {reaction_index: 0, count: 1, my_reacted: false}.
         let a_heart_t1 = mk("R1", "T1", Some("0"), sender_a.clone(), false, 1000, 2000);
-        let out = group_tapbacks_by_target(live_tapbacks(&[a_heart_t1.clone()]));
+        let out = group_tapbacks_by_target(live_tapbacks(std::slice::from_ref(&a_heart_t1)));
         assert_eq!(out.len(), 1, "one target with one reaction -> one map entry");
         let v = out.get("T1").expect("target T1 is in the map");
         assert_eq!(v.len(), 1, "one reaction type -> one inner entry");
@@ -1627,7 +1627,7 @@ mod tests {
 
         // 6. my_reacted: true when the (only) sender is is_from_me.
         let me_heart_t1 = mk("R5", "T1", Some("0"), sender_me.clone(), true, 1400, 2000);
-        let out = group_tapbacks_by_target(live_tapbacks(&[me_heart_t1.clone()]));
+        let out = group_tapbacks_by_target(live_tapbacks(std::slice::from_ref(&me_heart_t1)));
         let v = &out["T1"];
         assert_eq!(v.len(), 1);
         assert!(v[0].my_reacted, "is_from_me -> my_reacted: true");
