@@ -903,7 +903,7 @@ mod tests {
 
     /// The real HEIC fixture, embedded so we don't depend on a run-time working
     /// directory.  4×4 pixel, lossless-encoded RGBA.
-    const HEIC_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/sample.heic");
+    const HEIC_FIXTURE: &[u8] = include_bytes!("fixtures/sample.heic");
 
     // -----------------------------------------------------------------------
     // Test 1 – real HEIC decodes to expected dimensions & pixel data
