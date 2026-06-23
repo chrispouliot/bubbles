@@ -5,6 +5,11 @@ edition = "2024"
 
 [dependencies]
 serde = { version = "1.0.219", features = ["derive"] }
+goblin = "0.8"
+unicorn-engine = "2"
+log = "0.4"
+sha1 = "0.10"
+ureq = "2"
 
 [features]
 serde = []

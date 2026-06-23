@@ -35,7 +35,11 @@ flume = "0.11.0"
 icloud_auth = { path = "./apple-private-apis/icloud-auth", default-features = false }
 srp = { path = "./apple-private-apis/icloud-auth/rustcrypto-srp" }
 omnisette = { path = "./apple-private-apis/omnisette" }
-open-absinthe = { path = "./open-absinthe", optional = true, features = ["serde"] }
+# open-absinthe is maintained locally, not vendored with rustpush. The path
+# points two levels up to the workspace sibling at crates/open-absinthe/. When
+# re-vendoring rustpush, restore this override (the upstream path
+# "./open-absinthe" no longer resolves).
+open-absinthe = { path = "../../crates/open-absinthe", optional = true, features = ["serde"] }
 deku = "0.16.0"
 zip = { version = "2.1.5", default-features = false, features = ["deflate-zlib"] }
 rasn = "0.16.0"

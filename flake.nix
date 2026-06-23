@@ -130,6 +130,7 @@
               ./src
               ./assets
               ./third_party
+              ./crates
               ./app.openbubbles.Gtk.Devel.desktop
               ./app.openbubbles.Gtk.Devel.metainfo.xml
             ];

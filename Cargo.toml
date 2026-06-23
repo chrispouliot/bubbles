@@ -39,6 +39,10 @@ tokio-rusqlite = "0.5"
 # rustpush backend (only under --features rustpush). Vendored path deps under
 # third_party/rustpush (pinned to a7fab47) with FairPlay certs pre-seeded into
 # certs/fairplay/, so no clone or cert-seeding step is needed at build time.
+# open-absinthe is the locally-maintained NAC emulator; it lives at
+# crates/open-absinthe/ (not in third_party) and is pulled in by rustpush's
+# `open-absinthe` path dep, which points two levels up out of the vendored
+# tree (see third_party/rustpush/Cargo.toml).
 rustpush = { path = "third_party/rustpush", features = ["macos-validation-data", "remote-anisette-v3"], optional = true }
 keystore = { path = "third_party/rustpush/keystore", optional = true }
 
