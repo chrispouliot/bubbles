@@ -10,6 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once, OnceLock};
 
 use adw::prelude::*;
@@ -183,6 +184,14 @@ row.entry image.edit-icon {
   min-height: 72px;
   background-color: alpha(currentColor, 0.08);
   color: alpha(currentColor, 0.5);
+}
+.crop-indicator {
+  border-radius: 999px;
+  border: 2px solid @accent_bg_color;
+  background-color: rgba(255, 255, 255, 0.25);
+}
+.crop-viewport {
+  border: 1px solid alpha(currentColor, 0.4);
 }
 ";
 
@@ -669,7 +678,7 @@ pub fn enter_messaging(
     // Rename the open conversation.
     {
         let ui = ui.clone();
-        rename_button.connect_clicked(move |_| ui.prompt_rename());
+        rename_button.connect_clicked(move |_| ui.prompt_edit_chat());
     }
 
     // New Chat button in the sidebar header.
@@ -1620,35 +1629,449 @@ impl Ui {
         about.present(Some(&self.split));
     }
 
-    /// Prompt for a user-given name for the open conversation. An empty field
-    /// clears the override and reverts to the derived title.
-    fn prompt_rename(&self) {
+    /// Prompt to edit the open conversation's name and/or photo.
+    /// The photo section is a placeholder — picking a file stashes it but
+    /// does not yet apply it (see Unit 4b).
+    fn prompt_edit_chat(&self) {
         let Some(chat) = self.open_summary.borrow().clone() else {
             return;
         };
-        // Placeholder shows what an empty field falls back to (the derived name).
+        // Derived title (what the field value falls back to when empty).
         let derived = {
             let mut c = chat.clone();
             c.custom_name = None;
             chat_title(&c, &self.handles)
         };
+
+        // --- Name section ---
+        let name_label = gtk::Label::builder()
+            .label("Name")
+            .halign(gtk::Align::Start)
+            .build();
         let entry = gtk::Entry::builder()
             .activates_default(true)
             .text(chat.custom_name.clone().unwrap_or_default())
             .build();
         entry.set_placeholder_text(Some(&derived));
 
-        let dialog = adw::AlertDialog::new(Some("Rename Conversation"), None);
-        dialog.set_extra_child(Some(&entry));
-        dialog.add_responses(&[("cancel", "Cancel"), ("rename", "Rename")]);
-        dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("rename"));
+        // --- Photo section ---
+        let photo_label = gtk::Label::builder()
+            .label("Photo")
+            .halign(gtk::Align::Start)
+            .build();
+
+        let status_label = gtk::Label::builder()
+            .label("No photo selected")
+            .halign(gtk::Align::Start)
+            .build();
+        let choose_btn = gtk::Button::builder()
+            .label("Choose Photo…")
+            .build();
+        let remove_btn = gtk::Button::builder()
+            .label("Remove Photo")
+            .build();
+
+        // Photo edit state shared across closures.
+        let state: Rc<RefCell<PhotoEditState>> = Rc::new(RefCell::new(PhotoEditState {
+            picked_path: None,
+            decoded: None,
+            params: None,
+            removal_requested: false,
+        }));
+
+        // File picker: set up filter and dialog once.
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Images"));
+        filter.add_mime_type("image/png");
+        filter.add_mime_type("image/jpeg");
+        filter.add_mime_type("image/heic");
+        filter.add_mime_type("image/heif");
+
+        let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+
+        let file_dialog = gtk::FileDialog::builder()
+            .title("Choose a chat photo")
+            .default_filter(&filter)
+            .filters(&filters)
+            .build();
+
+        // --- Crop UI widgets ---
+        let crop_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .build();
+        let frame = gtk::Frame::builder()
+            .width_request(256)
+            .height_request(256)
+            .build();
+        let overlay = gtk::Overlay::new();
+        let picture = gtk::Picture::builder()
+            .can_shrink(true)
+            // Cover: the source fills the 256×256 frame (sides clipped for
+            // non-square images).  Pairs with the `connect_get_child_position`
+            // math below so the visible circle is aligned with the displayed
+            // image instead of the letterbox.
+            .content_fit(gtk::ContentFit::Cover)
+            .build();
+        overlay.set_child(Some(&picture));
+        // Viewport: a thin rectangle outline that fills the overlay, so the
+        // user can see the photo's full extent.  The circle indicator (drawn
+        // on top, below) shows the actual crop inside the viewport.
+        let viewport = gtk::Frame::builder()
+            .css_classes(["crop-viewport"])
+            .build();
+        viewport.set_can_target(false);
+        overlay.add_overlay(&viewport);
+        overlay.set_measure_overlay(&viewport, false);
+        overlay.set_clip_overlay(&viewport, false);
+        let indicator = gtk::Frame::builder()
+            .css_classes(["crop-indicator"])
+            .build();
+        indicator.set_can_target(false);
+        overlay.add_overlay(&indicator);
+        // Measure the indicator with the overlay's allocation (so the
+        // get_child_position Rectangle sets the actual size, not a
+        // separate measure pass) and don't clip it (so the circle can
+        // extend past the overlay's bounds when the user drags the crop
+        // off the photo's edge).
+        overlay.set_measure_overlay(&indicator, false);
+        overlay.set_clip_overlay(&indicator, false);
+        // Position the indicator at explicit coordinates via
+        // `get_child_position`.  This is NOT a CSS margin — it's an
+        // absolute `gdk::Rectangle` that GTK uses directly, so negative
+        // coordinates are legal and the indicator can extend past the
+        // overlay's bounds.  Same pattern as `bubble_with_chip` (which
+        // positions a reaction chip half-on, half-off the bubble's edge).
+        // The callback reads the current crop state on every layout pass
+        // and returns the indicator's rectangle; the call sites just need
+        // `overlay.queue_allocate()` after mutating the state to refresh.
+        let state_for_position = state.clone();
+        let viewport_for_position = viewport.clone();
+        overlay.connect_get_child_position(move |overlay, child| {
+            // Viewport: fills the overlay so the user can see the photo's
+            // full extent (the "rectangle the same size as the photo" that
+            // frames the crop circle).
+            if child == &viewport_for_position {
+                let w = overlay.width();
+                let h = overlay.height();
+                if w <= 0 || h <= 0 {
+                    return None;
+                }
+                return Some(gtk::gdk::Rectangle::new(0, 0, w, h));
+            }
+            // Circle: the actual crop, drawn on top of the viewport.
+            let s = state_for_position.borrow();
+            let (decoded, params) = match (s.decoded.as_ref(), s.params.as_ref()) {
+                (Some(d), Some(p)) => (d, p),
+                _ => return None,
+            };
+            let src_w = decoded.width as f64;
+            let src_h = decoded.height as f64;
+            // Use the overlay's actual allocated size, not a hardcoded 256.
+            // The frame is `width_request(256)` — a minimum, not a fixed size;
+            // GTK can (and does, when the dialog content is wider) allocate
+            // it larger.  Hardcoding 256 here would position the indicator at
+            // the top-left of a larger frame, making the visible circle
+            // appear off-centre to the left.
+            let frame_w = overlay.width() as f64;
+            let frame_h = overlay.height() as f64;
+            if frame_w <= 0.0 || frame_h <= 0.0 {
+                return None;
+            }
+            let scale = (frame_w / src_w).max(frame_h / src_h);
+            let scaled_w = src_w * scale;
+            let scaled_h = src_h * scale;
+            let x_offset = ((scaled_w - frame_w) / 2.0).max(0.0);
+            let y_offset = ((scaled_h - frame_h) / 2.0).max(0.0);
+            let display_r = params.r * scale;
+            let display_cx = params.cx * scale - x_offset;
+            let display_cy = params.cy * scale - y_offset;
+            // The circle's diameter is the actual crop in display coords —
+            // no clamp to `min(frame_w, frame_h)`.  For a non-square source
+            // where `r = min(src_w, src_h) / 2`, the circle can be wider
+            // (or taller) than the frame; `set_clip_overlay(&indicator,
+            // false)` lets it extend past the overlay's bounds.  The
+            // viewport outline shows the full photo extent so the user
+            // can see the circle's position relative to the photo.
+            let dia = (display_r * 2.0).round().max(1.0) as i32;
+            let x = (display_cx - display_r).round() as i32;
+            let y = (display_cy - display_r).round() as i32;
+            Some(gtk::gdk::Rectangle::new(x, y, dia, dia))
+        });
+        frame.set_child(Some(&overlay));
+        crop_box.append(&frame);
+        crop_box.set_visible(false);
+
+        // Show "Remove Photo" when the chat already has a custom avatar.
+        let has_existing_avatar = chat
+            .custom_avatar_path
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+            .is_some();
+        remove_btn.set_visible(has_existing_avatar);
+
+        // --- Remove button ---
+        {
+            let state = state.clone();
+            let status = status_label.clone();
+            let crop_box = crop_box.clone();
+            let remove_btn = remove_btn.clone();
+            remove_btn.clone().connect_clicked(move |_| {
+                let mut s = state.borrow_mut();
+                s.removal_requested = true;
+                s.picked_path = None;
+                s.decoded = None;
+                s.params = None;
+                status.set_label("Photo will be removed on save");
+                crop_box.set_visible(false);
+                if !has_existing_avatar {
+                    remove_btn.set_visible(false);
+                }
+            });
+        }
+
+        // --- Drag gesture for panning the crop ---
+        //
+        // Attached to the `frame` (the 256×256 container), NOT the picture,
+        // and configured to claim the button-drag sequence in capture phase.
+        //
+        // Why: an earlier version attached the gesture only to `picture` and
+        // returned `Proceed` from the handler.  That left the button-drag
+        // sequence unclaimed, so the window manager (or some upstream
+        // handler) won the sequence and dragged the app window instead of
+        // panning the crop.  Capturing on the frame + claiming the sequence
+        // explicitly + returning `Propagation::Stop` from `drag_update` fixes
+        // it.  (Same pattern the scroll controller below already uses.)
+        {
+            let state = state.clone();
+            let overlay = overlay.clone();
+            let drag_start: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
+            let gesture = gtk::GestureDrag::new();
+            // Run before the event is delivered to the target so the gesture
+            // can win the sequence ahead of the window-drag handler.
+            gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+            // No other gesture in our group should also handle this drag.
+            gesture.set_exclusive(true);
+
+            {
+                let drag_start = drag_start.clone();
+                let state = state.clone();
+                gesture.connect_drag_begin(move |gesture, _start_x, _start_y| {
+                    if let Some(ref params) = state.borrow().params {
+                        *drag_start.borrow_mut() = Some((params.cx, params.cy));
+                    }
+                    // Claim the sequence so the window drag handler does
+                    // not take over.
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                });
+            }
+            {
+                let drag_start = drag_start.clone();
+                let state = state.clone();
+                let overlay = overlay.clone();
+                gesture.connect_drag_update(move |_gesture, offset_x, offset_y| {
+                    // 1. Read current state values without holding a mutable borrow.
+                    let (src_w, src_h, r) = {
+                        let s = state.borrow();
+                        let d = match s.decoded.as_ref() {
+                            Some(v) => v,
+                            None => return,
+                        };
+                        let p = match s.params.as_ref() {
+                            Some(v) => v,
+                            None => return,
+                        };
+                        (d.width as f64, d.height as f64, p.r)
+                    };
+                    // Cover scale: matches the picture's content_fit so
+                    // display coords map to source coords correctly even for
+                    // non-square images.  Uses the overlay's ACTUAL allocated
+                    // size (not a hardcoded 256) so the math matches the
+                    // get_child_position callback when the dialog's content
+                    // box stretches the frame wider than 256.
+                    let frame_w = overlay.width() as f64;
+                    let frame_h = overlay.height() as f64;
+                    let scale = (frame_w / src_w).max(frame_h / src_h);
+                    // Drag offsets are relative to the widget; the
+                    // conversion to source coords is `offset / scale`.  The
+                    // clip offset used by the get_child_position callback
+                    // is a constant per-frame, so it cancels out for
+                    // relative deltas — no extra compensation needed here.
+                    let (start_cx, start_cy) = match *drag_start.borrow() {
+                        Some(v) => v,
+                        None => return,
+                    };
+                    let new_cx = (start_cx + offset_x / scale)
+                        .clamp(r, src_w - r);
+                    let new_cy = (start_cy + offset_y / scale)
+                        .clamp(r, src_h - r);
+                    // 2. Write the updated params back.
+                    if let Some(ref mut params) = state.borrow_mut().params {
+                        params.cx = new_cx;
+                        params.cy = new_cy;
+                    }
+                    // 3. Trigger a re-layout so the overlay's
+                    // `get_child_position` callback fires and repositions
+                    // the indicator at the new crop.
+                    overlay.queue_allocate();
+                    // Sequence is already claimed in drag_begin, so the
+                    // event won't bubble to the window drag handler.
+                });
+            }
+            frame.add_controller(gesture);
+        }
+
+        // --- Scroll gesture for zoom ---
+        {
+            let state = state.clone();
+            let overlay = overlay.clone();
+            let scroll = gtk::EventControllerScroll::new(
+                gtk::EventControllerScrollFlags::VERTICAL,
+            );
+            scroll.connect_scroll(move |_scroll, _dx, dy| {
+                // Read current state values.
+                let (src_w, src_h, r, cx, cy) = {
+                    let s = state.borrow();
+                    let d = match s.decoded.as_ref() {
+                        Some(v) => v,
+                        None => return glib::Propagation::Proceed,
+                    };
+                    let p = match s.params.as_ref() {
+                        Some(v) => v,
+                        None => return glib::Propagation::Proceed,
+                    };
+                    (d.width as f64, d.height as f64, p.r, p.cx, p.cy)
+                };
+                let factor = if dy > 0.0 { 1.1 } else { 0.9 };
+                let new_r =
+                    (r * factor).clamp(32.0, src_w.min(src_h) / 2.0);
+                let new_cx = cx.clamp(new_r, src_w - new_r);
+                let new_cy = cy.clamp(new_r, src_h - new_r);
+                // Write back.
+                if let Some(ref mut params) = state.borrow_mut().params {
+                    params.r = new_r;
+                    params.cx = new_cx;
+                    params.cy = new_cy;
+                }
+                // Trigger a re-layout so the overlay's get_child_position
+                // callback fires and repositions the indicator at the new
+                // crop.
+                overlay.queue_allocate();
+                glib::Propagation::Stop
+            });
+            picture.add_controller(scroll);
+        }
+
+        // --- File picker callback ---
+        {
+            let state = state.clone();
+            let status = status_label.clone();
+            let picture = picture.clone();
+            let crop_box = crop_box.clone();
+            let overlay = overlay.clone();
+            let remove_btn_for_fp = remove_btn.clone();
+            choose_btn.connect_clicked(move |btn| {
+                let win = btn
+                    .root()
+                    .and_then(|r| r.downcast::<gtk::Window>().ok());
+                let dialog = file_dialog.clone();
+                let state = state.clone();
+                let status = status.clone();
+                let picture = picture.clone();
+                let crop_box = crop_box.clone();
+                let overlay = overlay.clone();
+                let remove_btn = remove_btn_for_fp.clone();
+                dialog.open(win.as_ref(), gtk::gio::Cancellable::NONE, move |res| {
+                    if let Ok(file) = res {
+                        if let Some(path) = file.path() {
+                            let basename = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "file".to_string());
+                            // Decode on the main thread (acceptable for v1).
+                            match crate::image::decode_image_rgba(&path, None) {
+                                Ok(decoded) => {
+                                    let src_w = decoded.width as f64;
+                                    let src_h = decoded.height as f64;
+                                    let r_val = src_w.min(src_h) / 2.0;
+                                    let params_val = crate::image::CropParams {
+                                        cx: src_w / 2.0,
+                                        cy: src_h / 2.0,
+                                        r: r_val,
+                                    };
+                                    // Store in state
+                                    {
+                                        let mut s = state.borrow_mut();
+                                        s.picked_path = Some(path.clone());
+                                        s.decoded = Some(decoded);
+                                        s.params = Some(params_val);
+                                        s.removal_requested = false;
+                                    }
+                                    // Show the image in the picture widget
+                                    if let Some(texture) =
+                                        load_texture(&path.to_string_lossy())
+                                    {
+                                        picture.set_paintable(Some(&texture));
+                                    }
+                                    // Trigger a re-layout so the overlay's
+                                    // get_child_position callback fires and
+                                    // positions the indicator at the
+                                    // centered crop.
+                                    overlay.queue_allocate();
+                                    crop_box.set_visible(true);
+                                    status.set_label(&format!("Picked: {basename}"));
+                                    remove_btn.set_visible(true);
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to decode image: {e}");
+                                    status.set_label(&format!(
+                                        "Failed to load: {basename}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+        }
+
+        // Photo row: [Choose Photo… button] + [status label] + [Remove Photo]
+        let photo_hbox = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .build();
+        photo_hbox.append(&choose_btn);
+        photo_hbox.append(&status_label);
+        photo_hbox.append(&remove_btn);
+
+        // Main extra child: vertical box containing both sections
+        let box_ = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(12)
+            .margin_bottom(12)
+            .build();
+        box_.append(&name_label);
+        box_.append(&entry);
+        box_.append(&photo_label);
+        box_.append(&photo_hbox);
+        box_.append(&crop_box);
+
+        let dialog = adw::AlertDialog::new(Some("Edit Chat"), None);
+        dialog.set_extra_child(Some(&box_));
+        dialog.add_responses(&[("cancel", "Cancel"), ("save", "Save")]);
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("save"));
         dialog.set_close_response("cancel");
 
         let ui = self.clone();
         let chat_id = chat.id;
+        let avatars_dir = glib::user_data_dir().join("openbubbles-gtk").join("avatars");
         dialog.connect_response(None, move |_dlg, resp| {
-            if resp != "rename" {
+            if resp != "save" {
                 return;
             }
             let trimmed = entry.text().trim().to_string();
@@ -1656,11 +2079,68 @@ impl Ui {
             let store = ui.store.clone();
             let ui2 = ui.clone();
             let name_for_db = name.clone();
+            let avatars_dir = avatars_dir.clone();
+
+            // Determine AvatarEdit from photo edit state.
+            let avatar_edit = {
+                let s = state.borrow();
+                if s.removal_requested {
+                    crate::ui::AvatarEdit::Remove
+                } else if let (Some(_path), Some(decoded), Some(params)) =
+                    (s.picked_path.as_ref(), s.decoded.as_ref(), s.params.as_ref())
+                {
+                    match crate::image::render_avatar(decoded, params) {
+                        Ok(rendered) => {
+                            // Encode the 256×256 rendered RGBA to PNG bytes,
+                            // matching the encoding in image::save_png.
+                            let stride = rendered.width as usize * 4;
+                            let pixbuf_bytes =
+                                glib::Bytes::from_owned(rendered.pixels);
+                            let pb = gtk::gdk_pixbuf::Pixbuf::from_bytes(
+                                &pixbuf_bytes,
+                                gtk::gdk_pixbuf::Colorspace::Rgb,
+                                true,
+                                8,
+                                rendered.width as i32,
+                                rendered.height as i32,
+                                stride as i32,
+                            );
+                            match pb.save_to_bufferv("png", &[]) {
+                                Ok(png_bytes) => {
+                                    crate::ui::AvatarEdit::Replace(png_bytes)
+                                }
+                                Err(e) => {
+                                    eprintln!("PNG encode failed: {e}");
+                                    crate::ui::AvatarEdit::NoChange
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("render_avatar failed: {e}");
+                            crate::ui::AvatarEdit::NoChange
+                        }
+                    }
+                } else {
+                    crate::ui::AvatarEdit::NoChange
+                }
+            };
+
+            let state_for_done = state.clone();
+            let avatars_dir_for_done = avatars_dir.clone();
             gtk_bridge::spawn(
-                async move { store.set_chat_custom_name(chat_id, name_for_db).await },
+                async move {
+                    crate::ui::apply_chat_edit(
+                        &store,
+                        chat_id,
+                        &avatars_dir,
+                        name_for_db,
+                        avatar_edit,
+                    )
+                    .await
+                },
                 move |res| {
                     if let Err(e) = res {
-                        eprintln!("rename error: {e:#}");
+                        eprintln!("edit chat error: {e:#}");
                         return;
                     }
                     // Reflect in the open chat's header right away, then rebuild the
@@ -1669,6 +2149,23 @@ impl Ui {
                         let mut g = ui2.open_summary.borrow_mut();
                         if let Some(open) = g.as_mut().filter(|o| o.id == chat_id) {
                             open.custom_name = name.clone();
+                            // Update the in-memory avatar path to keep the UI
+                            // consistent until the sidebar reloads.
+                            let s = state_for_done.borrow();
+                            if s.removal_requested {
+                                open.custom_avatar_path = None;
+                            } else if s.picked_path.is_some() {
+                                // A Replace was committed — the DB now has the
+                                // path to {avatars_dir}/{chat_id}.png.
+                                let target =
+                                    avatars_dir_for_done.join(format!("{chat_id}.png"));
+                                if let Ok(abs) = std::path::absolute(&target) {
+                                    open.custom_avatar_path = Some(
+                                        abs.to_string_lossy().into_owned(),
+                                    );
+                                }
+                            }
+                            // NoChange: leave custom_avatar_path as-is.
                             ui2.content_page
                                 .set_title(&chat_title(open, &ui2.handles));
                         }
@@ -3619,6 +4116,149 @@ fn build_preview_bubble() -> gtk::Widget {
     bubble.upcast()
 }
 
+/// Return the custom avatar path for a chat if one is set and non-empty.
+/// Returns `None` for `None`, empty string, or whitespace-only values.
+/// Does NOT trim the returned path — leading whitespace is preserved for
+/// non-empty paths so that callers receive the raw stored value.
+fn chat_avatar_custom_path(c: &ChatSummary) -> Option<&str> {
+    c.custom_avatar_path.as_deref().filter(|p| !p.trim().is_empty())
+}
+
+/// Photo-editing state shared across the crop-UI closures inside
+/// `prompt_edit_chat`.  Not `pub` — internal to this module.
+#[allow(dead_code)]
+struct PhotoEditState {
+    /// The path the file picker returned, if the user picked a photo.
+    picked_path: Option<PathBuf>,
+    /// The decoded source image (RGBA).  `None` before a pick or after decode failure.
+    decoded: Option<crate::image::DecodedRgba>,
+    /// The current crop selection in source coordinates.
+    params: Option<crate::image::CropParams>,
+    /// `true` when the user clicked "Remove Photo".
+    removal_requested: bool,
+}
+
+/// Reposition and resize the circular crop indicator to match `params` for
+/// the given source image dimensions.  Called whenever the crop changes
+/// (initial load, drag pan, scroll zoom).
+///
+/// Uses the same `max` scale as the picture's `ContentFit::Cover`, so for
+/// non-square images (where the picture is side-clipped, not letterboxed)
+/// the visible circle sits over the displayed image.  The `x_offset` /
+/// `y_offset` terms account for the symmetric clip: when the source is
+/// scaled up to fill the frame, any excess (above the frame size) is split
+/// evenly between the two sides and must be subtracted to land the
+/// indicator on the visible image.
+///
+/// NOTE: this helper is no longer called directly.  The crop UI now uses
+/// `GtkOverlay::connect_get_child_position` (set up in `prompt_edit_chat`)
+/// which returns an absolute `gdk::Rectangle` for the indicator — not a CSS
+/// margin.  That is what allows negative coordinates, so the circle can
+/// extend past the overlay's bounds when the user drags the crop off the
+/// photo's edge.  Callers that previously invoked this function now just
+/// call `overlay.queue_allocate()` to retrigger the layout pass that fires
+/// the callback.  This function is kept only for the comment block above
+/// the math, which documents the symmetric clip math that the callback
+/// reproduces inline.
+#[allow(dead_code)]
+fn _update_crop_indicator_math_doc(
+    _indicator: &gtk::Frame,
+    src_w: f64,
+    src_h: f64,
+    params: &crate::image::CropParams,
+) {
+    let frame_size = 256.0;
+    let scale = (frame_size / src_w).max(frame_size / src_h);
+    let scaled_w = src_w * scale;
+    let scaled_h = src_h * scale;
+    // Symmetric clip from Cover: half the excess on each side.  For a
+    // square source, both offsets are 0 and the math reduces to the
+    // simple `params.cx * scale` form.
+    let x_offset = ((scaled_w - frame_size) / 2.0).max(0.0);
+    let y_offset = ((scaled_h - frame_size) / 2.0).max(0.0);
+    let display_r = params.r * scale;
+    let display_cx = params.cx * scale - x_offset;
+    let display_cy = params.cy * scale - y_offset;
+    let dia = (display_r * 2.0).round().max(1.0) as i32;
+    let x = (display_cx - display_r).round() as i32;
+    let y = (display_cy - display_r).round() as i32;
+    let _ = (dia, x, y);
+}
+
+/// What should happen to the chat's custom avatar during this edit?
+#[allow(dead_code)]
+#[derive(Clone)]
+pub enum AvatarEdit {
+    /// Don't touch the avatar file or the column. Used when the user opened
+    /// the dialog and clicked Save without changing the photo.
+    NoChange,
+    /// Write `bytes` to `avatars_dir/{chat_id}.png` and set the column to the
+    /// absolute path. Overwrites any existing file at that path.
+    Replace(Vec<u8>),
+    /// Delete `avatars_dir/{chat_id}.png` if it exists, and clear the column.
+    /// Idempotent: succeeds even if no file was there.
+    Remove,
+}
+
+/// Apply a chat name/avatar edit: write the avatar file (if changing), then
+/// write both `custom_name` and `custom_avatar_path` to the store.
+///
+/// The avatar file is written BEFORE the store columns, so a successful DB
+/// write implies a successful file write. On failure the caller is responsible
+/// for cleaning up the file if needed.
+#[allow(dead_code)]
+pub async fn apply_chat_edit(
+    store: &Store,
+    chat_id: i64,
+    avatars_dir: &Path,
+    name: Option<String>,
+    avatar: AvatarEdit,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let name = name.filter(|n| !n.trim().is_empty());
+
+    // Ensure the avatars directory exists before any file operation.  The
+    // production caller passes `glib::user_data_dir().join("openbubbles-gtk")
+    // .join("avatars")` which may not exist on first run — without this,
+    // `std::fs::write` below would fail with ENOENT.  `create_dir_all` is
+    // idempotent (succeeds if the directory already exists) and creates
+    // any missing parent directories.
+    std::fs::create_dir_all(avatars_dir)?;
+
+    match avatar {
+        AvatarEdit::Replace(bytes) => {
+            let target = avatars_dir.join(format!("{chat_id}.png"));
+            // Write atomically: write to a temp file, then rename so a partial
+            // write never leaves a half-written file at the target path.
+            let tmp = avatars_dir.join(format!("{chat_id}.png.tmp"));
+            std::fs::write(&tmp, &bytes)?;
+            if let Err(e) = std::fs::rename(&tmp, &target) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+            let abs_path = std::path::absolute(&target)?;
+            store.set_chat_custom_name(chat_id, name).await?;
+            store
+                .set_chat_custom_avatar(chat_id, Some(abs_path.to_string_lossy().into_owned()))
+                .await?;
+        }
+        AvatarEdit::Remove => {
+            let target = avatars_dir.join(format!("{chat_id}.png"));
+            // Delete the file if it exists; ignore NotFound (idempotent).
+            match std::fs::remove_file(&target) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+            store.set_chat_custom_name(chat_id, name).await?;
+            store.set_chat_custom_avatar(chat_id, None).await?;
+        }
+        AvatarEdit::NoChange => {
+            store.set_chat_custom_name(chat_id, name).await?;
+        }
+    }
+
+    Ok(())
+}
+
 /// A sidebar row: avatar + chat name + unread badge.
 fn chat_row(c: &ChatSummary, handles: &[String]) -> gtk::ListBoxRow {
     let title = chat_title(c, handles);
@@ -3636,6 +4276,14 @@ fn chat_row(c: &ChatSummary, handles: &[String]) -> gtk::ListBoxRow {
 
     let avatar = adw::Avatar::new(36, Some(&title), true);
     avatar.set_hexpand(false);
+
+    // Override with custom avatar photo if one is set and loadable.
+    if let Some(path) = chat_avatar_custom_path(c) {
+        if let Some(texture) = load_texture(path) {
+            avatar.set_custom_image(Some(&texture));
+        }
+    }
+
     box_.append(&avatar);
 
     let title_label = gtk::Label::new(Some(&title));
@@ -5259,6 +5907,99 @@ mod tests {
         let result = parse_uri_list("file:///a\r\nfile:///b\r\n");
         assert_eq!(result, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
     }
+
+    // --- chat_avatar_custom_path tests ---
+
+    #[test]
+    fn chat_avatar_custom_path_returns_some_for_set_path() {
+        let c = ChatSummary {
+            id: 0,
+            key: String::new(),
+            display_name: None,
+            is_group: false,
+            service: None,
+            last_message_date: None,
+            participants: vec![],
+            unread: 0,
+            custom_name: None,
+            custom_avatar_path: Some("/some/path/avatar.png".into()),
+        };
+        let result = super::chat_avatar_custom_path(&c);
+        assert_eq!(result, Some("/some/path/avatar.png"));
+    }
+
+    #[test]
+    fn chat_avatar_custom_path_returns_none_when_unset() {
+        let c = ChatSummary {
+            id: 0,
+            key: String::new(),
+            display_name: None,
+            is_group: false,
+            service: None,
+            last_message_date: None,
+            participants: vec![],
+            unread: 0,
+            custom_name: None,
+            custom_avatar_path: None,
+        };
+        let result = super::chat_avatar_custom_path(&c);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn chat_avatar_custom_path_filters_empty_string() {
+        let c = ChatSummary {
+            id: 0,
+            key: String::new(),
+            display_name: None,
+            is_group: false,
+            service: None,
+            last_message_date: None,
+            participants: vec![],
+            unread: 0,
+            custom_name: None,
+            custom_avatar_path: Some("".into()),
+        };
+        let result = super::chat_avatar_custom_path(&c);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn chat_avatar_custom_path_filters_whitespace_only() {
+        let c = ChatSummary {
+            id: 0,
+            key: String::new(),
+            display_name: None,
+            is_group: false,
+            service: None,
+            last_message_date: None,
+            participants: vec![],
+            unread: 0,
+            custom_name: None,
+            custom_avatar_path: Some("   ".into()),
+        };
+        let result = super::chat_avatar_custom_path(&c);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn chat_avatar_custom_path_preserves_leading_whitespace_when_not_empty() {
+        let input = "  /x.png".to_string();
+        let c = ChatSummary {
+            id: 0,
+            key: String::new(),
+            display_name: None,
+            is_group: false,
+            service: None,
+            last_message_date: None,
+            participants: vec![],
+            unread: 0,
+            custom_name: None,
+            custom_avatar_path: Some(input.clone()),
+        };
+        let result = super::chat_avatar_custom_path(&c);
+        assert_eq!(result, Some(input.as_str()));
+    }
 }
 
 /// A single entry in the Apple tapback reaction table.
@@ -6282,4 +7023,316 @@ mod plan_chat_update_tests {
         );
     }
 } // mod plan_chat_update_tests
+
+#[cfg(test)]
+mod avatar_save_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Ingest a 1:1 message to create a chat and return its id.
+    async fn ingest_chat(store: &Store) -> i64 {
+        store
+            .apply(Ingest::Message(IncomingMessage {
+                guid: "avatar-save-test".into(),
+                chat: ChatRef {
+                    participants: vec![
+                        "mailto:alice@example.com".into(),
+                        "mailto:bob@example.com".into(),
+                    ],
+                    display_name: None,
+                    service: Some("iMessage".into()),
+                },
+                sender: Some("mailto:bob@example.com".into()),
+                is_from_me: false,
+                text: Some("Hello".into()),
+                date: 1000,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        store.chats().await.unwrap().remove(0).id
+    }
+
+    // ── test 1: Replace writes both file and DB columns ────────────────────
+
+    #[tokio::test]
+    async fn apply_chat_edit_writes_avatar_file_and_db_columns() {
+        let store = Store::open_in_memory().await.unwrap();
+        let chat_id = ingest_chat(&store).await;
+        let tmp = TempDir::new().unwrap();
+
+        let result = apply_chat_edit(
+            &store,
+            chat_id,
+            tmp.path(),
+            Some("New Name".into()),
+            AvatarEdit::Replace(vec![1, 2, 3, 4]),
+        )
+        .await;
+
+        assert!(result.is_ok());
+
+        let expected_path = tmp.path().join(format!("{chat_id}.png"));
+        assert!(expected_path.exists(), "avatar file should exist on disk");
+        let written = std::fs::read(&expected_path).unwrap();
+        assert_eq!(written, vec![1, 2, 3, 4], "file content should match the bytes passed to Replace");
+
+        let chats = store.chats().await.unwrap();
+        let chat = chats.into_iter().find(|c| c.id == chat_id).unwrap();
+        assert_eq!(chat.custom_name.as_deref(), Some("New Name"));
+        assert_eq!(
+            chat.custom_avatar_path.as_deref(),
+            Some(expected_path.to_str().unwrap()),
+            "DB custom_avatar_path should be the absolute path to the file"
+        );
+    }
+
+    // ── test 2: Remove clears DB column and deletes file ──────────────────
+
+    #[tokio::test]
+    async fn apply_chat_edit_remove_clears_db_and_deletes_file() {
+        let store = Store::open_in_memory().await.unwrap();
+        let chat_id = ingest_chat(&store).await;
+        let tmp = TempDir::new().unwrap();
+
+        // Write an avatar file and set the DB column as pre-condition.
+        let avatar_path = tmp.path().join(format!("{chat_id}.png"));
+        std::fs::write(&avatar_path, vec![1, 2, 3, 4]).unwrap();
+        store
+            .set_chat_custom_avatar(chat_id, Some(avatar_path.to_str().unwrap().into()))
+            .await
+            .unwrap();
+        store
+            .set_chat_custom_name(chat_id, Some("Original".into()))
+            .await
+            .unwrap();
+
+        let result = apply_chat_edit(&store, chat_id, tmp.path(), None, AvatarEdit::Remove).await;
+
+        assert!(result.is_ok());
+        assert!(!avatar_path.exists(), "Remove should delete the avatar file");
+
+        let chats = store.chats().await.unwrap();
+        let chat = chats.into_iter().find(|c| c.id == chat_id).unwrap();
+        assert!(
+            chat.custom_avatar_path.is_none(),
+            "Remove should clear custom_avatar_path in the DB"
+        );
+        assert!(
+            chat.custom_name.is_none(),
+            "name=None should clear custom_name"
+        );
+    }
+
+    // ── test 3: Remove is idempotent when no file exists ──────────────────
+
+    #[tokio::test]
+    async fn apply_chat_edit_remove_idempotent_when_no_file() {
+        let store = Store::open_in_memory().await.unwrap();
+        let chat_id = ingest_chat(&store).await;
+        let tmp = TempDir::new().unwrap();
+
+        // No avatar file exists at all — Remove should still succeed.
+        let result =
+            apply_chat_edit(&store, chat_id, tmp.path(), Some("Name".into()), AvatarEdit::Remove)
+                .await;
+
+        assert!(result.is_ok(), "Remove should succeed even when no file exists");
+
+        let chats = store.chats().await.unwrap();
+        let chat = chats.into_iter().find(|c| c.id == chat_id).unwrap();
+        assert_eq!(chat.custom_name.as_deref(), Some("Name"));
+        assert!(
+            chat.custom_avatar_path.is_none(),
+            "custom_avatar_path should remain None"
+        );
+    }
+
+    // ── test 4: Replace overwrites an existing file ───────────────────────
+
+    #[tokio::test]
+    async fn apply_chat_edit_replace_overwrites_existing_file() {
+        let store = Store::open_in_memory().await.unwrap();
+        let chat_id = ingest_chat(&store).await;
+        let tmp = TempDir::new().unwrap();
+
+        // Write old content first.
+        let avatar_path = tmp.path().join(format!("{chat_id}.png"));
+        std::fs::write(&avatar_path, vec![10, 20, 30, 40]).unwrap();
+
+        let result = apply_chat_edit(
+            &store,
+            chat_id,
+            tmp.path(),
+            None,
+            AvatarEdit::Replace(vec![1, 2, 3, 4]),
+        )
+        .await;
+
+        assert!(result.is_ok());
+
+        let written = std::fs::read(&avatar_path).unwrap();
+        assert_eq!(
+            written,
+            vec![1, 2, 3, 4],
+            "Replace should overwrite file with new bytes"
+        );
+
+        let chats = store.chats().await.unwrap();
+        let chat = chats.into_iter().find(|c| c.id == chat_id).unwrap();
+        assert_eq!(
+            chat.custom_avatar_path.as_deref(),
+            Some(avatar_path.to_str().unwrap()),
+            "Replace should set the DB column to the absolute path"
+        );
+    }
+
+    // ── test 5: NoChange leaves everything as-is ──────────────────────────
+
+    #[tokio::test]
+    async fn apply_chat_edit_no_change_does_not_touch_file_or_db() {
+        let store = Store::open_in_memory().await.unwrap();
+        let chat_id = ingest_chat(&store).await;
+        let tmp = TempDir::new().unwrap();
+
+        // Pre-set both columns via the store (no file needed).
+        store
+            .set_chat_custom_name(chat_id, Some("Original".into()))
+            .await
+            .unwrap();
+        store
+            .set_chat_custom_avatar(chat_id, Some("/path/to/old.png".into()))
+            .await
+            .unwrap();
+
+        let result = apply_chat_edit(
+            &store,
+            chat_id,
+            tmp.path(),
+            Some("Original".into()),
+            AvatarEdit::NoChange,
+        )
+        .await;
+
+        assert!(result.is_ok());
+
+        let chats = store.chats().await.unwrap();
+        let chat = chats.into_iter().find(|c| c.id == chat_id).unwrap();
+        assert_eq!(
+            chat.custom_name.as_deref(),
+            Some("Original"),
+            "NoChange should not alter custom_name"
+        );
+        assert_eq!(
+            chat.custom_avatar_path.as_deref(),
+            Some("/path/to/old.png"),
+            "NoChange should not alter custom_avatar_path"
+        );
+    }
+
+    // ── test 6: Whitespace-only name normalizes to None ───────────────────
+
+    #[tokio::test]
+    async fn apply_chat_edit_empty_name_normalizes_to_none() {
+        let store = Store::open_in_memory().await.unwrap();
+        let chat_id = ingest_chat(&store).await;
+        let tmp = TempDir::new().unwrap();
+
+        let result = apply_chat_edit(
+            &store,
+            chat_id,
+            tmp.path(),
+            Some("   ".into()),
+            AvatarEdit::NoChange,
+        )
+        .await;
+
+        assert!(result.is_ok());
+
+        let chats = store.chats().await.unwrap();
+        let chat = chats.into_iter().find(|c| c.id == chat_id).unwrap();
+        assert!(
+            chat.custom_name.is_none(),
+            "whitespace-only name should normalize to None"
+        );
+    }
+
+    // ── test 7: Replace with valid PNG bytes round-trips through decode ──
+
+    #[tokio::test]
+    async fn apply_chat_edit_with_replace_bytes_writes_a_valid_png() {
+        let store = Store::open_in_memory().await.unwrap();
+        let chat_id = ingest_chat(&store).await;
+        let tmp = TempDir::new().unwrap();
+
+        // Build a 2×2 RGBA image and save it to a temp file via save_png.
+        let src = crate::image::DecodedRgba {
+            width: 2,
+            height: 2,
+            pixels: vec![
+                255, 0, 0, 255,    // (0,0) red
+                0, 255, 0, 255,    // (1,0) green
+                0, 0, 255, 255,    // (0,1) blue
+                128, 128, 128, 128, // (1,1) semi-transparent grey
+            ],
+        };
+        let png_temp = TempDir::new().unwrap();
+        let png_path = png_temp.path().join("seed.png");
+        crate::image::save_png(&src, &png_path).unwrap();
+        let png_bytes = std::fs::read(&png_path).unwrap();
+
+        let result = apply_chat_edit(
+            &store,
+            chat_id,
+            tmp.path(),
+            None,
+            AvatarEdit::Replace(png_bytes),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let avatar_path = tmp.path().join(format!("{chat_id}.png"));
+        let decoded = crate::image::decode_image_rgba(&avatar_path, None)
+            .expect("apply_chat_edit should write a decodable PNG");
+        assert_eq!(decoded.width, src.width, "width should round-trip");
+        assert_eq!(decoded.height, src.height, "height should round-trip");
+        assert_eq!(decoded.pixels, src.pixels, "pixels should round-trip through apply_chat_edit");
+    }
+
+    // ── test 8: Replace auto-creates avatars_dir if missing ───────────────
+
+    #[tokio::test]
+    async fn apply_chat_edit_creates_avatars_dir_if_missing() {
+        let store = Store::open_in_memory().await.unwrap();
+        let chat_id = ingest_chat(&store).await;
+        let tmp = TempDir::new().unwrap();
+
+        let avatars_dir = tmp.path().join("avatars");
+        assert!(
+            !avatars_dir.exists(),
+            "avatars subdirectory should not exist before the call"
+        );
+
+        let result = apply_chat_edit(
+            &store,
+            chat_id,
+            &avatars_dir,
+            None,
+            AvatarEdit::Replace(vec![1, 2, 3, 4]),
+        )
+        .await;
+
+        assert!(result.is_ok(), "apply_chat_edit should create avatars_dir and succeed");
+
+        assert!(
+            avatars_dir.exists(),
+            "avatars subdirectory should have been auto-created"
+        );
+
+        let avatar_path = avatars_dir.join(format!("{chat_id}.png"));
+        assert!(avatar_path.exists(), "avatar file should exist");
+        let written = std::fs::read(&avatar_path).unwrap();
+        assert_eq!(written, vec![1, 2, 3, 4], "file content should match the bytes passed to Replace");
+    }
+}
 

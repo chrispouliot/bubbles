@@ -153,6 +153,10 @@ pub struct ChatSummary {
     /// User-set name overriding the derived title; `None` falls back to the
     /// Apple group name or the participants.
     pub custom_name: Option<String>,
+    /// User-set custom avatar path overriding any derived avatar; `None` falls
+    /// back to the derived avatar (participant photos, group initials, etc.).
+    #[allow(dead_code)]
+    pub custom_avatar_path: Option<String>,
 }
 
 /// A freshly-arrived inbound message, used to drive desktop notifications.

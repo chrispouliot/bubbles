@@ -138,6 +138,12 @@ pub fn migrate(c: &Connection) -> rusqlite::Result<()> {
         c.execute_batch(DDL_V4)?;
         v = 4;
     }
+    if v < 5 {
+        // User-set custom avatar path, a local override that survives chat upsert
+        // (like custom_name). Kept separate from any derived avatar.
+        c.execute_batch("ALTER TABLE chat ADD COLUMN custom_avatar_path TEXT;")?;
+        v = 5;
+    }
     c.pragma_update(None, "user_version", v)?;
     Ok(())
 }
@@ -486,7 +492,8 @@ pub fn query_chats(c: &Connection) -> rusqlite::Result<Vec<ChatSummary>> {
                 COALESCE(GROUP_CONCAT(h.address, ';'), ''),
                 (SELECT COUNT(*) FROM message m
                    WHERE m.chat_id = c.id AND m.is_from_me = 0 AND m.read_sent = 0),
-                c.custom_name
+                c.custom_name,
+                c.custom_avatar_path
          FROM chat c
          LEFT JOIN chat_participant cp ON cp.chat_id = c.id
          LEFT JOIN handle h            ON h.id = cp.handle_id
@@ -509,6 +516,7 @@ pub fn query_chats(c: &Connection) -> rusqlite::Result<Vec<ChatSummary>> {
             },
             unread: r.get(7)?,
             custom_name: r.get(8)?,
+            custom_avatar_path: r.get(9)?,
         })
     })?;
     rows.collect()
@@ -744,6 +752,23 @@ impl Store {
                 c.execute(
                     "UPDATE chat SET custom_name = ?1 WHERE id = ?2",
                     params![name, chat_id],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Set (or, with `None`/empty, clear) a conversation's custom avatar path.
+    /// This is a local override and survives chat upsert (like custom_name).
+    #[allow(dead_code)]
+    pub async fn set_chat_custom_avatar(&self, chat_id: i64, path: Option<String>) -> Result<()> {
+        let path = path.filter(|p| !p.trim().is_empty());
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE chat SET custom_avatar_path = ?1 WHERE id = ?2",
+                    params![path, chat_id],
                 )?;
                 Ok(())
             })
@@ -1741,5 +1766,163 @@ mod tests {
         let msgs = query_messages(&c, chat_id).unwrap();
         let base = msgs.iter().find(|m| m.guid == "BASE").unwrap();
         assert_eq!(base.send_error, None);
+    }
+
+    // --- custom chat avatar photo (v5) ---
+
+    #[tokio::test]
+    async fn set_chat_custom_avatar_round_trip() {
+        let store = Store::open_in_memory().await.unwrap();
+        store
+            .apply(Ingest::Message(msg("AVATAR-RT", 1000)))
+            .await
+            .unwrap();
+        let chat_id = store.chats().await.unwrap()[0].id;
+        store
+            .set_chat_custom_avatar(chat_id, Some("/some/path/avatar.png".into()))
+            .await
+            .unwrap();
+        let chats = store.chats().await.unwrap();
+        let chat = chats.into_iter().find(|c| c.id == chat_id).unwrap();
+        assert_eq!(
+            chat.custom_avatar_path.as_deref(),
+            Some("/some/path/avatar.png")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_chat_custom_avatar_clears_with_none() {
+        let store = Store::open_in_memory().await.unwrap();
+        store
+            .apply(Ingest::Message(msg("AVATAR-CLEAR", 1000)))
+            .await
+            .unwrap();
+        let chat_id = store.chats().await.unwrap()[0].id;
+
+        // Set a path first.
+        store
+            .set_chat_custom_avatar(chat_id, Some("/path/to/avatar.png".into()))
+            .await
+            .unwrap();
+        let chats = store.chats().await.unwrap();
+        let chat = chats.into_iter().find(|c| c.id == chat_id).unwrap();
+        assert!(
+            chat.custom_avatar_path.is_some(),
+            "path should be set before the clear"
+        );
+
+        // Clear with None.
+        store
+            .set_chat_custom_avatar(chat_id, None)
+            .await
+            .unwrap();
+        let chats = store.chats().await.unwrap();
+        let chat = chats.into_iter().find(|c| c.id == chat_id).unwrap();
+        assert!(
+            chat.custom_avatar_path.is_none(),
+            "None should clear the path"
+        );
+
+        // Empty string should also clear it (mirrors set_chat_custom_name).
+        store
+            .set_chat_custom_avatar(chat_id, Some("/other/path.png".into()))
+            .await
+            .unwrap();
+        store
+            .set_chat_custom_avatar(chat_id, Some("".into()))
+            .await
+            .unwrap();
+        let chats = store.chats().await.unwrap();
+        let chat = chats.into_iter().find(|c| c.id == chat_id).unwrap();
+        assert!(
+            chat.custom_avatar_path.is_none(),
+            "empty string should normalize to None"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_chat_has_no_custom_avatar_path_by_default() {
+        let store = Store::open_in_memory().await.unwrap();
+        store
+            .apply(Ingest::Message(msg("AVATAR-DEFAULT", 1000)))
+            .await
+            .unwrap();
+        let chats = store.chats().await.unwrap();
+        let chat = chats.into_iter().find(|c| !c.participants.is_empty()).unwrap();
+        assert!(
+            chat.custom_avatar_path.is_none(),
+            "fresh chat should have no custom avatar path"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_avatar_path_survives_chat_upsert() {
+        let store = Store::open_in_memory().await.unwrap();
+        // First message creates the chat.
+        store
+            .apply(Ingest::Message(msg("UPSERT-1", 1000)))
+            .await
+            .unwrap();
+        let chat_id = store.chats().await.unwrap()[0].id;
+
+        // Set a custom avatar path.
+        store
+            .set_chat_custom_avatar(chat_id, Some("/path/survives.png".into()))
+            .await
+            .unwrap();
+
+        // A second message re-upserts the same chat (same ChatRef -> same key).
+        store
+            .apply(Ingest::Message(msg("UPSERT-2", 2000)))
+            .await
+            .unwrap();
+
+        let chats = store.chats().await.unwrap();
+        let chat = chats.into_iter().find(|c| c.id == chat_id).unwrap();
+        assert_eq!(
+            chat.custom_avatar_path.as_deref(),
+            Some("/path/survives.png"),
+            "custom avatar path must survive a chat upsert"
+        );
+    }
+
+    #[test]
+    fn migration_v4_to_v5_adds_column() {
+        let c = Connection::open_in_memory().unwrap();
+        // Apply v1–v4 schema manually, setting user_version to 4 between steps.
+        c.execute_batch(DDL).unwrap();
+        c.pragma_update(None, "user_version", 1).unwrap();
+        c.execute_batch(
+            "ALTER TABLE message ADD COLUMN read_sent INTEGER NOT NULL DEFAULT 0;",
+        )
+        .unwrap();
+        c.pragma_update(None, "user_version", 2).unwrap();
+        c.execute_batch("ALTER TABLE chat ADD COLUMN custom_name TEXT;")
+            .unwrap();
+        c.pragma_update(None, "user_version", 3).unwrap();
+        c.execute_batch(DDL_V4).unwrap();
+        c.pragma_update(None, "user_version", 4).unwrap();
+
+        // Now run the full migrate — this should add v5.
+        migrate(&c).unwrap();
+
+        // Assert the column exists.
+        let col_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('chat') WHERE name = 'custom_avatar_path'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            col_count, 1,
+            "custom_avatar_path column must exist on chat after v5 migration"
+        );
+
+        // Assert user_version bumped to 5.
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 5, "user_version must be 5 after migration");
     }
 }

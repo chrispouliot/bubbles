@@ -519,6 +519,212 @@ fn apply_max_edge(decoded: DecodedRgba, max_edge: Option<u32>) -> DecodedRgba {
     DecodedRgba { width: w, height: h, pixels }
 }
 
+/// Extract a rectangular sub-region from a tightly-packed RGBA source.
+///
+/// Returns a new [`DecodedRgba`] with `width = w`, `height = h`, and pixels
+/// copied from the region `(x, y)` .. `(x + w, y + h)` of `src`.
+///
+/// # Errors
+///
+/// Returns [`ImageLoadError::DecodeFailed`] when any part of the requested
+/// region falls outside the source image bounds.
+#[allow(dead_code)]
+pub fn crop_rgba(
+    src: &DecodedRgba,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<DecodedRgba, ImageLoadError> {
+    let src_w = src.width;
+    let src_h = src.height;
+
+    if x + w > src_w || y + h > src_h {
+        return Err(ImageLoadError::DecodeFailed(format!(
+            "crop region ({x},{y}) {w}×{h} exceeds source {src_w}×{src_h}"
+        )));
+    }
+
+    let stride = src_w as usize * 4;
+    let row_byte_len = w as usize * 4;
+    let mut pixels = Vec::with_capacity(w as usize * h as usize * 4);
+
+    for row in 0..h {
+        let src_offset = ((y + row) as usize * stride) + (x as usize * 4);
+        pixels.extend_from_slice(&src.pixels[src_offset..src_offset + row_byte_len]);
+    }
+
+    Ok(DecodedRgba {
+        width: w,
+        height: h,
+        pixels,
+    })
+}
+
+/// Zero the alpha channel of every pixel whose centre lies strictly outside a
+/// centred circle.
+///
+/// The circle is centred at `(width/2, height/2)` with radius
+/// `min(width, height) / 2.0`.  Pixels inside the circle keep their original
+/// alpha; pixels outside have their alpha set to zero.  RGB values are
+/// unchanged.  Operates in place — no allocation.
+#[allow(dead_code)]
+pub fn apply_circle_mask(buf: &mut DecodedRgba) {
+    let w = buf.width;
+    let h = buf.height;
+    let cx = w as f64 / 2.0;
+    let cy = h as f64 / 2.0;
+    let radius = w.min(h) as f64 / 2.0;
+    let radius_sq = radius * radius;
+
+    for py in 0..h {
+        for px in 0..w {
+            let dx = px as f64 - cx;
+            let dy = py as f64 - cy;
+            if dx * dx + dy * dy > radius_sq {
+                let idx = ((py * w + px) * 4 + 3) as usize;
+                buf.pixels[idx] = 0;
+            }
+        }
+    }
+}
+
+/// Crop region in source-image coordinates (pixels of the picked image before
+/// any scaling). The crop is a square centered at (cx, cy) with half-side
+/// length r. The corresponding source rectangle is (cx - r, cy - r) to
+/// (cx + r, cy + r), clamped to the source image bounds.
+#[allow(dead_code)]
+pub struct CropParams {
+    pub cx: f64,
+    pub cy: f64,
+    pub r: f64,
+}
+
+/// Render a chat avatar from a source image and a crop selection. Returns a
+/// 256×256 RGBA buffer with the cropped circle, ready to feed into `save_png`.
+///
+/// Steps:
+///   1. Compute the source rectangle from `params`, clamped to [0, src_w] ×
+///      [0, src_h]. The rectangle must be non-empty (positive width and
+///      height).
+///   2. Crop the source to that rectangle (using the existing `crop_rgba`).
+///   3. Apply a circle mask centered in the cropped square (using the
+///      existing `apply_circle_mask`).
+///   4. Scale the masked square to 256×256 (use gdk-pixbuf bilinear scaling
+///      — see `apply_max_edge` for the pattern).
+///   5. Return the 256×256 `DecodedRgba`.
+///
+/// # Errors
+///
+/// Returns `ImageLoadError::DecodeFailed` when:
+///   - The crop is zero-area (e.g. `r == 0.0`, or `r` so small that the
+///     clamped rectangle is empty).
+///   - The crop is entirely outside the source (the clamped rectangle is
+///     empty).
+///   - Any underlying I/O / decode step fails (gdk-pixbuf allocation, etc.).
+#[allow(dead_code)]
+pub fn render_avatar(
+    src: &DecodedRgba,
+    params: &CropParams,
+) -> Result<DecodedRgba, ImageLoadError> {
+    // Step 1: clamp the crop rectangle to the source bounds.
+    let src_w = src.width as f64;
+    let src_h = src.height as f64;
+
+    let left = (params.cx - params.r).max(0.0);
+    let top = (params.cy - params.r).max(0.0);
+    let right = (params.cx + params.r).min(src_w);
+    let bottom = (params.cy + params.r).min(src_h);
+
+    if left >= right || top >= bottom {
+        return Err(ImageLoadError::DecodeFailed(
+            "crop region is empty after clamping to source bounds".to_string(),
+        ));
+    }
+
+    let x = left.floor() as u32;
+    let y = top.floor() as u32;
+    let w = right.ceil() as u32 - x;
+    let h = bottom.ceil() as u32 - y;
+
+    if w == 0 || h == 0 {
+        return Err(ImageLoadError::DecodeFailed(
+            "crop region is empty after clamping to source bounds".to_string(),
+        ));
+    }
+
+    // Step 2: crop
+    let mut cropped = crop_rgba(src, x, y, w, h)?;
+
+    // Step 3: apply circle mask
+    apply_circle_mask(&mut cropped);
+
+    // Step 4: scale to 256×256 via gdk-pixbuf bilinear
+    let target = 256i32;
+    let stride = cropped.width as usize * 4;
+    let bytes = glib::Bytes::from_owned(cropped.pixels);
+    let src_pb = gtk::gdk_pixbuf::Pixbuf::from_bytes(
+        &bytes,
+        gtk::gdk_pixbuf::Colorspace::Rgb,
+        true, // has_alpha
+        8,    // bits per sample
+        cropped.width as i32,
+        cropped.height as i32,
+        stride as i32,
+    );
+
+    let scaled = src_pb
+        .scale_simple(target, target, gtk::gdk_pixbuf::InterpType::Bilinear)
+        .ok_or_else(|| {
+            ImageLoadError::DecodeFailed("gdk-pixbuf scale_simple failed".to_string())
+        })?;
+
+    let w_out = scaled.width() as u32;
+    let h_out = scaled.height() as u32;
+    let scaled_stride = scaled.rowstride() as usize;
+    let src_bytes = scaled.read_pixel_bytes();
+    let src_bytes = src_bytes.as_ref();
+
+    let mut pixels = Vec::with_capacity(w_out as usize * h_out as usize * 4);
+    for row in 0..h_out as usize {
+        let slice = &src_bytes[row * scaled_stride..row * scaled_stride + w_out as usize * 4];
+        pixels.extend_from_slice(slice);
+    }
+
+    Ok(DecodedRgba {
+        width: w_out,
+        height: h_out,
+        pixels,
+    })
+}
+
+/// Write a [`DecodedRgba`] as a PNG file at `path`.
+///
+/// Uses gdk-pixbuf to encode the tightly-packed RGBA data as a PNG.
+#[allow(dead_code)]
+pub fn save_png(rgba: &DecodedRgba, path: &Path) -> Result<(), ImageLoadError> {
+    let stride = rgba.width as usize * 4;
+    let bytes = glib::Bytes::from_owned(rgba.pixels.clone());
+    let pb = gtk::gdk_pixbuf::Pixbuf::from_bytes(
+        &bytes,
+        gtk::gdk_pixbuf::Colorspace::Rgb,
+        true, // has_alpha — DecodedRgba is always RGBA
+        8,    // bits per sample
+        rgba.width as i32,
+        rgba.height as i32,
+        stride as i32,
+    );
+
+    let png_bytes = pb
+        .save_to_bufferv("png", &[])
+        .map_err(|e| ImageLoadError::DecodeFailed(e.to_string()))?;
+
+    std::fs::write(path, png_bytes)
+        .map_err(|e| ImageLoadError::DecodeFailed(e.to_string()))?;
+
+    Ok(())
+}
+
 /// Read the file at `path`, decode it (JPEG/PNG/etc. via gdk-pixbuf; HEIC/HEIF
 /// via libheif), apply EXIF orientation (JPEG/PNG only — libheif applies it
 /// internally), optionally cap the longer edge to `max_edge`, and return
@@ -692,6 +898,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::identity_op, clippy::erasing_op)]
     use super::*;
 
     /// The real HEIC fixture, embedded so we don't depend on a run-time working
@@ -1589,5 +1796,450 @@ mod tests {
             delivered, n,
             "all {n} items should be delivered, got {delivered}"
         );
+    }
+
+    // =======================================================================
+    // Unit 2 – custom chat avatar photo: image operations
+    // (crop_rgba, apply_circle_mask, save_png)
+    // =======================================================================
+
+    /// Build a 4×4 source buffer where each pixel's R encodes its column
+    /// and G encodes its row (R=0..3, G=0..3), B=0, A=255.
+    fn make_4x4_grid() -> DecodedRgba {
+        let mut pixels = Vec::with_capacity(4 * 4 * 4);
+        for row in 0..4 {
+            for col in 0..4 {
+                pixels.push(col as u8); // R = column
+                pixels.push(row as u8); // G = row
+                pixels.push(0);         // B = 0
+                pixels.push(255);       // A = 255
+            }
+        }
+        DecodedRgba {
+            width: 4,
+            height: 4,
+            pixels,
+        }
+    }
+
+    #[test]
+    fn crop_rgba_extracts_subregion() {
+        let src = make_4x4_grid();
+        let result = super::crop_rgba(&src, 1, 1, 2, 2).expect("crop should succeed");
+        assert_eq!(result.width, 2);
+        assert_eq!(result.height, 2);
+        assert_eq!(result.pixels.len(), 16);
+
+        // Pixel (col=1, row=1) → R=1, G=1
+        assert_eq!(result.pixels[0], 1, "pixel (0,0) in crop (source pos 1,1) R should be 1");
+        assert_eq!(result.pixels[1], 1, "pixel (0,0) in crop (source pos 1,1) G should be 1");
+        // Pixel (col=2, row=1) → R=2, G=1
+        assert_eq!(result.pixels[4], 2, "pixel (1,0) in crop (source pos 2,1) R should be 2");
+        assert_eq!(result.pixels[5], 1, "pixel (1,0) in crop (source pos 2,1) G should be 1");
+        // Pixel (col=1, row=2) → R=1, G=2
+        assert_eq!(result.pixels[8], 1, "pixel (0,1) in crop (source pos 1,2) R should be 1");
+        assert_eq!(result.pixels[9], 2, "pixel (0,1) in crop (source pos 1,2) G should be 2");
+        // Pixel (col=2, row=2) → R=2, G=2
+        assert_eq!(result.pixels[12], 2, "pixel (1,1) in crop (source pos 2,2) R should be 2");
+        assert_eq!(result.pixels[13], 2, "pixel (1,1) in crop (source pos 2,2) G should be 2");
+
+        // Source buffer is unchanged
+        assert_eq!(src.width, 4, "source width unchanged");
+        assert_eq!(src.height, 4, "source height unchanged");
+        assert_eq!(src.pixels.len(), 64, "source pixel count unchanged");
+        // Quick spot-check on source
+        assert_eq!(src.pixels[0], 0, "source pixel (0,0) R unchanged");
+        assert_eq!(src.pixels[1], 0, "source pixel (0,0) G unchanged");
+        assert_eq!(src.pixels[3], 255, "source pixel (0,0) A unchanged");
+    }
+
+    #[test]
+    fn crop_rgba_at_origin() {
+        let src = make_4x4_grid();
+        let result = super::crop_rgba(&src, 0, 0, 2, 2).expect("crop at origin should succeed");
+        assert_eq!(result.width, 2);
+        assert_eq!(result.height, 2);
+        assert_eq!(result.pixels.len(), 16);
+
+        // Top-left quadrant: (0,0), (1,0), (0,1), (1,1)
+        assert_eq!(result.pixels[0], 0, "pixel (0,0) R");
+        assert_eq!(result.pixels[1], 0, "pixel (0,0) G");
+        assert_eq!(result.pixels[4], 1, "pixel (1,0) R");
+        assert_eq!(result.pixels[5], 0, "pixel (1,0) G");
+        assert_eq!(result.pixels[8], 0, "pixel (0,1) R");
+        assert_eq!(result.pixels[9], 1, "pixel (0,1) G");
+        assert_eq!(result.pixels[12], 1, "pixel (1,1) R");
+        assert_eq!(result.pixels[13], 1, "pixel (1,1) G");
+    }
+
+    #[test]
+    fn crop_rgba_at_edge() {
+        let src = make_4x4_grid();
+        let result = super::crop_rgba(&src, 2, 2, 2, 2).expect("crop at edge should succeed");
+        assert_eq!(result.width, 2);
+        assert_eq!(result.height, 2);
+        assert_eq!(result.pixels.len(), 16);
+
+        // Bottom-right quadrant: (2,2), (3,2), (2,3), (3,3)
+        assert_eq!(result.pixels[0], 2, "pixel (0,0) in crop (source pos 2,2) R");
+        assert_eq!(result.pixels[1], 2, "pixel (0,0) in crop (source pos 2,2) G");
+        assert_eq!(result.pixels[4], 3, "pixel (1,0) in crop (source pos 3,2) R");
+        assert_eq!(result.pixels[5], 2, "pixel (1,0) in crop (source pos 3,2) G");
+        assert_eq!(result.pixels[8], 2, "pixel (0,1) in crop (source pos 2,3) R");
+        assert_eq!(result.pixels[9], 3, "pixel (0,1) in crop (source pos 2,3) G");
+        assert_eq!(result.pixels[12], 3, "pixel (1,1) in crop (source pos 3,3) R");
+        assert_eq!(result.pixels[13], 3, "pixel (1,1) in crop (source pos 3,3) G");
+    }
+
+    #[test]
+    fn crop_rgba_out_of_bounds_errors() {
+        let src = make_4x4_grid();
+        // Crop starting at (3,3) with size 2×2 would need pixels at columns
+        // 3-4 and rows 3-4, but source is only 4×4 (valid columns 0-3, rows 0-3).
+        let result = super::crop_rgba(&src, 3, 3, 2, 2);
+        assert!(
+            result.is_err(),
+            "expected Err for out-of-bounds crop, got Ok: {:?}",
+            result
+        );
+    }
+
+    /// Build a 4×4 fully-opaque white buffer (R=G=B=A=255).
+    fn make_4x4_opaque_white() -> DecodedRgba {
+        DecodedRgba {
+            width: 4,
+            height: 4,
+            pixels: vec![255u8; 4 * 4 * 4],
+        }
+    }
+
+    #[test]
+    fn apply_circle_mask_zeroes_corner_alpha() {
+        let mut buf = make_4x4_opaque_white();
+        super::apply_circle_mask(&mut buf);
+
+        // For a 4×4 square, center = (1.5, 1.5), radius = 2.0.
+        // Pixel (1,1) is at distance ≈ 0.71 < 2 → inside circle → alpha unchanged (255).
+        let center_idx = (1 * 4 + 1) * 4 + 3;
+        assert_eq!(
+            buf.pixels[center_idx], 255,
+            "center pixel (1,1) at distance ≈0.71 < radius 2 should keep alpha=255"
+        );
+
+        // Pixel (0,0) is at distance ≈ 2.12 > 2 → outside circle → alpha set to 0.
+        let corner_idx = (0 * 4 + 0) * 4 + 3;
+        assert_eq!(
+            buf.pixels[corner_idx], 0,
+            "corner pixel (0,0) at distance ≈2.12 > radius 2 should have alpha=0"
+        );
+
+        // All RGB values must be unchanged (still 255) everywhere.
+        for y in 0..4 {
+            for x in 0..4 {
+                let idx = (y * 4 + x) * 4;
+                assert_eq!(buf.pixels[idx], 255, "R at ({x},{y}) unchanged");
+                assert_eq!(buf.pixels[idx + 1], 255, "G at ({x},{y}) unchanged");
+                assert_eq!(buf.pixels[idx + 2], 255, "B at ({x},{y}) unchanged");
+            }
+        }
+    }
+
+    #[test]
+    fn apply_circle_mask_preserves_circle_pixel_alpha() {
+        // For a 4×4 buffer: center=(1.5, 1.5), radius=min(4,4)/2 = 2.0.
+        //
+        //   (1,1):  distance = sqrt((1-1.5)² + (1-1.5)²) = sqrt(0.5) ≈ 0.71  < 2 → inside
+        //   (0,0):  distance = sqrt((0-1.5)² + (0-1.5)²) = sqrt(4.5) ≈ 2.12 > 2 → outside
+        let mut buf = make_4x4_opaque_white();
+        super::apply_circle_mask(&mut buf);
+
+        let inside_idx = (1 * 4 + 1) * 4 + 3;
+        assert_eq!(
+            buf.pixels[inside_idx], 255,
+            "pixel (1,1) at distance ≈0.71 < radius 2 should keep alpha=255"
+        );
+
+        let outside_idx = (0 * 4 + 0) * 4 + 3;
+        assert_eq!(
+            buf.pixels[outside_idx], 0,
+            "pixel (0,0) at distance ≈2.12 > radius 2 should have alpha=0"
+        );
+    }
+
+    #[test]
+    fn save_png_round_trip_preserves_pixels() {
+        // 8×8 buffer with a pattern: R = column, G = row, B = 0, A = 255.
+        let mut pixels = Vec::with_capacity(8 * 8 * 4);
+        for row in 0..8 {
+            for col in 0..8 {
+                pixels.push(col as u8); // R
+                pixels.push(row as u8); // G
+                pixels.push(0);         // B
+                pixels.push(255);       // A
+            }
+        }
+        let src = DecodedRgba {
+            width: 8,
+            height: 8,
+            pixels,
+        };
+
+        let temp = tempfile::Builder::new()
+            .suffix(".png")
+            .tempfile()
+            .expect("create temp .png file");
+
+        super::save_png(&src, temp.path()).expect("save_png should succeed");
+
+        let decoded = super::decode_image_rgba(temp.path(), None)
+            .expect("decode_image_rgba should load the saved PNG");
+
+        assert_eq!(decoded.width, 8, "width should round-trip");
+        assert_eq!(decoded.height, 8, "height should round-trip");
+        assert_eq!(decoded.pixels, src.pixels, "pixel data should round-trip exactly");
+    }
+
+    #[test]
+    fn save_png_round_trip_preserves_alpha() {
+        // 4×4 buffer: checkerboard of opaque (A=255) and transparent (A=0) pixels.
+        let mut pixels = Vec::with_capacity(4 * 4 * 4);
+        for row in 0..4 {
+            for col in 0..4 {
+                pixels.push(128);                               // R
+                pixels.push(64);                                // G
+                pixels.push(32);                                // B
+                pixels.push(if (row + col) % 2 == 0 { 255 } else { 0 }); // A
+            }
+        }
+        let src = DecodedRgba {
+            width: 4,
+            height: 4,
+            pixels,
+        };
+
+        let temp = tempfile::Builder::new()
+            .suffix(".png")
+            .tempfile()
+            .expect("create temp .png file");
+
+        super::save_png(&src, temp.path()).expect("save_png should succeed");
+
+        let decoded = super::decode_image_rgba(temp.path(), None)
+            .expect("decode_image_rgba should load the saved PNG");
+
+        assert_eq!(decoded.width, 4, "width should round-trip");
+        assert_eq!(decoded.height, 4, "height should round-trip");
+        assert_eq!(decoded.pixels, src.pixels, "alpha values should round-trip exactly");
+    }
+
+    // =======================================================================
+    // Unit 4b-math – custom chat avatar photo: render_avatar
+    // (combines crop_rgba + apply_circle_mask + scale-to-256)
+    // =======================================================================
+
+    /// Build a 100×100 source buffer where each pixel's R = column mod 256,
+    /// G = row mod 256, B = 0, A = 255.
+    fn make_100x100_grid() -> DecodedRgba {
+        let mut pixels = Vec::with_capacity(100 * 100 * 4);
+        for row in 0..100 {
+            for col in 0..100 {
+                pixels.push((col % 256) as u8); // R = column
+                pixels.push((row % 256) as u8); // G = row
+                pixels.push(0);                 // B = 0
+                pixels.push(255);               // A = 255
+            }
+        }
+        DecodedRgba {
+            width: 100,
+            height: 100,
+            pixels,
+        }
+    }
+
+    /// Build a 100×100 fully-opaque white buffer (R=G=B=A=255).
+    fn make_100x100_opaque_white() -> DecodedRgba {
+        DecodedRgba {
+            width: 100,
+            height: 100,
+            pixels: vec![255u8; 100 * 100 * 4],
+        }
+    }
+
+    /// Build a 64×64 source buffer with the same column/row pattern.
+    fn make_64x64_grid() -> DecodedRgba {
+        let mut pixels = Vec::with_capacity(64 * 64 * 4);
+        for row in 0..64 {
+            for col in 0..64 {
+                pixels.push((col % 256) as u8); // R = column
+                pixels.push((row % 256) as u8); // G = row
+                pixels.push(0);                 // B = 0
+                pixels.push(255);               // A = 255
+            }
+        }
+        DecodedRgba {
+            width: 64,
+            height: 64,
+            pixels,
+        }
+    }
+
+    #[test]
+    fn render_avatar_centered_full_size() {
+        let src = make_100x100_grid();
+        let result = super::render_avatar(
+            &src,
+            &super::CropParams {
+                cx: 50.0,
+                cy: 50.0,
+                r: 50.0,
+            },
+        )
+        .expect("centered full-size crop should succeed");
+
+        assert_eq!(result.width, 256, "output width should be 256");
+        assert_eq!(result.height, 256, "output height should be 256");
+        assert_eq!(
+            result.pixels.len(),
+            256 * 256 * 4,
+            "pixel buffer should be 256×256×4 bytes"
+        );
+    }
+
+    #[test]
+    fn render_avatar_offset_crop() {
+        let src = make_100x100_grid();
+        let result = super::render_avatar(
+            &src,
+            &super::CropParams {
+                cx: 25.0,
+                cy: 25.0,
+                r: 25.0,
+            },
+        )
+        .expect("offset crop should succeed");
+
+        assert_eq!(result.width, 256, "output width should be 256");
+        assert_eq!(result.height, 256, "output height should be 256");
+
+        // The crop is non-empty — at least one corner pixel is non-zero
+        // (the bilinear scaling may mix values, but the output isn't all
+        // transparent/zero).
+        let non_zero = result.pixels.iter().any(|&b| b != 0);
+        assert!(non_zero, "output should contain non-zero pixel data");
+    }
+
+    #[test]
+    fn render_avatar_clamps_to_source_bounds() {
+        let src = make_100x100_grid();
+        let result = super::render_avatar(
+            &src,
+            &super::CropParams {
+                cx: 0.0,
+                cy: 0.0,
+                r: 50.0,
+            },
+        )
+        .expect("crop clamped to source should succeed");
+
+        assert_eq!(result.width, 256, "output width should be 256");
+        assert_eq!(result.height, 256, "output height should be 256");
+    }
+
+    #[test]
+    fn render_avatar_circular_alpha_in_output() {
+        let src = make_100x100_opaque_white();
+        let result = super::render_avatar(
+            &src,
+            &super::CropParams {
+                cx: 50.0,
+                cy: 50.0,
+                r: 50.0,
+            },
+        )
+        .expect("centered crop should succeed");
+
+        assert_eq!(result.width, 256, "output width should be 256");
+        assert_eq!(result.height, 256, "output height should be 256");
+
+        // After scaling the centered 100×100 crop to 256×256, the circle
+        // centre is at (128, 128).  The pixel at (128, 128) should be inside
+        // the circle → alpha ≈ 255.
+        let center_idx = (128 * 256 + 128) * 4 + 3;
+        assert_eq!(
+            result.pixels[center_idx], 255,
+            "centre pixel (128,128) should be inside circle with alpha=255"
+        );
+
+        // Corner pixel (0,0) is far outside the circle → alpha = 0.
+        let corner_idx = (0 * 256 + 0) * 4 + 3;
+        assert_eq!(
+            result.pixels[corner_idx], 0,
+            "corner pixel (0,0) should be outside circle with alpha=0"
+        );
+    }
+
+    #[test]
+    fn render_avatar_zero_area_errors() {
+        let src = make_100x100_grid();
+        let result = super::render_avatar(
+            &src,
+            &super::CropParams {
+                cx: 50.0,
+                cy: 50.0,
+                r: 0.0,
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "expected Err for zero-radius crop, got Ok: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn render_avatar_fully_outside_source_errors() {
+        let src = make_100x100_grid();
+        let result = super::render_avatar(
+            &src,
+            &super::CropParams {
+                cx: 1000.0,
+                cy: 1000.0,
+                r: 50.0,
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "expected Err for fully-outside-source crop, got Ok: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn render_avatar_round_trip_via_save_png() {
+        let src = make_64x64_grid();
+        let rendered = super::render_avatar(
+            &src,
+            &super::CropParams {
+                cx: 32.0,
+                cy: 32.0,
+                r: 32.0,
+            },
+        )
+        .expect("centered crop for round-trip should succeed");
+
+        let temp = tempfile::Builder::new()
+            .suffix(".png")
+            .tempfile()
+            .expect("create temp .png file");
+
+        super::save_png(&rendered, temp.path()).expect("save_png should succeed");
+
+        let decoded =
+            super::decode_image_rgba(temp.path(), None).expect("decode_image_rgba should load PNG");
+
+        assert_eq!(decoded.width, 256, "round-tripped width should be 256");
+        assert_eq!(decoded.height, 256, "round-tripped height should be 256");
     }
 }
