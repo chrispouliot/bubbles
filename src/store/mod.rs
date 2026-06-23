@@ -833,6 +833,10 @@ impl Store {
 mod tests {
     use super::*;
 
+    /// (target_guid, target_part, sender, is_from_me, reaction_index) — the
+    /// identity tuple used to compare `LiveTapback`s in the helper closure below.
+    type LiveTapbackKey = (String, Option<String>, Option<String>, bool, u8);
+
     fn db() -> Connection {
         let c = Connection::open_in_memory().unwrap();
         migrate(&c).unwrap();
@@ -1393,7 +1397,7 @@ mod tests {
 
         // Project a Vec<LiveTapback> to a BTreeSet so the assertions do not
         // depend on the helper's output ordering.
-        let fingerprint = |v: &[LiveTapback]| -> BTreeSet<(String, Option<String>, Option<String>, bool, u8)> {
+        let fingerprint = |v: &[LiveTapback]| -> BTreeSet<LiveTapbackKey> {
             v.iter()
                 .map(|l| {
                     (

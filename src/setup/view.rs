@@ -397,10 +397,12 @@ fn login_page(
             };
 
             let fut = flow::advance_login(
-                backend.clone(),
-                config,
+                flow::LoginContext {
+                    backend: backend.clone(),
+                    config,
+                    anisette,
+                },
                 connection,
-                anisette,
                 None,
                 None,
                 Some((id, pw)),
@@ -500,9 +502,11 @@ fn two_fa_page(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Back
             };
 
             let fut = flow::submit_code(
-                backend.clone(),
-                config,
-                anisette,
+                flow::LoginContext {
+                    backend: backend.clone(),
+                    config,
+                    anisette,
+                },
                 account,
                 circle,
                 verify_body,

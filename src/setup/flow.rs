@@ -23,6 +23,15 @@ pub struct Connected {
     pub anisette: Anisette,
 }
 
+/// Context shared by [`advance_login`] and [`submit_code`]: the backend, the
+/// resolved config, and the anisette client. The flow-specific args (account,
+/// circle, code, etc.) are passed separately because they change per state.
+pub struct LoginContext {
+    pub backend: Arc<dyn Backend>,
+    pub config: Config,
+    pub anisette: Anisette,
+}
+
 /// Step 2: identity + push connection + anisette.
 pub async fn prepare_connection(b: Arc<dyn Backend>, config: Config) -> Result<Connected> {
     let identity = b.new_identity()?;
@@ -96,15 +105,14 @@ pub struct LoginAdvance {
 /// Step 3: `updateLoginState`. Drives `NeedsLogin -> {Needs*2Fa} -> verification`
 /// without ever blocking the UI thread.
 pub async fn advance_login(
-    b: Arc<dyn Backend>,
-    config: Config,
+    ctx: LoginContext,
     connection: Connection,
-    anisette: Anisette,
     account: Option<Account>,
     circle: Option<CircleSession>,
     creds: Option<(String, String)>,
     mut state: LoginState,
 ) -> Result<LoginAdvance> {
+    let LoginContext { backend: b, config, anisette } = ctx;
     let mut account = account;
     let mut apple_user = None;
     let mut circle = circle;
@@ -144,15 +152,14 @@ pub struct CodeResult {
 
 /// Step 3 (cont.): `submitCode`. Routes to device or SMS verification by state.
 pub async fn submit_code(
-    b: Arc<dyn Backend>,
-    config: Config,
-    anisette: Anisette,
+    ctx: LoginContext,
     account: Account,
     circle: Option<CircleSession>,
     verify_body: Option<VerifyBody>,
     state: LoginState,
     code: String,
 ) -> Result<CodeResult> {
+    let LoginContext { backend: b, config, anisette } = ctx;
     match state {
         LoginState::Needs2FaVerification => {
             let session = circle.as_ref().context("missing circle session")?;

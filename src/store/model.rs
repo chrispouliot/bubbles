@@ -238,11 +238,6 @@ pub enum AttachmentKind {
     Other,
 }
 
-/// Free-function wrapper that the unit tests pin directly.
-pub fn attachment_kind(att: &StoredAttachment) -> AttachmentKind {
-    att.kind()
-}
-
 /// A sender-generated URL preview, attached to a specific message. This is the
 /// iMessage rich-link / LinkPresentation data the sender's device shipped to us:
 /// title, summary, URL, and the inline thumbnail bytes rustpush already pulled
@@ -606,7 +601,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // attachment_kind() — dispatch to widget kind
+    // StoredAttachment::kind() — dispatch to widget kind
     // -------------------------------------------------------------------
 
     #[test]
@@ -617,7 +612,7 @@ mod tests {
             local_path: None,
             is_sticker: false,
         };
-        assert_eq!(attachment_kind(&att), AttachmentKind::Image);
+        assert_eq!(att.kind(), AttachmentKind::Image);
     }
 
     #[test]
@@ -628,7 +623,7 @@ mod tests {
             local_path: None,
             is_sticker: false,
         };
-        assert_eq!(attachment_kind(&att), AttachmentKind::Video);
+        assert_eq!(att.kind(), AttachmentKind::Video);
     }
 
     #[test]
@@ -639,7 +634,7 @@ mod tests {
             local_path: None,
             is_sticker: false,
         };
-        assert_eq!(attachment_kind(&att), AttachmentKind::Video);
+        assert_eq!(att.kind(), AttachmentKind::Video);
     }
 
     #[test]
@@ -650,7 +645,7 @@ mod tests {
             local_path: None,
             is_sticker: false,
         };
-        assert_eq!(attachment_kind(&att), AttachmentKind::Video);
+        assert_eq!(att.kind(), AttachmentKind::Video);
     }
 
     #[test]
@@ -661,7 +656,7 @@ mod tests {
             local_path: None,
             is_sticker: false,
         };
-        assert_eq!(attachment_kind(&att), AttachmentKind::Other);
+        assert_eq!(att.kind(), AttachmentKind::Other);
     }
 
     #[test]
@@ -672,7 +667,7 @@ mod tests {
             local_path: None,
             is_sticker: false,
         };
-        assert_eq!(attachment_kind(&att), AttachmentKind::Other);
+        assert_eq!(att.kind(), AttachmentKind::Other);
     }
 
     #[test]
@@ -683,7 +678,7 @@ mod tests {
             local_path: None,
             is_sticker: false,
         };
-        assert_eq!(attachment_kind(&att), AttachmentKind::Other);
+        assert_eq!(att.kind(), AttachmentKind::Other);
     }
 
     #[test]
@@ -695,7 +690,7 @@ mod tests {
             local_path: None,
             is_sticker: false,
         };
-        assert_eq!(attachment_kind(&att), AttachmentKind::Image);
+        assert_eq!(att.kind(), AttachmentKind::Image);
     }
 
     #[test]
@@ -706,6 +701,6 @@ mod tests {
             local_path: None,
             is_sticker: false,
         };
-        assert_eq!(attachment_kind(&att), AttachmentKind::Image);
+        assert_eq!(att.kind(), AttachmentKind::Image);
     }
 }

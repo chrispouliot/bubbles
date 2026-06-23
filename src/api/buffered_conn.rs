@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use rustpush::{APSConnection, APSMessage};
 
+type SubscribeFn = Box<dyn FnOnce() -> broadcast::Receiver<APSMessage> + Send>;
+
 struct BufferState<T> {
     buffer: VecDeque<T>,
     subscribed: bool,
@@ -76,7 +78,7 @@ where
 /// received before the first subscriber attaches so they are not lost.
 pub struct BufferedApsConn {
     inner: APSConnection,
-    subscribe_fn: Mutex<Option<Box<dyn FnOnce() -> broadcast::Receiver<APSMessage> + Send>>>,
+    subscribe_fn: Mutex<Option<SubscribeFn>>,
 }
 
 impl BufferedApsConn {

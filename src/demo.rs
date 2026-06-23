@@ -125,6 +125,7 @@ async fn seed(store: &Store) {
 /// `last_at` is the final message's timestamp. The first `read_count` messages
 /// are marked read; the rest stay unread. If `read_receipt_last_sent`, the most
 /// recent outgoing message gets a Read receipt so the UI shows "Read HH:MM".
+#[allow(clippy::too_many_arguments)] // Demo helper, all 4 call sites in this file pass positionally.
 async fn seed_chat(
     store: &Store,
     tag: &str,

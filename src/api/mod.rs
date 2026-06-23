@@ -6,6 +6,7 @@
 // trimming the mirror (which would make re-vendor painful).
 #![allow(unused_imports)]
 #![allow(dead_code)]
+#![allow(clippy::result_large_err)] // PushError is a 176-byte upstream type; we mirror the signature rather than change it.
 
 pub mod buffered_conn;
 use buffered_conn::BufferedApsConn;
@@ -229,7 +230,7 @@ pub struct ProvisionedAnisette {
 pub enum ProvisionedFlavor {
     #[default]
     Mac,
-    IOS,
+    Ios,
 }
 
 pub fn get_device_info(config: &JoinedOSConfig) -> anyhow::Result<DeviceInfo> {
@@ -539,6 +540,7 @@ pub async fn send_2fa_to_devices(state: &Arc<Mutex<AppleAccount<DefaultAnisetteP
     Ok((client_session, LoginState::Needs2FAVerification, sid))
 }
 
+#[allow(clippy::too_many_arguments)] // Mirrors the upstream rustpush::verify_2fa signature; diverging from upstream would make re-vendoring painful.
 pub async fn verify_2fa(path: String, client: &mut CircleClientSession<DefaultAnisetteProvider>, _anisette: &ArcAnisetteClient<DefaultAnisetteProvider>, os_config: &JoinedOSConfig, account: &Arc<Mutex<AppleAccount<DefaultAnisetteProvider>>>, watcher: &mut broadcast::Receiver<APSMessage>, idms: &Arc<IdmsAuthListener>, code: String) -> anyhow::Result<(LoginState, Option<IDSUser>)> {
     client.send_code(&code).await?;
 

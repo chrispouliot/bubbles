@@ -30,6 +30,7 @@ pub enum TimeFormat {
 /// Default time format: 12-hour AM/PM.
 pub const DEFAULT: TimeFormat = TimeFormat::AmPm;
 
+#[cfg(not(test))]
 const STATE_FILE: &str = "time_format.txt";
 
 /// Data directory for openbubbles-gtk. `pub(crate)` for test access.
