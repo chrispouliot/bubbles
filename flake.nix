@@ -164,6 +164,8 @@
             perl
             protobuf
             rustPlatform.bindgenHook
+            makeWrapper # wraps the installed binary so it can find the gstreamer
+                        # plugin bundles in its runtime closure (see postInstall).
           ];
 
           # `hicolor-icon-theme` provides the base hicolor files
@@ -197,6 +199,31 @@
           ];
 
           postInstall = ''
+            # GStreamer plugin discovery on the installed binary.
+            #
+            # The gstreamer plugin bundles in buildInputs (gst-plugins-base,
+            # gst-plugins-good, gst-libav, gst-plugins-rs) ship their .so files
+            # under $out/lib/gstreamer-1.0/ inside their own /nix/store paths,
+            # not inside ours — so gstreamer's compiled-in default search
+            # paths (which point at /usr/lib/gstreamer-1.0) miss them at
+            # runtime. Point GST_PLUGIN_PATH at the four bundles so
+            # `decodebin` / `playbin` can find the codec elements
+            # (`avdec_hevc` for HEVC, `avdec_h264` for H.264, `avdec_aac` for
+            # audio) and so the `gtk4paintablesink` static registration done
+            # by the gst-plugin-gtk4 Rust crate resolves against the matching
+            # C plugin. `--prefix … :` preserves any GST_PLUGIN_PATH the
+            # user already has set (e.g. via environment.sessionVariables).
+            wrapProgram $out/bin/openbubbles-gtk \
+              --prefix GST_PLUGIN_PATH : "${
+                pkgs.gst_all_1.gst-plugins-base
+              }/lib/gstreamer-1.0:${
+                pkgs.gst_all_1.gst-plugins-good
+              }/lib/gstreamer-1.0:${
+                pkgs.gst_all_1.gst-libav
+              }/lib/gstreamer-1.0:${
+                pkgs.gst_all_1.gst-plugins-rs
+              }/lib/gstreamer-1.0"
+
             install -Dm644 $src/app.openbubbles.Gtk.Devel.desktop \
               $out/share/applications/app.openbubbles.Gtk.Devel.desktop
             install -Dm644 $src/app.openbubbles.Gtk.Devel.metainfo.xml \
