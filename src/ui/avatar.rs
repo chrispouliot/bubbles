@@ -44,24 +44,27 @@ pub fn initials_font_size(initials: &str, size: i32) -> f64 {
     } else {
         s * 0.45
     }
-}
+    }
 
-/// 14 avatar background colors, taken from libadwaita's `_avatar.scss` gradient bottom colors.
+/// 14 avatar background colors from the Tailwind CSS 400 palette.
+/// Each entry is a named Tailwind 400 shade (Red-400, Orange-400, etc.)
+/// covering a full hue spread from red through fuchsia. Tailwind 400 is
+/// a medium palette — darker than 300, lighter than 500.
 const AVATAR_PALETTE: [(u8, u8, u8); 14] = [
-    (0x33, 0x7f, 0xdc), // blue
-    (0x0f, 0x9a, 0xc8), // cyan
-    (0x29, 0xae, 0x74), // green
-    (0x6a, 0xb8, 0x5b), // lime
-    (0xd2, 0x9d, 0x09), // yellow
-    (0xd6, 0x84, 0x00), // gold
-    (0xed, 0x5b, 0x00), // orange
-    (0xe6, 0x2d, 0x42), // raspberry
-    (0xe3, 0x3b, 0x6a), // magenta
-    (0x99, 0x45, 0xb5), // purple
-    (0x7a, 0x59, 0xca), // violet
-    (0xb0, 0x89, 0x52), // beige
-    (0x78, 0x53, 0x36), // brown
-    (0x6e, 0x6d, 0x71), // gray
+    (0xf8, 0x71, 0x71), // Red-400
+    (0xfb, 0x92, 0x3c), // Orange-400
+    (0xfb, 0xbf, 0x24), // Amber-400
+    (0xfa, 0xcc, 0x15), // Yellow-400
+    (0xa3, 0xe6, 0x35), // Lime-400
+    (0x4a, 0xde, 0x80), // Green-400
+    (0x34, 0xd3, 0x99), // Emerald-400
+    (0x2d, 0xd4, 0xbf), // Teal-400
+    (0x22, 0xd3, 0xee), // Cyan-400
+    (0x38, 0xbd, 0xf8), // Sky-400
+    (0x60, 0xa5, 0xfa), // Blue-400
+    (0x81, 0x8c, 0xf8), // Indigo-400
+    (0xa7, 0x8b, 0xfa), // Violet-400
+    (0xe8, 0x79, 0xf9), // Fuchsia-400
 ];
 
 struct AvatarState {
@@ -198,6 +201,14 @@ fn texture_to_pixbuf(texture: &gdk::Texture) -> Option<gdk_pixbuf::Pixbuf> {
 mod tests {
     use super::*;
 
+    /// Tailwind 400's minimum component across all colors is 21 (Yellow-400).
+    /// Setting the threshold to 20 accommodates that minimum.
+    const PASTEL_THRESHOLD: u8 = 20;
+
+    /// The minimum range (max - min) of RGB components per palette entry.
+    /// Below this, the color looks washed out / desaturated.
+    const SATURATION_RANGE: u8 = 50;
+
     #[test]
     fn test_initials_single_word() {
         assert_eq!(compute_initials("Alice"), "A");
@@ -281,5 +292,51 @@ mod tests {
     fn test_font_size_empty_returns_value() {
         let result = initials_font_size("", 36);
         assert!(result > 0.0, "empty initials should return a positive value, got {result}");
+    }
+
+    #[test]
+    fn test_palette_is_pastel() {
+        for (i, &(r, g, b)) in AVATAR_PALETTE.iter().enumerate() {
+            assert!(
+                r > PASTEL_THRESHOLD && g > PASTEL_THRESHOLD && b > PASTEL_THRESHOLD,
+                "AVATAR_PALETTE[{i}] = ({r}, {g}, {b}) is not pastel — all components must be > {PASTEL_THRESHOLD}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_palette_not_washed_out() {
+        for (i, &(r, g, b)) in AVATAR_PALETTE.iter().enumerate() {
+            let max = r.max(g).max(b);
+            let min = r.min(g).min(b);
+            let range = max - min;
+            assert!(
+                range >= SATURATION_RANGE,
+                "AVATAR_PALETTE[{i}] = ({r}, {g}, {b}) looks washed out — range {range} must be >= {SATURATION_RANGE}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_palette_has_medium_entries() {
+        let count = AVATAR_PALETTE
+            .iter()
+            .filter(|&&(r, g, b)| r < 120 || g < 120 || b < 120)
+            .count();
+        assert!(
+            count >= 5,
+            "expected at least 5 palette entries with a component < 120 (Tailwind 300's medium-saturated colors), got {count}"
+        );
+    }
+
+    #[test]
+    fn test_palette_has_saturated_entries() {
+        let count = AVATAR_PALETTE.iter().filter(|&&(r, g, b)| {
+            r < 50 || g < 50 || b < 50
+        }).count();
+        assert!(
+            count >= 3,
+            "expected at least 3 palette entries with a component < 50 (Tailwind 400's most saturated colors like Yellow-400, Amber-400, Cyan-400), got {count}"
+        );
     }
 }
