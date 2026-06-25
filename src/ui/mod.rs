@@ -28,6 +28,8 @@ use crate::store::Tapback;
 #[cfg(feature = "rustpush")]
 use rustpush::{Reaction, ReactMessageType};
 
+mod avatar;
+
 /// Callback type for the reaction emoji picker: receives the target message
 /// GUID, the reaction index (0-5), and the target message's text (for the
 /// wire-level `ams` field).
@@ -4274,8 +4276,8 @@ fn chat_row(c: &ChatSummary, handles: &[String]) -> gtk::ListBoxRow {
         .margin_bottom(8)
         .build();
 
-    let avatar = adw::Avatar::new(36, Some(&title), true);
-    avatar.set_hexpand(false);
+    let avatar = avatar::AvatarWidget::new(36, &title);
+    avatar.widget().set_hexpand(false);
 
     // Override with custom avatar photo if one is set and loadable.
     if let Some(path) = chat_avatar_custom_path(c) {
@@ -4284,7 +4286,7 @@ fn chat_row(c: &ChatSummary, handles: &[String]) -> gtk::ListBoxRow {
         }
     }
 
-    box_.append(&avatar);
+    box_.append(avatar.widget());
 
     let title_label = gtk::Label::new(Some(&title));
     title_label.set_hexpand(true);
@@ -4359,9 +4361,9 @@ fn incoming_message(
     // Avatars (and their continuation spacer) only in group chats.
     if is_group {
         if show_header {
-            let avatar = adw::Avatar::new(28, Some(&sender_display(m)), true);
-            avatar.set_valign(gtk::Align::Start);
-            row.append(&avatar);
+            let avatar = avatar::AvatarWidget::new(28, &sender_display(m));
+            avatar.widget().set_valign(gtk::Align::Start);
+            row.append(avatar.widget());
         } else {
             let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             spacer.set_size_request(28, -1);
