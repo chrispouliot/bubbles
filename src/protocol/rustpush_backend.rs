@@ -625,12 +625,8 @@ impl Backend for RustpushBackend {
                 .await
                 .map_err(|e| anyhow::anyhow!("upload attachment: {e:?}"))?;
 
-        let mut normal = NormalMessage::new(text.clone().unwrap_or_default(), MessageType::IMessage);
-        normal.parts = MessageParts(vec![IndexedMessagePart {
-            part: MessagePart::Attachment(attachment),
-            idx: None,
-            ext: None,
-        }]);
+        let mut normal = NormalMessage::new(String::new(), MessageType::IMessage);
+        normal.parts = build_attachment_message_parts(text.as_deref(), attachment);
         let mut inst = MessageInst::new(conversation, my_handle, Message::Message(normal));
         inst.id = guid.clone();
         let date = now_ms();
@@ -1152,6 +1148,34 @@ fn build_react_message(
     }
 }
 
+/// Build a `MessageParts` wire payload for an iMessage that carries an
+/// attachment plus an optional text caption.
+///
+/// When `text` is `Some(s)` the payload contains two parts in this order:
+/// `MessagePart::Text` (caption) then `MessagePart::Attachment`.
+/// When `text` is `None` the payload contains a single `MessagePart::Attachment`.
+fn build_attachment_message_parts(text: Option<&str>, attachment: Attachment) -> MessageParts {
+    match text {
+        Some(s) => MessageParts(vec![
+            IndexedMessagePart {
+                part: MessagePart::Text(s.to_string(), Default::default()),
+                idx: None,
+                ext: None,
+            },
+            IndexedMessagePart {
+                part: MessagePart::Attachment(attachment),
+                idx: None,
+                ext: None,
+            },
+        ]),
+        None => MessageParts(vec![IndexedMessagePart {
+            part: MessagePart::Attachment(attachment),
+            idx: None,
+            ext: None,
+        }]),
+    }
+}
+
 /// Generate a fresh GUID (uppercased UUID v4) for message identification.
 fn new_guid() -> String {
     glib::uuid_string_random().to_string().to_uppercase()
@@ -1211,6 +1235,7 @@ mod tests {
     //! `mod tests` only compiles with the feature — matches the project's
     //! existing per-module cfg convention.
     use super::*;
+    use rustpush::AttachmentType;
 
     /// Pin: the pure helper that builds the wire-level `ReactMessage` for
     /// `send_reaction`:
@@ -1421,5 +1446,109 @@ mod tests {
             inst.id, inst2.id,
             "two calls to build_react_message_inst must produce distinct ids"
         );
+    }
+
+    /// Pin: the pure helper that builds the wire-level `MessageParts` for
+    /// `send_attachment`:
+    ///
+    /// * **with `text = Some(...)`**: produces a two-part `MessageParts`,
+    ///   `MessagePart::Text(...)` first then `MessagePart::Attachment(...)`,
+    ///   both with `idx: None` and `ext: None`. The text content is preserved
+    ///   as-is.
+    /// * **with `text = None`**: produces a single-part `MessageParts`
+    ///   containing only the `MessagePart::Attachment(...)` (photo-only case —
+    ///   regression guard).
+    ///
+    /// This is the extracted seam that replaces the buggy inline construction
+    /// in `send_attachment`, where `NormalMessage::new(text, ...)` correctly
+    /// seeded the text part but the very next line overwrote `normal.parts`
+    /// with a one-element `MessageParts` containing only the `Attachment`,
+    /// dropping the caption from the wire payload.
+    #[test]
+    fn build_attachment_message_parts_cases() {
+        fn fixture_attachment() -> Attachment {
+            Attachment {
+                a_type: AttachmentType::Inline(vec![]),
+                part: 0,
+                uti_type: "public.jpeg".into(),
+                mime: "image/jpeg".into(),
+                name: "photo.jpg".into(),
+                iris: false,
+            }
+        }
+
+        // -- Case 1: text = Some("hello") — two parts, text first. --
+        let attach = fixture_attachment();
+        let parts = build_attachment_message_parts(Some("hello"), attach.clone());
+
+        assert_eq!(
+            parts.0.len(),
+            2,
+            "with text: must produce exactly 2 IndexedMessagePart entries"
+        );
+
+        // First entry: MessagePart::Text with the caption, idx=None, ext=None.
+        match &parts.0[0].part {
+            MessagePart::Text(t, _) => assert_eq!(t, "hello", "text content must be preserved"),
+            _ => panic!("parts[0] should be MessagePart::Text"),
+        }
+        assert_eq!(parts.0[0].idx, None, "parts[0].idx should be None");
+        assert!(parts.0[0].ext.is_none(), "parts[0].ext should be None");
+
+        // Second entry: MessagePart::Attachment with the same attachment,
+        // idx=None, ext=None.  Pin the order: text first, then attachment.
+        match &parts.0[1].part {
+            MessagePart::Attachment(a) => {
+                assert_eq!(a.part, attach.part, "attachment.part should match");
+                assert_eq!(
+                    a.uti_type, attach.uti_type,
+                    "attachment.uti_type should match"
+                );
+                assert_eq!(a.mime, attach.mime, "attachment.mime should match");
+                assert_eq!(a.name, attach.name, "attachment.name should match");
+                assert_eq!(a.iris, attach.iris, "attachment.iris should match");
+                match (&a.a_type, &attach.a_type) {
+                    (AttachmentType::Inline(l), AttachmentType::Inline(r)) => {
+                        assert_eq!(l, r, "attachment a_type (Inline) data should match")
+                    }
+                    _ => panic!("expected a_type to be Inline in both places"),
+                }
+            }
+            _ => panic!("parts[1] should be MessagePart::Attachment"),
+        }
+        assert_eq!(parts.0[1].idx, None, "parts[1].idx should be None");
+        assert!(parts.0[1].ext.is_none(), "parts[1].ext should be None");
+
+        // -- Case 2: text = None — single attachment part only. --
+        let attach2 = fixture_attachment();
+        let parts2 = build_attachment_message_parts(None, attach2.clone());
+
+        assert_eq!(
+            parts2.0.len(),
+            1,
+            "without text: must produce exactly 1 IndexedMessagePart entry"
+        );
+
+        match &parts2.0[0].part {
+            MessagePart::Attachment(a) => {
+                assert_eq!(a.part, attach2.part, "attachment.part should match");
+                assert_eq!(
+                    a.uti_type, attach2.uti_type,
+                    "attachment.uti_type should match"
+                );
+                assert_eq!(a.mime, attach2.mime, "attachment.mime should match");
+                assert_eq!(a.name, attach2.name, "attachment.name should match");
+                assert_eq!(a.iris, attach2.iris, "attachment.iris should match");
+                match (&a.a_type, &attach2.a_type) {
+                    (AttachmentType::Inline(l), AttachmentType::Inline(r)) => {
+                        assert_eq!(l, r, "attachment a_type (Inline) data should match")
+                    }
+                    _ => panic!("expected a_type to be Inline in both places"),
+                }
+            }
+            _ => panic!("single part should be MessagePart::Attachment"),
+        }
+        assert_eq!(parts2.0[0].idx, None, "single part idx should be None");
+        assert!(parts2.0[0].ext.is_none(), "single part ext should be None");
     }
 }
