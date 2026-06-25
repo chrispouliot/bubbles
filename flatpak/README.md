@@ -17,7 +17,13 @@ Then (for GNOME 50 / freedesktop base 25.08):
       org.freedesktop.Sdk.Extension.rust-stable//25.08
 
 The `//50` and `//25.08` intentionally differ — the `rust-stable` branch tracks
-the freedesktop base of the GNOME SDK, not the GNOME version number.
+the freedesktop base of the GNOME SDK, not the GNOME version number. The
+manifest pins `//25.08` explicitly so `flatpak-builder` doesn't fall back to the
+runtime's branch (which would point at a non-existent `rust-stable//50`).
+
+The `codecs-extra` extension (libx264, libx265, nvenc) at branch `25.08-extra`
+is also pulled in automatically when the runtime installs — no `add-extensions`
+stanza is needed in the manifest for HEVC/H.264 video to work.
 
 ## Build + install + run
 

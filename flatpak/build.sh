@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 # Runs inside the flatpak-builder sandbox (build-args: --share=network).
-# Builds + installs the app. rustpush is vendored under third_party/rustpush
-# (submodules + FairPlay certs pre-seeded), so there is no build-time clone or
-# cert-seeding step here — only protoc download, crate fetch, and the build.
+# Builds + installs the app. Everything is vendored, so there is no build-time
+# clone or cert-seeding step here — only protoc download, crate fetch, and
+# the build. Notes on the vendored tree, since it looks submodule-shaped:
+#   * third_party/rustpush/apple-private-apis/ and its nested icloud-auth /
+#     omnisette / clearadi submodules are committed as ordinary files in
+#     this repo (not gitlinks), so a fresh `git clone` populates them — no
+#     `git submodule update --init` is needed, and trying it would fail at
+#     the SSH URLs in third_party/rustpush/.gitmodules.
+#   * The open-absinthe entry in that .gitmodules is dead text for this
+#     build: third_party/rustpush/Cargo.toml has a path override that
+#     redirects the dep to ../../crates/open-absinthe (the workspace
+#     member). cargo follows the override, not the submodule URL.
+#   * FairPlay certs are pre-seeded at third_party/rustpush/certs/.
 set -euo pipefail
 
 PROJECT="$(pwd)"   # the copied source tree = flatpak-builder build dir

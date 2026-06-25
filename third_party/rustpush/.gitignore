@@ -10,9 +10,8 @@
 /id_cache.plist
 /hwconfig.plist
 /anisette_test
-# NOTE: certs/fairplay/* is NOT ignored here. The build seeds placeholder
+# NOTE: certs/fairplay/* is NOT ignored here. The build seeds
 # FairPlay certs (copies of the public certs/legacy-fairplay/fairplay.{crt,pem})
 # into certs/fairplay/ at the expected names so activation.rs can
-# include_bytes!() them at compile time. The real Apple keys are never present;
-# only these public placeholders ship in this vendored tree.
+# include_bytes!() them at compile time.
 /keystore/target
