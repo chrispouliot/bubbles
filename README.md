@@ -7,6 +7,9 @@ A native Linux iMessage client written in Rust with GTK4 / libadwaita based on [
 The app implements the same [rustpush](https://github.com/OpenBubbles/rustpush) for the backend
 as the original OpenBubbles Flutter app and uses the same Hosted Relay or Mac Hardware Token authentication.
 
+Implements KDE Status Notifier for tray icon support and background app running without a window (On Gnome, use the Kstatus Notifier / App Indicator extension)
+including red dot icon for new messages.
+
 ## Develop
 
 The dev environment is a Nix flake devshell, wired for `direnv`:
