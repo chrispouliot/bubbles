@@ -12,3 +12,4 @@ result-*
 *.swp
 
 .flatpak-builder
+build-dir
