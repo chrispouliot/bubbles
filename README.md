@@ -10,6 +10,8 @@ as the original OpenBubbles Flutter app and uses the same Hosted Relay or Mac Ha
 Implements KDE Status Notifier for tray icon support and background app running without a window (On Gnome, use the Kstatus Notifier / App Indicator extension)
 including red dot icon for new messages.
 
+This was made for my own personal use as I wanted an OpenBubbles client that fit in better on my Linux/Gnome desktop.
+
 ## Develop
 
 The dev environment is a Nix flake devshell, wired for `direnv`:
