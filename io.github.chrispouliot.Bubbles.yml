@@ -44,6 +44,37 @@ build-options:
   append-path: /usr/lib/sdk/rust-stable/bin
 
 modules:
+  # gst-plugins-rs / gtk4paintablesink. The freedesktop-sdk 25.08 runtime
+  # (org.gnome.Platform v50) ships gst-libav via the auto-installed
+  # codecs-extra extension, but does NOT ship gst-plugins-rs — so the
+  # Unit C lightbox's `gtk4paintablesink` has to be built here and installed
+  # to /app/lib/gstreamer-1.0/, which gstreamer's compiled-in path picks up
+  # automatically at runtime.
+  - name: gst-plugins-rs
+    buildsystem: simple
+    sources:
+      - type: archive
+        url: https://crates.io/api/v1/crates/gst-plugin-gtk4/0.13.7/download
+        dest-filename: gst-plugin-gtk4-0.13.7.tar.gz
+        sha256: a4cb890d0df1814d2f61ad7d5a4db8ec4fed0e2ac287af26d3c342be1dfae75b
+      - gst-plugin-gtk4-sources.json
+    build-options:
+      env:
+        # Per-module CARGO_HOME under the build dir so this module's
+        # crate cache doesn't collide with the bubbles module's cache
+        # (which uses .cargo-home, skipped in the bubbles sources below).
+        CARGO_HOME: "$FLATPAK_BUILDER_BUILDDIR/cargo"
+    build-commands:
+      # --prefix=/app installs the .so to /app/lib/gstreamer-1.0/,
+      # which gstreamer's compiled-in search path picks up at runtime —
+      # no GST_PLUGIN_PATH override needed (unlike the Nix flake's
+      # wrapProgram dance, which only exists because Nix's per-store-path
+      # layout means gstreamer can't auto-discover the plugin bundles).
+      # Features: GL backends for both Wayland (egl) and X11 (glx/egl),
+      # plus dmabuf for zero-copy on Linux. The default features
+      # disable GL, which the lightbox needs to render frames.
+      - cargo cinstall --offline --release --features=waylandegl,x11glx,x11egl,dmabuf --library-type=cdylib --prefix=/app
+
   - name: bubbles
     buildsystem: simple
     build-commands:

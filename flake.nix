@@ -38,6 +38,29 @@
         # stable.toolchain bundles rustc, cargo, clippy, rustfmt, rust-src, rust-std.
         toolchain = fenix.packages.${system}.stable.toolchain;
 
+        # flatpak-cargo-generator — nixpkgs doesn't ship it, and the PyPI
+        # `flatpak-module-tools` package is a stale Fedora-Modules fork
+        # (last release 2022-11, unrelated to the flatpak/flatpak-builder-tools
+        # repo we actually need). So we vendor the single .py from upstream
+        # at a pinned commit. The script's PEP 723 inline metadata header
+        # lists aiohttp, pyyaml, tomlkit as its runtime deps; we use the
+        # nixpkgs Python versions of those. `exec` replaces the shell with
+        # the interpreter so SIGINT propagates to Python correctly.
+        #
+        # To bump: nix-prefetch-url the new raw URL and replace both the
+        # commit in the URL and the sha256 below.
+        flatpak-cargo-generator = pkgs.writeShellScriptBin "flatpak-cargo-generator" ''
+          exec ${pkgs.python3.withPackages (ps: with ps; [
+            aiohttp
+            pyyaml
+            tomlkit
+          ])}/bin/python3 \
+            ${pkgs.fetchurl {
+              url = "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/737c0085912f9f7dabf9341d4608e2a77a51a73a/cargo/flatpak-cargo-generator.py";
+              hash = "sha256-s3PIqxoFN47F2O0GRcexJ7zsfS96F5hpT7xifVcNhWw=";
+            }} "$@"
+        '';
+
         nativeBuildInputs = with pkgs; [
           toolchain
           rust-analyzer
@@ -56,6 +79,23 @@
           # flatpak-builder shells out to appstreamcli for its metainfo compose
           # step; without it on PATH the build fails at the very end.
           appstream
+
+          # Flatpak dev workflow. The Rust package build (`packages.default`)
+          # doesn't need any of this — it just produces the bubbles binary —
+          # but the dev shell inherits these via the `inherit nativeBuildInputs`
+          # below, so a `nix develop` is enough to get the full flatpak
+          # toolchain for working on the manifest.
+          #
+          # * flatpak-builder:       builds the bundle from the manifest.
+          # * flatpak:               installs/runs the built bundle so the
+          #                          lightbox can be tested after each build.
+          # * flatpak-cargo-generator: vendored above (see that binding for
+          #                          why). Used to generate
+          #                          `gst-plugin-gtk4-sources.json` for the
+          #                          gst-plugins-rs module in the manifest.
+          flatpak-builder
+          flatpak
+          flatpak-cargo-generator
         ];
 
         buildInputs = with pkgs; [
