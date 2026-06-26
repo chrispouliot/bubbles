@@ -1,4 +1,4 @@
-//! SQLite-backed message store (Phase B).
+//! SQLite-backed message store.
 //!
 //! All logic lives in the sync `*_blocking` / `query_*` functions over a
 //! `rusqlite::Connection`; they are unit-tested directly (see `#[cfg(test)]`).
@@ -78,9 +78,9 @@ CREATE TABLE attachment(
 // thumbnail is stored as a file on disk under `$XDG_CACHE_HOME/.../previews/`,
 // and this table holds the path plus the textual metadata.
 //
-// `link_preview` is the URL-keyed cache the fetcher writes to (Phases 4-5 of
-// the plan). For now it's empty, but the table ships in the same migration so
-// a Phase 5 install doesn't need a second migration.
+// `link_preview` is the URL-keyed cache the fetcher writes to. The table
+// ships in the same migration even though nothing populates it today, so the
+// schema bump is a single user_version step.
 const DDL_V4: &str = "
 CREATE TABLE message_link_preview(
   message_guid   TEXT NOT NULL,
@@ -132,9 +132,9 @@ pub fn migrate(c: &Connection) -> rusqlite::Result<()> {
         v = 3;
     }
     if v < 4 {
-        // Sender-generated link previews (Phase 1-3) and the URL-keyed cache
-        // the Phase 5 fetcher writes to. Shipped in the same migration so the
-        // schema bump is a single user_version step.
+        // Sender-generated link previews and the URL-keyed cache the
+        // fetcher writes to. Both ship in this migration so the schema bump
+        // is a single user_version step.
         c.execute_batch(DDL_V4)?;
         v = 4;
     }
@@ -319,7 +319,7 @@ fn insert_tapback(c: &Connection, t: &Tapback) -> rusqlite::Result<()> {
     bump_chat_date(c, chat_id, t.date)
 }
 
-// --- message-scoped link previews (Phase 1-3) ---
+// --- message-scoped link previews ---
 
 /// Directory where thumbnail files for [`MessageLinkPreview::image_path`] are
 /// written. Created on demand by the receiver; the store does not manage it.
@@ -1253,7 +1253,7 @@ mod tests {
         assert_eq!(page[0].attachments[0].name.as_deref(), Some("cat.jpg"));
     }
 
-    // --- link preview tests (Phase 1) ---
+    // --- link preview tests ---
 
     fn preview(guid: &str, part: i64) -> MessageLinkPreview {
         MessageLinkPreview {

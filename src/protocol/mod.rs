@@ -116,7 +116,7 @@ pub enum RegisterOutcome {
     Blocked(SupportAlert),
 }
 
-/// A session restored from disk (Phase A2): the end-state of a completed
+/// A session restored from disk: the end-state of a completed
 /// onboarding minus the login/2FA detour — equivalent to what the flow holds
 /// after `register` + `make_imclient`. Lets a relaunch skip onboarding entirely.
 #[derive(Debug)]
@@ -284,14 +284,14 @@ pub trait Backend: Send + Sync {
     /// `api::get_handles`.
     async fn get_handles(&self, client: &ImClient) -> Result<Vec<String>>;
 
-    // --- 5. session restore (Phase A2) ---
+    // --- 5. session restore ---
 
     /// Attempt to restore a previously-registered session from the state dir.
     /// `Ok(None)` => nothing saved (run onboarding); `Ok(Some(_))` => restored
     /// and ready to message without re-registering with Apple.
     async fn restore_session(&self) -> Result<Option<RestoredSession>>;
 
-    // --- 6. receive (Phase C) ---
+    // --- 6. receive ---
 
     /// Spawn the detached receive loop: decode inbound pushes, persist each to
     /// `store`, and pulse `notify` after every applied event so the UI can
@@ -306,7 +306,7 @@ pub trait Backend: Send + Sync {
         notify: async_channel::Sender<RecvEvent>,
     );
 
-    // --- 7. send (Phase D) ---
+    // --- 7. send ---
 
     /// Send a text message to `chat` as `my_handle`. Returns the locally
     /// persistable record (already flagged `is_from_me`) on success.

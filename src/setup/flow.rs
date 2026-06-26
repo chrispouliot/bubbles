@@ -212,7 +212,7 @@ pub async fn register(
     }
 }
 
-/// Phase A2: attempt to restore a registered session from disk before showing
+/// Attempt to restore a registered session from disk before showing
 /// any onboarding UI. `Ok(None)` means nothing is saved and the caller should
 /// run the normal flow.
 pub async fn restore(b: Arc<dyn Backend>) -> Result<Option<RestoredSession>> {

@@ -414,9 +414,8 @@ pub fn group_tapbacks_by_target(
 /// A URL-keyed, fetched preview. Distinct from [`MessageLinkPreview`]: that one
 /// is message-scoped, sender-supplied, and immutable. This one is keyed by URL
 /// (so re-opening the same link reuses the result), TTL'd, and the result of
-/// *us* fetching the page (Phase 5+). For now Phase 1-3 doesn't write to this
-/// table, but the schema lives alongside `message_link_preview` in the same
-/// migration so the rollout is one atomic bump.
+/// *us* fetching the page. The schema lives alongside `message_link_preview`
+/// in the same migration so a future fetcher can land as one atomic bump.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct LinkPreview {

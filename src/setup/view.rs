@@ -55,7 +55,7 @@ pub fn build_window(
     state.borrow_mut().store = Some(store);
     let nav = adw::NavigationView::new();
 
-    // Phase A2: try to restore a saved session before showing onboarding. While
+    // Try to restore a saved session before showing onboarding. While
     // the async restore runs we show a placeholder; on completion we replace the
     // stack with either the messaging UI (restored) or the hardware page.
     nav.push(&restoring_page());

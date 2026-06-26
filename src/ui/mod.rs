@@ -35,8 +35,7 @@ mod avatar;
 /// wire-level `ams` field).
 type ReactionHandler = dyn Fn(String, usize, String);
 
-/// Phase D default: send read receipts when a chat is viewed. Becomes a user
-/// setting once a settings module exists.
+/// Default: send read receipts when a chat is viewed.
 const SEND_READ_RECEIPTS: bool = true;
 
 /// New sender header after this idle gap (5 min), even for the same person.
@@ -4828,8 +4827,8 @@ fn video_widget(path: &str) -> gtk::Widget {
         },
     );
 
-    // Click to enlarge: find the lightbox host overlay and call the video
-    // lightbox (which is a stub for now — Unit C replaces the body).
+    // Click to enlarge: find the lightbox host overlay and open the video
+    // lightbox.
     let gesture = gtk::GestureClick::new();
     let path_owned = path.to_string();
     let overlay_weak = overlay.downgrade();
@@ -5016,7 +5015,7 @@ fn show_video_lightbox(host: &gtk::Overlay, path: &str) {
     dim.grab_focus();
 }
 
-// --- link preview card (Phase 2-3) ---
+// --- link preview card ---
 
 /// Best-effort extraction of a host label from a URL for the small "example.com"
 /// caption at the bottom of the card. We try to render something readable even
@@ -5082,12 +5081,11 @@ fn link_preview_placeholder_card(p: &MessageLinkPreview) -> gtk::Widget {
     card.upcast()
 }
 
-/// A 72×72 rounded thumbnail. If the cached image can't be decoded (HEIC on a
-/// system without gdk-pixbuf HEIC, or the file was deleted), the cell is filled
-/// with a neutral chain-link icon. Decoding the image bytes inline avoids a
-/// synchronous file load on the main thread if the bytes are already in hand;
-/// for now we still go via the path (the bytes were just written to disk, so
-/// they're guaranteed fresh and small).
+/// A 72×72 rounded thumbnail, loaded from `image_path` on disk. The
+/// thumbnail bytes were just written there by the link-preview ingest, so
+/// the synchronous read is fast and fresh. If the cached image can't be
+/// decoded (HEIC on a system without gdk-pixbuf HEIC, or the file was
+/// deleted), the cell is filled with a neutral chain-link icon.
 fn link_preview_thumb(p: &MessageLinkPreview) -> gtk::Widget {
     if let Some(path) = p.image_path.as_deref() {
         if let Ok(texture) = gtk::gdk::Texture::from_filename(path) {

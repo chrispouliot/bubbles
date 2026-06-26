@@ -1,11 +1,15 @@
-//! The real backend: implements [`Backend`] over `rustpush` + the vendored,
-//! de-FRB'd `api.rs` (exposed as `crate::api`).
+//! The real backend: implements [`Backend`] over `rustpush` + the vendored
+//! `api.rs` subset (exposed as `crate::api`). Where [`stub`](super::stub) is
+//! a no-op for offline iteration, this is the full Apple-stack path: Apple
+//! ID login (NAC validation goes through the locally-vendored
+//! `open-absinthe` crate), 2FA via SMS or trusted device, message
+//! send/receive, tapbacks, attachments, link previews.
 //!
-//! NOT in the default build. Enable once you've vendored `api.rs` (+ its
-//! siblings) and added the deps — see `PHASE_A.md`. Wire it with a cargo
-//! feature, e.g. `#[cfg(feature = "rustpush")] pub mod rustpush_backend;` in
-//! `protocol/mod.rs`, then swap `StubBackend` for `RustpushBackend::new(path)`
-//! in `main`.
+//! Gated by the `rustpush` Cargo feature, which is in the workspace's
+//! `default` set, so this module compiles in normal `cargo build` runs.
+//! `main` constructs the corresponding `Arc<dyn Backend>` at startup;
+//! `--no-default-features` drops the rustpush dep entirely and falls back
+//! to [`stub`](super::stub).
 //!
 //! Handle mapping (our opaque handle <- concrete type):
 //!   Config        <- api::JoinedOSConfig
@@ -17,10 +21,6 @@
 //!   CircleSession <- CircleHandle { session+watcher behind a Mutex, + idms }
 //!   VerifyBody    <- rustpush::VerifyBody
 //!   ImClient      <- Arc<IMClient>
-//!
-//! This file is written against the confirmed signatures of api.rs @ a7fab47,
-//! but is NOT compile-checked here (needs rustpush built). Spots I could not
-//! verify are marked `// VERIFY`.
 
 use std::sync::Arc;
 
@@ -170,7 +170,7 @@ impl Backend for RustpushBackend {
     }
 
     async fn setup_push(&self, config: &Config, identity: &Identity) -> Result<Connection> {
-        // `state: None` = fresh connection. For session restore (Phase A2),
+        // `state: None` = fresh connection. For session restore,
         // pass the saved Option<APSState> here instead.
         let (conn, err) =
             api::setup_push(cfg(config), ident(identity), None, self.state_path.clone()).await;
@@ -758,7 +758,7 @@ fn variant_name(m: &Message) -> &'static str {
 
 /// Map a decrypted `MessageInst` into a store [`Ingest`]. `my_handles` is our
 /// own address set (from `get_handles`), used to compute `is_from_me`. This is
-/// the bridge Phase C's receive loop will run before `Store::apply`.
+/// the bridge receive loop will run before `Store::apply`.
 pub fn ingest_from(inst: &MessageInst, my_handles: &[String]) -> Ingest {
     let guid = inst.id.clone();
     let date = inst.sent_timestamp as i64;
@@ -957,7 +957,7 @@ fn tapback_type(t: &ReactMessageType) -> Option<i64> {
     Some(if *enable { 2000 + idx } else { 3000 + idx })
 }
 
-// --- link preview extraction (Phase 1-3) ---
+// --- link preview extraction ---
 
 /// Pick the primary thumbnail blob out of a `LinkMeta`. The image is *not* a
 /// normal MMCS attachment on the message — rustpush decodes the balloon body
@@ -1100,8 +1100,7 @@ fn extract_link_preview(guid: &str, lm: &LinkMeta) -> Option<MessageLinkPreview>
     })
 }
 
-/// Phase D default: acknowledge inbound messages with Delivered receipts.
-/// Becomes a user setting once a settings module exists.
+/// Default: acknowledge inbound messages with Delivered receipts.
 const SEND_DELIVERED_RECEIPTS: bool = true;
 
 fn conversation_from(chat: &ChatRef) -> ConversationData {
