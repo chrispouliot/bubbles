@@ -27,26 +27,26 @@ stanza is needed in the manifest for HEVC/H.264 video to work.
 
 ## Build + install + run
 
-    flatpak-builder --user --install --force-clean build-dir app.openbubbles.Gtk.Devel.yml
-    flatpak run app.openbubbles.Gtk.Devel
+    flatpak-builder --user --install --force-clean build-dir io.github.chrispouliot.Bubbles.yml
+    flatpak run io.github.chrispouliot.Bubbles
 
 ## Pointing at your self-hosted relay
 
-The relay host is a runtime env var (`OPENBUBBLES_RELAY_HOST`, optional
-`OPENBUBBLES_RELAY_TOKEN`), so no rebuild is needed:
+The relay host is a runtime env var (`BUBBLES_RELAY_HOST`, optional
+`BUBBLES_RELAY_TOKEN`), so no rebuild is needed:
 
     # one-off
-    flatpak run --env=OPENBUBBLES_RELAY_HOST=http://nas:8085 app.openbubbles.Gtk.Devel
+    flatpak run --env=BUBBLES_RELAY_HOST=http://nas:8085 io.github.chrispouliot.Bubbles
 
     # persistent (preferred for a fixed sidecar)
-    flatpak override --user --env=OPENBUBBLES_RELAY_HOST=http://nas:8085 app.openbubbles.Gtk.Devel
-    flatpak run app.openbubbles.Gtk.Devel
+    flatpak override --user --env=BUBBLES_RELAY_HOST=http://nas:8085 io.github.chrispouliot.Bubbles
+    flatpak run io.github.chrispouliot.Bubbles
 
 The LAN sidecar is reachable because the manifest grants `--share=network`.
 A custom host omits the hosted-relay token automatically; set
-`OPENBUBBLES_RELAY_TOKEN` too if your sidecar wants one.
+`BUBBLES_RELAY_TOKEN` too if your sidecar wants one.
 
-Demo mode (no network/onboarding): `--env=OPENBUBBLES_DEMO=1`.
+Demo mode (no network/onboarding): `--env=BUBBLES_DEMO=1`.
 
 ## What the build does
 
@@ -81,6 +81,6 @@ two network uses remain: fetching crates and downloading `protoc`. To finish:
 - `project_license` is SSPL-1.0 (rustpush is a covered work once its feature is
   on). Keep the metainfo in sync, and drop the standalone LICENSE per PHASE_A.md.
 - Replace the placeholder icon at
-  `assets/icons/hicolor/scalable/apps/app.openbubbles.Gtk.Devel.svg`.
+  `assets/icons/hicolor/scalable/apps/io.github.chrispouliot.Bubbles.svg`.
 - First build is slow (clones rustpush + submodules, compiles the whole tree).
   Re-runs reuse `.cargo-home` inside the build dir.

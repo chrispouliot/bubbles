@@ -941,7 +941,7 @@ pub fn enter_messaging(
     overlay.set_child(Some(&bp_bin));
 
     let host = adw::NavigationPage::builder()
-        .title("OpenBubbles")
+        .title("Bubbles")
         .child(&overlay)
         .build();
     nav.replace(&[host]);
@@ -1622,7 +1622,7 @@ impl Ui {
 
     fn show_about(&self) {
         let about = adw::AboutDialog::builder()
-            .application_name("OpenBubbles")
+            .application_name("Bubbles")
             .version(env!("CARGO_PKG_VERSION"))
             .build();
         if let Some(id) = gtk::gio::Application::default().and_then(|a| a.application_id()) {
@@ -2071,7 +2071,7 @@ impl Ui {
 
         let ui = self.clone();
         let chat_id = chat.id;
-        let avatars_dir = glib::user_data_dir().join("openbubbles-gtk").join("avatars");
+        let avatars_dir = glib::user_data_dir().join("bubbles").join("avatars");
         dialog.connect_response(None, move |_dlg, resp| {
             if resp != "save" {
                 return;
@@ -4219,7 +4219,7 @@ pub async fn apply_chat_edit(
     let name = name.filter(|n| !n.trim().is_empty());
 
     // Ensure the avatars directory exists before any file operation.  The
-    // production caller passes `glib::user_data_dir().join("openbubbles-gtk")
+    // production caller passes `glib::user_data_dir().join("bubbles")
     // .join("avatars")` which may not exist on first run — without this,
     // `std::fs::write` below would fail with ENOENT.  `create_dir_all` is
     // idempotent (succeeds if the directory already exists) and creates

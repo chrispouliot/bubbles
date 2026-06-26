@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>app.openbubbles.Gtk.Devel</id>
+  <id>io.github.chrispouliot.Bubbles</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>SSPL-1.0</project_license>
-  <name>OpenBubbles</name>
+  <name>Bubbles</name>
   <summary>Native GTK4 iMessage client</summary>
   <description>
     <p>
@@ -11,9 +11,9 @@
       rustpush backend. Supports a self-hosted validation relay sidecar.
     </p>
   </description>
-  <launchable type="desktop-id">app.openbubbles.Gtk.Devel.desktop</launchable>
+  <launchable type="desktop-id">io.github.chrispouliot.Bubbles.desktop</launchable>
   <provides>
-    <binary>openbubbles-gtk</binary>
+    <binary>bubbles</binary>
   </provides>
   <categories>
     <category>Network</category>

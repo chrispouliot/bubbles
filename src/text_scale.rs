@@ -15,7 +15,7 @@ pub const MIN_OFFSET: f64 = -5.0;
 pub const MAX_OFFSET: f64 = 5.0;
 
 fn data_dir() -> PathBuf {
-    glib::user_data_dir().join("openbubbles-gtk")
+    glib::user_data_dir().join("bubbles")
 }
 
 fn state_path() -> PathBuf {

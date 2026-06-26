@@ -332,7 +332,7 @@ pub fn preview_image_dir() -> std::path::PathBuf {
                 .unwrap_or_default()
                 .join(".cache")
         });
-    base.join("openbubbles-gtk").join("previews")
+    base.join("bubbles").join("previews")
 }
 
 /// Upsert a sender-generated link preview. The PK is `(message_guid, part_idx)`

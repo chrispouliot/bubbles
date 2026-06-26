@@ -25,7 +25,7 @@ use ksni::blocking::TrayMethods;
 /// shell can't resolve a sandboxed theme path, so we hand it raw pixels).
 ///
 /// This is a dedicated copy kept outside the hicolor theme: the dock/launcher
-/// icon is intentionally smaller (see `assets/icons/.../app.openbubbles.Gtk.Devel.svg`
+/// icon is intentionally smaller (see `assets/icons/.../io.github.chrispouliot.Bubbles.svg`
 /// for the padded variant) so it doesn't visually dominate, but the tray needs
 /// to stay at full visual weight — the system tray scales icons down to ~16-22px
 /// and a padded 80% icon would render as a tiny dot of blue.
@@ -48,11 +48,11 @@ struct ObTray {
 
 impl ksni::Tray for ObTray {
     fn id(&self) -> String {
-        "app.openbubbles.Gtk".into()
+        "io.github.chrispouliot.Bubbles".into()
     }
 
     fn title(&self) -> String {
-        "OpenBubbles".into()
+        "Bubbles".into()
     }
 
     /// Swap the whole icon to a pre-badged variant when unread — more reliable
@@ -76,7 +76,7 @@ impl ksni::Tray for ObTray {
         use ksni::menu::StandardItem;
         vec![
             StandardItem {
-                label: "Open OpenBubbles".into(),
+                label: "Open Bubbles".into(),
                 activate: Box::new(|t: &mut ObTray| {
                     let _ = t.tx.send_blocking(TrayEvent::Activate);
                 }),

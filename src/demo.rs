@@ -1,5 +1,5 @@
 //! A self-contained demo sandbox for exercising the messaging UI without any
-//! network or onboarding. Enabled with `OPENBUBBLES_DEMO=1`.
+//! network or onboarding. Enabled with `BUBBLES_DEMO=1`.
 //!
 //! It opens an in-memory store, seeds a handful of chats (including one with 50
 //! unread, to exercise pagination and the "earlier unread" pill), and hands the
@@ -44,7 +44,7 @@ pub fn build_demo_window(app: &adw::Application) -> adw::ApplicationWindow {
 
     adw::ApplicationWindow::builder()
         .application(app)
-        .title("OpenBubbles — Demo")
+        .title("Bubbles — Demo")
         .default_width(920)
         .default_height(640)
         .content(&nav)

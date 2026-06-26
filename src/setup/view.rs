@@ -19,23 +19,23 @@ use crate::store::Store;
 
 // Relay host + token, overridable at runtime so the client can point at a
 // self-hosted validation sidecar without recompiling:
-//   OPENBUBBLES_RELAY_HOST=http://nas:8085   (no token needed for the sidecar)
+//   BUBBLES_RELAY_HOST=http://nas:8085   (no token needed for the sidecar)
 // Defaults to OpenBubbles' hosted relay.
 const DEFAULT_RELAY_HOST: &str = "https://hw.openbubbles.app";
 const DEFAULT_RELAY_TOKEN: &str = "5c175851953ecaf5209185d897591badb6c3e712";
 
 fn relay_host() -> String {
-    std::env::var("OPENBUBBLES_RELAY_HOST").unwrap_or_else(|_| DEFAULT_RELAY_HOST.to_string())
+    std::env::var("BUBBLES_RELAY_HOST").unwrap_or_else(|_| DEFAULT_RELAY_HOST.to_string())
 }
 
 /// The beeper/relay token. Sent only when targeting the default hosted relay;
-/// for a custom host (the sidecar) it's omitted unless OPENBUBBLES_RELAY_TOKEN
+/// for a custom host (the sidecar) it's omitted unless BUBBLES_RELAY_TOKEN
 /// is set explicitly.
 fn relay_token() -> Option<String> {
-    if let Ok(tok) = std::env::var("OPENBUBBLES_RELAY_TOKEN") {
+    if let Ok(tok) = std::env::var("BUBBLES_RELAY_TOKEN") {
         return Some(tok);
     }
-    if std::env::var("OPENBUBBLES_RELAY_HOST").is_ok() {
+    if std::env::var("BUBBLES_RELAY_HOST").is_ok() {
         None // custom host (sidecar): no token by default
     } else {
         Some(DEFAULT_RELAY_TOKEN.to_string())
@@ -88,7 +88,7 @@ pub fn build_window(
    let (width, height) = crate::window_state::read().unwrap_or((460i32, 560i32));
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("OpenBubbles")
+        .title("Bubbles")
         .default_width(width)
         .default_height(height)
         .content(&nav)
@@ -122,7 +122,7 @@ fn restoring_page() -> adw::NavigationPage {
     content.append(&spinner);
 
 
-    nav_page("OpenBubbles", &content)
+    nav_page("Bubbles", &content)
 }
 
 // --- small scaffolding helpers ---

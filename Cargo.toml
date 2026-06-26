@@ -1,5 +1,5 @@
 [package]
-name = "openbubbles-gtk"
+name = "bubbles"
 version = "0.1.0"
 edition = "2021"
 # Once the rustpush feature is enabled, the whole crate is a covered work under

@@ -95,14 +95,14 @@
       in
       {
         # Build the GTK client as a normal Nix package so it can be consumed
-        # from an external flake (e.g. `inputs.openbubbles-gtk.url =
+        # from an external flake (e.g. `inputs.bubbles.url =
         # "path:/work";` from a NixOS/home-manager config) and installed via
         # `environment.systemPackages` or `home.packages`. The .desktop file,
         # AppStream metainfo, and hicolor icons are dropped into the standard
         # $out/share/... locations so the entry is discoverable by xdg and
         # software centers.
         packages.default = pkgs.rustPlatform.buildRustPackage {
-          pname = "openbubbles-gtk";
+          pname = "bubbles";
           version = "0.1.0";
 
           # Explicit source allowlist via `lib.fileset` — only these paths are
@@ -131,8 +131,8 @@
               ./assets
               ./third_party
               ./crates
-              ./app.openbubbles.Gtk.Devel.desktop
-              ./app.openbubbles.Gtk.Devel.metainfo.xml
+              ./io.github.chrispouliot.Bubbles.desktop
+              ./io.github.chrispouliot.Bubbles.metainfo.xml
             ];
           };
           cargoLock = {
@@ -213,7 +213,7 @@
             # by the gst-plugin-gtk4 Rust crate resolves against the matching
             # C plugin. `--prefix … :` preserves any GST_PLUGIN_PATH the
             # user already has set (e.g. via environment.sessionVariables).
-            wrapProgram $out/bin/openbubbles-gtk \
+            wrapProgram $out/bin/bubbles \
               --prefix GST_PLUGIN_PATH : "${
                 pkgs.gst_all_1.gst-plugins-base
               }/lib/gstreamer-1.0:${
@@ -224,16 +224,16 @@
                 pkgs.gst_all_1.gst-plugins-rs
               }/lib/gstreamer-1.0"
 
-            install -Dm644 $src/app.openbubbles.Gtk.Devel.desktop \
-              $out/share/applications/app.openbubbles.Gtk.Devel.desktop
-            install -Dm644 $src/app.openbubbles.Gtk.Devel.metainfo.xml \
-              $out/share/metainfo/app.openbubbles.Gtk.Devel.metainfo.xml
-            install -Dm644 $src/assets/icons/hicolor/scalable/apps/app.openbubbles.Gtk.Devel.svg \
-              $out/share/icons/hicolor/scalable/apps/app.openbubbles.Gtk.Devel.svg
+            install -Dm644 $src/io.github.chrispouliot.Bubbles.desktop \
+              $out/share/applications/io.github.chrispouliot.Bubbles.desktop
+            install -Dm644 $src/io.github.chrispouliot.Bubbles.metainfo.xml \
+              $out/share/metainfo/io.github.chrispouliot.Bubbles.metainfo.xml
+            install -Dm644 $src/assets/icons/hicolor/scalable/apps/io.github.chrispouliot.Bubbles.svg \
+              $out/share/icons/hicolor/scalable/apps/io.github.chrispouliot.Bubbles.svg
             for sz in 64 128 256; do
               install -Dm644 \
-                "$src/assets/icons/hicolor/''${sz}x''${sz}/apps/app.openbubbles.Gtk.Devel.png" \
-                "$out/share/icons/hicolor/''${sz}x''${sz}/apps/app.openbubbles.Gtk.Devel.png"
+                "$src/assets/icons/hicolor/''${sz}x''${sz}/apps/io.github.chrispouliot.Bubbles.png" \
+                "$out/share/icons/hicolor/''${sz}x''${sz}/apps/io.github.chrispouliot.Bubbles.png"
             done
             # In-app action icons (splash hero, send button, etc.) live
             # under hicolor/scalable/actions/. The app references them by
@@ -252,7 +252,7 @@
             description = "Native GTK4/libadwaita client for OpenBubbles (iMessage)";
             license = licenses.sspl;
             platforms = platforms.linux;
-            mainProgram = "openbubbles-gtk";
+            mainProgram = "bubbles";
           };
         };
 
@@ -289,7 +289,7 @@
               pkgs.gst_all_1.gst-plugins-rs
             }/lib/gstreamer-1.0:''${GST_PLUGIN_PATH:-}"
 
-            echo "openbubbles-gtk devshell · $(rustc --version)"
+            echo "bubbles devshell · $(rustc --version)"
           '';
         };
 
@@ -298,11 +298,11 @@
     )
     // {
       # NixOS integration module. Consumers add this to `nixosSystem.modules`
-      # and toggle `programs.openbubbles-gtk.enable` instead of wiring
+      # and toggle `programs.bubbles.enable` instead of wiring
       # `environment.systemPackages` themselves — same pattern as
       # `programs.firefox` / `programs.gnome-terminal`. The default package
       # follows the consumer's host system so cross-platform overrides
-      # (e.g. `programs.openbubbles-gtk.package = ...;`) work without
+      # (e.g. `programs.bubbles.package = ...;`) work without
       # further plumbing.
       nixosModules.default =
         { config
@@ -311,16 +311,16 @@
         , ...
         }:
         let
-          cfg = config.programs.openbubbles-gtk;
+          cfg = config.programs.bubbles;
         in
         {
-          options.programs.openbubbles-gtk = {
-            enable = lib.mkEnableOption "OpenBubbles GTK client (native iMessage client)";
+          options.programs.bubbles = {
+            enable = lib.mkEnableOption "Bubbles (native iMessage client)";
             package = lib.mkOption {
               type = lib.types.package;
               default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-              defaultText = lib.literalExpression "openbubbles-gtk.packages.\${system}.default";
-              description = "The openbubbles-gtk package to install.";
+              defaultText = lib.literalExpression "bubbles.packages.\${system}.default";
+              description = "The bubbles package to install.";
             };
           };
 
@@ -328,7 +328,7 @@
             environment.systemPackages = [
               cfg.package
               # The base hicolor icon theme (index.theme, symbolic/apps/, etc.)
-              # is what every other theme inherits from, and is what the openbubbles-gtk
+              # is what every other theme inherits from, and is what the bubbles
               # .desktop + icon-theme union at /run/current-system/sw/share/icons/
               # needs to actually be a valid hicolor tree. Without this in the
               # system profile, the app icon silently fails to resolve in the

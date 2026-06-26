@@ -33,9 +33,9 @@ pub const DEFAULT: TimeFormat = TimeFormat::AmPm;
 #[cfg(not(test))]
 const STATE_FILE: &str = "time_format.txt";
 
-/// Data directory for openbubbles-gtk. `pub(crate)` for test access.
+/// Data directory for bubbles. `pub(crate)` for test access.
 pub(crate) fn data_dir() -> PathBuf {
-    glib::user_data_dir().join("openbubbles-gtk")
+    glib::user_data_dir().join("bubbles")
 }
 
 /// Path to the time-format state file. `pub(crate)` for test access.

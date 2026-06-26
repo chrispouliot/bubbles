@@ -8,7 +8,7 @@ use gtk::glib;
 const STATE_FILE: &str = "window.txt";
 
 fn data_dir() -> PathBuf {
-    glib::user_data_dir().join("openbubbles-gtk")
+    glib::user_data_dir().join("bubbles")
 }
 
 fn state_path() -> PathBuf {

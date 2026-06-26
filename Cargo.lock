@@ -450,6 +450,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "bubbles"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "async-recursion",
+ "async-trait",
+ "base64 0.21.7",
+ "flexi_logger",
+ "gio",
+ "glib",
+ "gst-plugin-gtk4",
+ "gstreamer",
+ "gstreamer-app",
+ "gstreamer-pbutils",
+ "gstreamer-video",
+ "gtk4",
+ "keystore",
+ "ksni",
+ "libadwaita",
+ "libheif-rs",
+ "log",
+ "multi_log",
+ "plist",
+ "pretty_env_logger",
+ "prost",
+ "prost-build",
+ "rand 0.8.6",
+ "regex",
+ "rusqlite",
+ "rustls 0.23.40",
+ "rustpush",
+ "serde",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-rusqlite",
+ "uuid",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3048,47 +3089,6 @@ dependencies = [
  "sha1",
  "unicorn-engine",
  "ureq",
-]
-
-[[package]]
-name = "openbubbles-gtk"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-channel",
- "async-recursion",
- "async-trait",
- "base64 0.21.7",
- "flexi_logger",
- "gio",
- "glib",
- "gst-plugin-gtk4",
- "gstreamer",
- "gstreamer-app",
- "gstreamer-pbutils",
- "gstreamer-video",
- "gtk4",
- "keystore",
- "ksni",
- "libadwaita",
- "libheif-rs",
- "log",
- "multi_log",
- "plist",
- "pretty_env_logger",
- "prost",
- "prost-build",
- "rand 0.8.6",
- "regex",
- "rusqlite",
- "rustls 0.23.40",
- "rustpush",
- "serde",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-rusqlite",
- "uuid",
 ]
 
 [[package]]

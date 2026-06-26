@@ -1,4 +1,4 @@
-# openbubbles-gtk
+# Bubbles
 
 A native GTK4 / libadwaita client for [OpenBubbles](https://github.com/OpenBubbles/openbubbles-app),
 written in Rust. The goal is to replace the Flutter desktop app with a faster,

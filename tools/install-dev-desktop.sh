@@ -4,18 +4,18 @@
 # click-to-open routing. GNOME maps a notification to an app by application ID
 # -> <app-id>.desktop, so the desktop file's basename must match APP_ID.
 #
-#   ./tools/install-dev-desktop.sh            # uses target/debug/openbubbles-gtk
-#   ./tools/install-dev-desktop.sh --release  # uses target/release/openbubbles-gtk
+#   ./tools/install-dev-desktop.sh            # uses target/debug/bubbles
+#   ./tools/install-dev-desktop.sh --release  # uses target/release/bubbles
 #
 # Re-run if you switch between debug/release (the Exec path changes).
 set -euo pipefail
 
-APP_ID=app.openbubbles.Gtk.Devel
+APP_ID=io.github.chrispouliot.Bubbles
 PROJECT="$(cd "$(dirname "$0")/.." && pwd)"
 
 PROFILE=debug
 [ "${1:-}" = "--release" ] && PROFILE=release
-BIN="$PROJECT/target/$PROFILE/openbubbles-gtk"
+BIN="$PROJECT/target/$PROFILE/bubbles"
 if [ ! -x "$BIN" ]; then
   echo "!! $BIN not found -- build it first (cargo build${PROFILE:+ --$PROFILE} excluded for debug)" >&2
   echo "   debug:   cargo build" >&2

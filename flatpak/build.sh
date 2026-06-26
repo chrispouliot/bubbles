@@ -37,19 +37,19 @@ export CARGO_HOME="$PROJECT/.cargo-home"
 cargo build --release
 
 # 4. Install binary + desktop integration files.
-install -Dm755 target/release/openbubbles-gtk \
-  /app/bin/openbubbles-gtk
-install -Dm644 app.openbubbles.Gtk.Devel.desktop \
-  /app/share/applications/app.openbubbles.Gtk.Devel.desktop
-install -Dm644 app.openbubbles.Gtk.Devel.metainfo.xml \
-  /app/share/metainfo/app.openbubbles.Gtk.Devel.metainfo.xml
-install -Dm644 assets/icons/hicolor/scalable/apps/app.openbubbles.Gtk.Devel.svg \
-  /app/share/icons/hicolor/scalable/apps/app.openbubbles.Gtk.Devel.svg
+install -Dm755 target/release/bubbles \
+  /app/bin/bubbles
+install -Dm644 io.github.chrispouliot.Bubbles.desktop \
+  /app/share/applications/io.github.chrispouliot.Bubbles.desktop
+install -Dm644 io.github.chrispouliot.Bubbles.metainfo.xml \
+  /app/share/metainfo/io.github.chrispouliot.Bubbles.metainfo.xml
+install -Dm644 assets/icons/hicolor/scalable/apps/io.github.chrispouliot.Bubbles.svg \
+  /app/share/icons/hicolor/scalable/apps/io.github.chrispouliot.Bubbles.svg
 # Rasterized sizes: appstreamcli compose needs a readable raster icon (it can't
 # rely on the host having an SVG loader), and they help non-GNOME environments.
 for sz in 64 128 256; do
-  install -Dm644 "assets/icons/hicolor/${sz}x${sz}/apps/app.openbubbles.Gtk.Devel.png" \
-    "/app/share/icons/hicolor/${sz}x${sz}/apps/app.openbubbles.Gtk.Devel.png"
+  install -Dm644 "assets/icons/hicolor/${sz}x${sz}/apps/io.github.chrispouliot.Bubbles.png" \
+    "/app/share/icons/hicolor/${sz}x${sz}/apps/io.github.chrispouliot.Bubbles.png"
 done
 # In-app action icons (splash hero, send button, etc.) are referenced by name
 # at runtime — from_icon_name("empty-state"), from_icon_name("ob-send-symbolic")

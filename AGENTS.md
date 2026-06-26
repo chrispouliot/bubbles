@@ -1,4 +1,4 @@
-# AGENTS.md — openbubbles-gtk
+# AGENTS.md — Bubbles
 
 Rust + GTK4 iMessage client built on rustpush. Project-specific facts only; the global
 behavioral rules (editing, recovery, verify, footguns) layer underneath these.

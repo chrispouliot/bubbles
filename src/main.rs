@@ -30,7 +30,7 @@ use adw::prelude::*;
 
 use protocol::Backend;
 
-const APP_ID: &str = "app.openbubbles.Gtk.Devel";
+const APP_ID: &str = "io.github.chrispouliot.Bubbles";
 
 fn main() -> glib::ExitCode {
     // rustls 0.23 won't auto-pick a crypto provider when more than one is linked.
@@ -56,7 +56,7 @@ fn main() -> glib::ExitCode {
             existing.present();
             return;
         }
-        let window = if std::env::var_os("OPENBUBBLES_DEMO").is_some() {
+        let window = if std::env::var_os("BUBBLES_DEMO").is_some() {
             demo::build_demo_window(app)
         } else {
             setup::view::build_window(app, make_backend(), make_store())
@@ -112,7 +112,7 @@ fn nac_selftest(blob_path: &str) {
 
 /// Open (creating if needed) the message store under the app data dir.
 fn make_store() -> store::Store {
-    let dir = glib::user_data_dir().join("openbubbles-gtk");
+    let dir = glib::user_data_dir().join("bubbles");
     std::fs::create_dir_all(&dir).ok();
     let path = dir.join("messages.db");
     runtime::runtime()
@@ -124,7 +124,7 @@ fn make_store() -> store::Store {
 /// onboarding flow a live `RustpushBackend`.
 #[cfg(feature = "rustpush")]
 fn make_backend() -> Arc<dyn Backend> {
-    let dir = glib::user_data_dir().join("openbubbles-gtk");
+    let dir = glib::user_data_dir().join("bubbles");
     std::fs::create_dir_all(&dir).ok();
     let path = dir.to_string_lossy().into_owned();
     api::do_first_time_init(path.clone());

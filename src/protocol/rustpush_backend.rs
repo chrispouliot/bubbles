@@ -829,7 +829,7 @@ fn attachments_dir() -> std::path::PathBuf {
                 .unwrap_or_default()
                 .join(".local/share")
         });
-    base.join("openbubbles-gtk").join("attachments")
+    base.join("bubbles").join("attachments")
 }
 
 fn ext_for(mime: &str, name: &str) -> String {
