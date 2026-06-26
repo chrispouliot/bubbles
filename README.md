@@ -1,7 +1,7 @@
 # Bubbles
 
-A native GTK4 / libadwaita client for [OpenBubbles](https://github.com/OpenBubbles/openbubbles-app),
-written in Rust. THe app implements the same [`rustpush`](https://github.com/OpenBubbles/rustpush) for the backend
+A native Linux iMessage client written in Rust with GTK4 / libadwaita for [OpenBubbles](https://github.com/OpenBubbles/openbubbles-app)
+The app implements the same [rustpush](https://github.com/OpenBubbles/rustpush) for the backend
 as the original OpenBubbles Flutter app.
 
 ## Develop
