@@ -2,8 +2,8 @@
 name = "bubbles"
 version = "0.1.0"
 edition = "2021"
-# Once the rustpush feature is enabled, the whole crate is a covered work under
-# rustpush's SSPL-1.0 (see PHASE_A.md). Drop the SSPL LICENSE at that point.
+# The whole crate is a covered work under SSPL-1.0 when the rustpush
+# feature is enabled. The full license text is in LICENCE at the repo root.
 license = "SSPL-1.0"
 description = "Native GTK4/libadwaita client for OpenBubbles (iMessage)"
 build = "build.rs"
