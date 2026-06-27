@@ -38,7 +38,7 @@ pub fn handle_prepare_for_sleep(monitor: &PowerMonitor, sleeping: bool) {
 /// Not yet wired into the startup path — that is a separate unit.
 #[cfg(target_os = "linux")]
 pub fn spawn_dbus_power_monitor(monitor: Arc<PowerMonitor>) {
-    tokio::spawn(async move {
+    crate::runtime::runtime().spawn(async move {
         use zbus::export::futures_util::StreamExt;
         use zbus::message::Type;
         use zbus::{Connection, MatchRule, MessageStream};
