@@ -151,8 +151,9 @@ impl Backend for StubBackend {
         _handles: Vec<String>,
         _store: crate::store::Store,
         _notify: async_channel::Sender<crate::protocol::RecvEvent>,
-    ) {
+    ) -> std::sync::Arc<tokio::sync::Notify> {
         // No live connection in the stub; nothing to receive.
+        std::sync::Arc::new(tokio::sync::Notify::new())
     }
 
     async fn send_text(

@@ -118,6 +118,101 @@ fn map_state(s: RpLoginState) -> LoginState {
     }
 }
 
+/// Returned by `subscribe` when the underlying connection is dead and
+/// cannot be subscribed to. The receive loop calls `reconnect` to
+/// re-establish the connection, then retries `subscribe`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionDead;
+
+/// Returned by `reconnect` when the re-establishment attempt fails.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct ReconnectError(pub String);
+
+/// Subscribe with up to 3 attempts, calling `reconnect` between attempts.
+/// Returns `Some(rx)` on success, `None` after giving up.
+async fn subscribe_with_reconnect<S, R, RFut>(
+    subscribe: &S,
+    reconnect: &R,
+) -> Option<tokio::sync::broadcast::Receiver<APSMessage>>
+where
+    S: Fn() -> Result<tokio::sync::broadcast::Receiver<APSMessage>, ConnectionDead>,
+    R: Fn() -> RFut,
+    RFut: std::future::Future<Output = Result<(), ReconnectError>>,
+{
+    for attempt in 0..3 {
+        match subscribe() {
+            Ok(rx) => return Some(rx),
+            Err(ConnectionDead) => {
+                log::warn!(
+                    "connection dead, attempting reconnect (attempt {})",
+                    attempt + 1
+                );
+                if let Err(e) = reconnect().await {
+                    log::error!("reconnect failed: {e:?}");
+                    return None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+    log::error!(
+        "connection still dead after 3 reconnect attempts, exiting receive loop"
+    );
+    None
+}
+
+/// Long-running receive loop. Calls `subscribe` to obtain a broadcast
+/// receiver of inbound APS messages and processes each one via `process`.
+/// On `Lagged` the dropped count is logged and the loop continues; on
+/// `Closed` the loop tries to re-subscribe (with reconnect-on-dead logic);
+/// on `kick.notified()` the loop re-subscribes. The `reconnect` closure is
+/// called when `subscribe` returns `Err(ConnectionDead)`.
+/// Extracted from `start_receiving` so the loop structure (subscribe +
+/// recv + error arms + reconnect) can be tested without a live APNs connection.
+async fn run_receive_loop<S, P, R, SFut, RFut>(
+    subscribe: S,
+    process: P,
+    kick: std::sync::Arc<tokio::sync::Notify>,
+    reconnect: R,
+)
+where
+    S: Fn() -> Result<tokio::sync::broadcast::Receiver<APSMessage>, ConnectionDead> + Send,
+    P: Fn(APSMessage) -> SFut + Send,
+    SFut: std::future::Future<Output = ()> + Send,
+    R: Fn() -> RFut + Send,
+    RFut: std::future::Future<Output = Result<(), ReconnectError>> + Send,
+{
+    let Some(mut rx) = subscribe_with_reconnect(&subscribe, &reconnect).await else {
+        return;
+    };
+    log::info!("receive loop started");
+    loop {
+        tokio::select! {
+            result = rx.recv() => match result {
+                Ok(msg) => process(msg).await,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    log::warn!("receive lagged, dropped {n} messages");
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    log::warn!("receive channel closed, re-subscribing");
+                    let Some(new_rx) = subscribe_with_reconnect(&subscribe, &reconnect).await else {
+                        return;
+                    };
+                    rx = new_rx;
+                }
+            },
+            _ = kick.notified() => {
+                log::info!("kick received, re-subscribing");
+                let Some(new_rx) = subscribe_with_reconnect(&subscribe, &reconnect).await else {
+                    return;
+                };
+                rx = new_rx;
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl Backend for RustpushBackend {
     // --- 1. hardware token / validation data ---
@@ -406,130 +501,172 @@ impl Backend for RustpushBackend {
         handles: Vec<String>,
         store: Store,
         notify: async_channel::Sender<RecvEvent>,
-    ) {
+    ) -> std::sync::Arc<tokio::sync::Notify> {
         let conn = conn(connection).conn.clone();
         let imclient = client(c).clone();
+        let state_path = self.state_path.clone();
+        let kick = std::sync::Arc::new(tokio::sync::Notify::new());
+        let kick_spawn = std::sync::Arc::clone(&kick);
         crate::runtime::runtime().spawn(async move {
-            let mut rx = api::subscribe_conn(&conn);
-            log::info!("receive loop started");
-            loop {
-                match rx.recv().await {
-                    Ok(msg) => match imclient.handle(msg).await {
-                        Ok(Some(inst)) => {
-                            log_inst(&inst);
-                            // Typing is ephemeral: forward it straight to the UI
-                            // (keyed like the store's chat key) and don't persist
-                            // or acknowledge it.
-                            if let Message::Typing(typing, _) = &inst.message {
-                                let from_me = is_from_me(&inst, &handles);
-                                log::debug!(
-                                    "typing recv from={:?} from_me={from_me} typing={typing}",
-                                    inst.sender
-                                );
-                                if !from_me {
-                                    if let Some(conv) = &inst.conversation {
-                                        let chat_key = ChatRef {
-                                            participants: conv.participants.clone(),
-                                            display_name: conv.cv_name.clone(),
-                                            service: None,
-                                        }
-                                        .key();
-                                        let _ = notify
-                                            .send(RecvEvent::Typing {
-                                                chat_key,
-                                                from: inst.sender.clone(),
-                                                typing: *typing,
-                                                superseded: false,
-                                            })
-                                            .await;
-                                    }
-                                }
-                                continue;
-                            }
-                            let mut ingest = ingest_from(&inst, &handles);
-                            // Download any attachments and attach them to the record.
-                            if let Ingest::Message(im) = &mut ingest {
-                                im.attachments = download_inbound(&inst, conn.inner(), &im.guid).await;
-                            }
-                            if let Err(e) = store.apply(ingest).await {
-                                log::warn!("store apply error: {e:#}");
-                            }
-                            // Sender-generated link preview (iMessage rich link):
-                            // rustpush already pulled the balloon body and gave us
-                            // the inline thumbnail bytes; we cache them to disk and
-                            // upsert the row. Same guid as the message so a
-                            // placeholder is replaced in place by its fill-in.
-                            // MUST NOT fetch the URL — that would leak the
-                            // recipient's IP to the sender's hosting (a tracking
-                            // beacon). The sender already shipped us the snapshot.
-                            //
-                            // We do NOT pulse RecvEvent::Applied here: a full
-                            // `reload_messages` on a preview-only update flickers
-                            // and can jump scroll (per the plan). Instead we send
-                            // RecvEvent::LinkPreviewUpdated, which the UI handles
-                            // as an in-place card replacement.
-                            if let Message::Message(nm) = &inst.message {
-                                if let Some(lm) = &nm.link_meta {
-                                    match extract_link_preview(&inst.id, lm) {
-                                        Some(p) => {
-                                            if let Err(e) =
-                                                store.apply(Ingest::LinkPreview(p)).await
-                                            {
-                                                log::warn!("store apply link preview: {e:#}");
-                                            } else {
-                                                let _ = notify
-                                                    .send(RecvEvent::LinkPreviewUpdated {
-                                                        guid: inst.id.clone(),
-                                                        part_idx: 0,
-                                                    })
-                                                    .await;
-                                            }
-                                        }
-                                        None => log::debug!("link_meta present but no preview extracted for {}", inst.id),
-                                    }
-                                }
-                            }
-                            // Acknowledge inbound content with a Delivered receipt.
-                            if SEND_DELIVERED_RECEIPTS && is_incoming_content(&inst, &handles) {
-                                send_receipt_for(&imclient, &inst, &handles, false).await;
-                            }
-                            // Pulse the UI; drop if no receiver is listening.
-                            let _ = notify.send(RecvEvent::Applied).await;
-                            // A real inbound message means they've stopped typing:
-                            // clear the indicator now rather than waiting for a
-                            // typing-stop that iMessage doesn't always send.
-                            if is_incoming_content(&inst, &handles) {
-                                if let Some(conv) = &inst.conversation {
-                                    let chat_key = ChatRef {
-                                        participants: conv.participants.clone(),
-                                        display_name: conv.cv_name.clone(),
-                                        service: None,
-                                    }
-                                    .key();
-                                    let _ = notify
-                                        .send(RecvEvent::Typing {
-                                            chat_key,
-                                            from: inst.sender.clone(),
-                                            typing: false,
-                                            superseded: true,
-                                        })
-                                        .await;
-                                }
-                            }
+            // Shared connection state — replaceable by `reconnect`.
+            let state: std::sync::Arc<std::sync::Mutex<Arc<BufferedApsConn>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(conn));
+
+            let subscribe = {
+                let state = std::sync::Arc::clone(&state);
+                move || -> Result<tokio::sync::broadcast::Receiver<APSMessage>, ConnectionDead> {
+                    let conn = state.lock().expect("connection mutex poisoned").clone();
+                    Ok(api::subscribe_conn(&conn))
+                }
+            };
+
+            let reconnect = {
+                let state = std::sync::Arc::clone(&state);
+                let path = state_path.clone();
+                move || {
+                    let state = std::sync::Arc::clone(&state);
+                    let path = path.clone();
+                    async move {
+                        let saved = api::read_hardware(path.clone())
+                            .ok_or_else(|| ReconnectError("read_hardware returned None".to_string()))?;
+                        let identity = api::decode_identity(&saved.identity)
+                            .map_err(|e| ReconnectError(format!("decode_identity failed: {e}")))?;
+                        let config = saved.os_config;
+                        let (new_conn, err) = api::setup_push(&config, &identity, Some(saved.push), path).await;
+                        if let Some(e) = err {
+                            log::warn!("setup_push returned a non-fatal error: {e:?}");
                         }
-                        Ok(None) => {}
-                        Err(e) => log::warn!("handle error: {e:?}"),
-                    },
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        log::warn!("receive lagged, dropped {n} messages");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        log::info!("receive loop closed");
-                        break;
+                        *state.lock().expect("connection mutex poisoned") = new_conn;
+                        log::info!("connection re-established");
+                        Ok(())
                     }
                 }
-            }
+            };
+
+            run_receive_loop(
+                subscribe,
+                move |msg| {
+                    let imclient = imclient.clone();
+                    let handles = handles.clone();
+                    let store = store.clone();
+                    let notify = notify.clone();
+                    let state = std::sync::Arc::clone(&state);
+                    async move {
+                        let conn = state.lock().expect("connection mutex poisoned").clone();
+                        match imclient.handle(msg).await {
+                            Ok(Some(inst)) => {
+                                log_inst(&inst);
+                                // Typing is ephemeral: forward it straight to the UI
+                                // (keyed like the store's chat key) and don't persist
+                                // or acknowledge it.
+                                if let Message::Typing(typing, _) = &inst.message {
+                                    let from_me = is_from_me(&inst, &handles);
+                                    log::debug!(
+                                        "typing recv from={:?} from_me={from_me} typing={typing}",
+                                        inst.sender
+                                    );
+                                    if !from_me {
+                                        if let Some(conv) = &inst.conversation {
+                                            let chat_key = ChatRef {
+                                                participants: conv.participants.clone(),
+                                                display_name: conv.cv_name.clone(),
+                                                service: None,
+                                            }
+                                            .key();
+                                            let _ = notify
+                                                .send(RecvEvent::Typing {
+                                                    chat_key,
+                                                    from: inst.sender.clone(),
+                                                    typing: *typing,
+                                                    superseded: false,
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                } else {
+                                    let mut ingest = ingest_from(&inst, &handles);
+                                    // Download any attachments and attach them to the record.
+                                    if let Ingest::Message(im) = &mut ingest {
+                                        im.attachments = download_inbound(&inst, conn.inner(), &im.guid).await;
+                                    }
+                                    if let Err(e) = store.apply(ingest).await {
+                                        log::warn!("store apply error: {e:#}");
+                                    }
+                                    // Sender-generated link preview (iMessage rich link):
+                                    // rustpush already pulled the balloon body and gave us
+                                    // the inline thumbnail bytes; we cache them to disk and
+                                    // upsert the row. Same guid as the message so a
+                                    // placeholder is replaced in place by its fill-in.
+                                    // MUST NOT fetch the URL — that would leak the
+                                    // recipient's IP to the sender's hosting (a tracking
+                                    // beacon). The sender already shipped us the snapshot.
+                                    //
+                                    // We do NOT pulse RecvEvent::Applied here: a full
+                                    // `reload_messages` on a preview-only update flickers
+                                    // and can jump scroll (per the plan). Instead we send
+                                    // RecvEvent::LinkPreviewUpdated, which the UI handles
+                                    // as an in-place card replacement.
+                                    if let Message::Message(nm) = &inst.message {
+                                        if let Some(lm) = &nm.link_meta {
+                                            match extract_link_preview(&inst.id, lm) {
+                                                Some(p) => {
+                                                    if let Err(e) =
+                                                        store.apply(Ingest::LinkPreview(p)).await
+                                                    {
+                                                        log::warn!("store apply link preview: {e:#}");
+                                                    } else {
+                                                        let _ = notify
+                                                            .send(RecvEvent::LinkPreviewUpdated {
+                                                                guid: inst.id.clone(),
+                                                                part_idx: 0,
+                                                            })
+                                                            .await;
+                                                    }
+                                                }
+                                                None => log::debug!("link_meta present but no preview extracted for {}", inst.id),
+                                            }
+                                        }
+                                    }
+                                    // Acknowledge inbound content with a Delivered receipt.
+                                    if SEND_DELIVERED_RECEIPTS && is_incoming_content(&inst, &handles) {
+                                        send_receipt_for(&imclient, &inst, &handles, false).await;
+                                    }
+                                    // Pulse the UI; drop if no receiver is listening.
+                                    let _ = notify.send(RecvEvent::Applied).await;
+                                    // A real inbound message means they've stopped typing:
+                                    // clear the indicator now rather than waiting for a
+                                    // typing-stop that iMessage doesn't always send.
+                                    if is_incoming_content(&inst, &handles) {
+                                        if let Some(conv) = &inst.conversation {
+                                            let chat_key = ChatRef {
+                                                participants: conv.participants.clone(),
+                                                display_name: conv.cv_name.clone(),
+                                                service: None,
+                                            }
+                                            .key();
+                                            let _ = notify
+                                                .send(RecvEvent::Typing {
+                                                    chat_key,
+                                                    from: inst.sender.clone(),
+                                                    typing: false,
+                                                    superseded: true,
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => log::warn!("handle error: {e:?}"),
+                        }
+                    }
+                },
+                kick_spawn,
+                reconnect,
+            )
+            .await
         });
+        kick
     }
 
     async fn send_text(
@@ -1709,6 +1846,276 @@ mod tests {
             inst_a.id, inst_b.id,
             "two calls to build_edit_message_inst must produce distinct ids"
         );
+    }
+
+    #[tokio::test]
+    async fn receive_loop_recovers_from_closed() {
+        use std::cell::{Cell, RefCell};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::broadcast;
+
+        const EXPECTED_MSG_COUNT: usize = 3;
+
+        // --- Channel 1: sender dropped so the receiver returns Closed immediately ---
+        let (tx1, rx1) = broadcast::channel::<APSMessage>(16);
+        drop(tx1);
+
+        // --- Channel 2: sender stays alive with messages queued ---
+        let (tx2, rx2) = broadcast::channel::<APSMessage>(16);
+        for _ in 0..EXPECTED_MSG_COUNT {
+            tx2.send(APSMessage::Ping).unwrap();
+        }
+        // Keep tx2 alive so rx2 (and any clone created via RefCell::take) stays open.
+        let _tx2_keepalive = tx2;
+
+        // Wrap both receivers in RefCell<Option<...>> so the Fn() closure can
+        // return them via borrow_mut().take() without consuming itself.
+        let rx1_cell = RefCell::new(Some(rx1));
+        let rx2_cell = RefCell::new(Some(rx2));
+
+        let call_count = Cell::new(0u8);
+        let subscribe = move || -> Result<_, ConnectionDead> {
+            let call = call_count.get();
+            call_count.set(call + 1);
+            match call {
+                0 => Ok(rx1_cell
+                    .borrow_mut()
+                    .take()
+                    .expect("subscribe call 0: rx1 should be present")),
+                _ => Ok(rx2_cell
+                    .borrow_mut()
+                    .take()
+                    .expect("subscribe call 1+: rx2 should be present")),
+            }
+        };
+
+        let processed = Arc::new(AtomicUsize::new(0));
+        let process = {
+            let processed_clone = Arc::clone(&processed);
+            move |_msg: APSMessage| {
+                let p = Arc::clone(&processed_clone);
+                async move {
+                    p.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        };
+
+        // Bounded run: the loop either breaks (current bug) or keeps waiting
+        // after processing messages (fixed). The timeout ensures the test
+        // terminates either way.
+        let reconnect = || async { Ok::<(), ReconnectError>(()) };
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_receive_loop(subscribe, process, std::sync::Arc::new(tokio::sync::Notify::new()), reconnect),
+        )
+        .await;
+
+        assert_eq!(
+            processed.load(Ordering::SeqCst),
+            EXPECTED_MSG_COUNT,
+            "subscribe must be called again after Closed, and messages from the new receiver must be processed"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_loop_resubscribes_on_kick() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::time::Duration;
+        use tokio::sync::broadcast;
+        use tokio::sync::Notify;
+
+        let subscribe_call_count = Arc::new(AtomicUsize::new(0));
+        let processed_count = Arc::new(AtomicUsize::new(0));
+
+        // -- Pre-made receivers (not fresh subscribe() calls) so that the
+        //    receivers the subscribe closure returns already contain queued
+        //    messages.  A broadcast::Receiver created via Sender::subscribe()
+        //    starts at the current write tail and cannot see messages sent
+        //    before its creation, so we must make the receivers ahead of time.
+        let (tx, _rx) = broadcast::channel::<APSMessage>(16);
+
+        // rx1: created before the first send — sees position 0.
+        let rx1 = tx.subscribe();
+        tx.send(APSMessage::Ping).unwrap();
+
+        // rx2: created before the second send — sees position 1.
+        let rx2 = tx.subscribe();
+        tx.send(APSMessage::Ping).unwrap();
+        // Keep tx alive (otherwise receivers would return Closed).
+        let _tx_keepalive = tx;
+
+        let rx1_cell = Mutex::new(Some(rx1));
+        let rx2_cell = Mutex::new(Some(rx2));
+
+        let subscribe = {
+            let call_count = Arc::clone(&subscribe_call_count);
+            move || -> Result<_, ConnectionDead> {
+                call_count.fetch_add(1, Ordering::SeqCst);
+                // Dispatch based on the *previous* count value so the first
+                // call (value 0) returns rx1 and all subsequent calls return rx2.
+                let prev = call_count.load(Ordering::SeqCst) - 1;
+                match prev {
+                    0 => Ok(rx1_cell.lock().unwrap().take().expect(
+                        "subscribe call 0: rx1 should be present",
+                    )),
+                    _ => Ok(rx2_cell.lock().unwrap().take().expect(
+                        "subscribe call 1+: rx2 should be present",
+                    )),
+                }
+            }
+        };
+
+        let process = {
+            let processed = Arc::clone(&processed_count);
+            move |_msg: APSMessage| {
+                let p = Arc::clone(&processed);
+                async move {
+                    p.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        };
+
+        let kick = Arc::new(Notify::new());
+
+        let reconnect = || async { Ok::<(), ReconnectError>(()) };
+
+        // Spawn the loop in the background.
+        let handle = {
+            let kick = Arc::clone(&kick);
+            tokio::spawn(async move {
+                run_receive_loop(subscribe, process, kick, reconnect).await;
+            })
+        };
+
+        // Give the loop time to process the first message and then await the kick.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The first subscribe should have been called, and the first message processed.
+        assert!(
+            subscribe_call_count.load(Ordering::SeqCst) >= 1,
+            "subscribe should have been called at least once before kick"
+        );
+        assert!(
+            processed_count.load(Ordering::SeqCst) >= 1,
+            "at least one message should have been processed before kick"
+        );
+
+        // Signal the kick — the loop should re-subscribe.
+        kick.notify_one();
+
+        // Wait for the re-subscription and message processing.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            subscribe_call_count.load(Ordering::SeqCst) >= 2,
+            "subscribe must be called a second time after kick.notify_one()"
+        );
+        assert!(
+            processed_count.load(Ordering::SeqCst) >= 2,
+            "a second message must be processed after the kick triggers re-subscription"
+        );
+
+        // Clean up: abort the background task so the test doesn't hang.
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn receive_loop_calls_reconnect_on_dead_connection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::time::Duration;
+        use tokio::sync::broadcast;
+
+        let subscribe_call_count = Arc::new(AtomicUsize::new(0));
+        let reconnect_call_count = Arc::new(AtomicUsize::new(0));
+        let processed_count = Arc::new(AtomicUsize::new(0));
+
+        // Shared connection state: None = dead, Some(tx) = alive.
+        let conn: Arc<Mutex<Option<tokio::sync::broadcast::Sender<APSMessage>>>> =
+            Arc::new(Mutex::new(None));
+
+        let subscribe = {
+            let conn = Arc::clone(&conn);
+            let call_count = Arc::clone(&subscribe_call_count);
+            move || {
+                call_count.fetch_add(1, Ordering::SeqCst);
+                let guard = conn.lock().unwrap();
+                match &*guard {
+                    None => Err(ConnectionDead),
+                    Some(tx) => {
+                        // Create the receiver BEFORE sending the message, so
+                        // the receiver starts at the current tail and the
+                        // message sent after is visible.
+                        let rx = tx.subscribe();
+                        tx.send(APSMessage::Ping).unwrap();
+                        Ok(rx)
+                    }
+                }
+            }
+        };
+
+        let process = {
+            let processed = Arc::clone(&processed_count);
+            move |_msg: APSMessage| {
+                let p = Arc::clone(&processed);
+                async move {
+                    p.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        };
+
+        let reconnect = {
+            let conn = Arc::clone(&conn);
+            let counter = Arc::clone(&reconnect_call_count);
+            move || {
+                let conn = Arc::clone(&conn);
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let (tx, _rx) = broadcast::channel::<APSMessage>(16);
+                    // Don't send the message here — subscribe() will send it
+                    // after creating the receiver, ensuring the receiver can
+                    // see it.
+                    *conn.lock().unwrap() = Some(tx);
+                    Ok::<(), ReconnectError>(())
+                }
+            }
+        };
+
+        let kick = Arc::new(tokio::sync::Notify::new());
+
+        let handle = {
+            let kick = Arc::clone(&kick);
+            tokio::spawn(async move {
+                run_receive_loop(subscribe, process, kick, reconnect).await;
+            })
+        };
+
+        // Give the loop time to call subscribe (gets Err), then reconnect, then
+        // subscribe again (gets Ok), then process the one message.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            reconnect_call_count.load(Ordering::SeqCst),
+            1,
+            "reconnect must be called exactly once, not in a spin loop"
+        );
+        assert_eq!(
+            processed_count.load(Ordering::SeqCst),
+            1,
+            "one message from the new connection must be processed"
+        );
+        assert!(
+            subscribe_call_count.load(Ordering::SeqCst) >= 2,
+            "subscribe must be called at least twice (once returning Err, once returning Ok after reconnect)"
+        );
+
+        handle.abort();
     }
 
     /// Pin: `ingest_from` maps `Message::Edit` to `Ingest::Edited` carrying the

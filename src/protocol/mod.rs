@@ -297,6 +297,10 @@ pub trait Backend: Send + Sync {
     /// `store`, and pulse `notify` after every applied event so the UI can
     /// refresh. Ephemeral signals (typing) are forwarded without being stored.
     /// No-op on backends without a live connection.
+    ///
+    /// Returns the receive loop's kick signal (`Arc<Notify>`). Callers may call
+    /// `notify_one()` on it to trigger re-subscription (e.g. after a wake-from-sleep
+    /// event).
     fn start_receiving(
         &self,
         connection: &Connection,
@@ -304,7 +308,7 @@ pub trait Backend: Send + Sync {
         handles: Vec<String>,
         store: Store,
         notify: async_channel::Sender<RecvEvent>,
-    );
+    ) -> std::sync::Arc<tokio::sync::Notify>;
 
     // --- 7. send ---
 

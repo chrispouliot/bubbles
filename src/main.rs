@@ -1,5 +1,6 @@
 mod gtk_bridge;
 mod image;
+mod power;
 mod protocol;
 mod retry;
 mod runtime;

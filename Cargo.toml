@@ -72,6 +72,9 @@ gstreamer-app = "0.25.2"
 gstreamer-pbutils = "0.25.2"
 gst-plugin-gtk4 = { version = "0.15", features = ["gtk_v4_12"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "4"
+
 [dev-dependencies]
 tempfile = "3"
 

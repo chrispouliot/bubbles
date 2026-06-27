@@ -965,7 +965,13 @@ pub fn enter_messaging(
 
     // Receive loop -> persist -> pulse -> refresh.
     let (tx, rx) = async_channel::unbounded::<RecvEvent>();
-    backend.start_receiving(&connection, &client, handles, store, tx);
+    let kick = backend.start_receiving(&connection, &client, handles, store, tx);
+    // Wire the wake-from-sleep handler to the receive loop's kick signal.
+    let monitor = std::sync::Arc::new(crate::power::PowerMonitor::new());
+    crate::power::wire_wake_to_receive_loop(&monitor, std::sync::Arc::clone(&kick));
+    // Subscribe to OS resume events (Linux only).
+    #[cfg(target_os = "linux")]
+    crate::power::spawn_dbus_power_monitor(std::sync::Arc::clone(&monitor));
     let ui_refresh = ui.clone();
     gtk_bridge::forward(rx, move |ev| match ev {
         RecvEvent::Applied => ui_refresh.schedule_refresh(),
