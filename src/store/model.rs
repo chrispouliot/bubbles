@@ -132,6 +132,11 @@ pub enum Ingest {
         guid: String,
         category: SendErrorCategory,
     },
+    /// An edit to an existing message.
+    Edited {
+        guid: String,
+        text: String,
+    },
     /// A recognized-but-unstored control event; the &str names the variant.
     #[allow(dead_code)]
     Ignored(&'static str),

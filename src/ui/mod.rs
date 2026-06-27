@@ -35,6 +35,16 @@ mod avatar;
 /// wire-level `ams` field).
 type ReactionHandler = dyn Fn(String, usize, String);
 
+/// Callback type for the "Edit" menu option on own messages: receives the
+/// target message GUID and the current text. The handler is responsible for
+/// opening the editor (Unit 6 wires this up).
+type EditHandler = dyn Fn(String, String);
+
+/// Callback type for the editor's Save button: receives the target message
+/// GUID and the new text. Unit 6 leaves this as a no-op; Unit 7 wires the
+/// real send.
+type EditSaveHandler = dyn Fn(String, String);
+
 /// Default: send read receipts when a chat is viewed.
 const SEND_READ_RECEIPTS: bool = true;
 
@@ -384,6 +394,11 @@ struct Ui {
     /// Snapshot of the `LiveReactionSummary` maps currently rendered. Used to
     /// compute chip changes (prev_reactions) in `reload_messages`.
     current_reactions: Rc<RefCell<std::collections::BTreeMap<String, Vec<LiveReactionSummary>>>>,
+    /// Text currently rendered in each bubble, keyed by guid. Used by
+    /// `plan_chat_update` to detect text changes (edits) and pick `EditText`
+    /// instead of `Noop` or `Rebuild`. Updated after every populate_messages
+    /// rebuild and after every in-place text update.
+    current_text: Rc<RefCell<std::collections::HashMap<String, String>>>,
 }
 
 /// Swap the window over to the messaging UI and start receiving. Called once a
@@ -648,6 +663,7 @@ pub fn enter_messaging(
         receipt_label: Rc::new(RefCell::new(None)),
         current_chips: Rc::new(RefCell::new(std::collections::HashMap::new())),
         current_reactions: Rc::new(RefCell::new(std::collections::BTreeMap::new())),
+        current_text: Rc::new(RefCell::new(std::collections::HashMap::new())),
     };
 
     // Sync the compose bar visibility with the split view's content panel.
@@ -2422,7 +2438,8 @@ impl Ui {
 
                 let anchor = first.as_ref().map(|(g, _)| g.as_str());
                 let on_reaction = ui.make_reaction_handler();
-                let (marker, chip_map) = populate_messages(&ui.msg_container, &msgs, is_group, anchor, &previews, &ui.preview_cards, on_reaction.as_ref(), &reactions);
+                let on_edit = ui.make_edit_handler();
+                let (marker, chip_map) = populate_messages(&ui.msg_container, &msgs, is_group, anchor, &previews, &ui.preview_cards, on_reaction.as_ref(), on_edit.as_ref(), &reactions);
                 *ui.current_chips.borrow_mut() = chip_map;
                 *ui.current_reactions.borrow_mut() = reactions.clone();
                 *ui.unread_marker_shown.borrow_mut() = marker.is_some();
@@ -2435,6 +2452,7 @@ impl Ui {
                     &ui.rendered_guids,
                     &ui.current_receipt_text,
                     &ui.receipt_label,
+                    &ui.current_text,
                 );
 
                 let to = match &marker {
@@ -2513,6 +2531,7 @@ impl Ui {
                     &prev_guids,
                     prev_receipt.as_deref(),
                     &prev_reactions,
+                    &ui.current_text.borrow(),
                     &msgs,
                     &reactions,
                 );
@@ -2541,8 +2560,19 @@ impl Ui {
                         };
                         ui.scroll_to(to);
                     }
+                    ChatUpdatePlan::EditText { guid, new_text } => {
+                        if let Some(entry) = ui.current_chips.borrow().get(&guid) {
+                            if let Some(label) = find_label_in_bubble(&entry.bubble) {
+                                label.set_markup(&text_to_markup(&new_text));
+                            }
+                        }
+                        ui.current_text.borrow_mut().insert(guid, new_text);
+                        ui.refresh_typing_row(is_group);
+                        ui.update_unread_pill();
+                    }
                     ChatUpdatePlan::Append { new_tail, receipt } => {
                         let on_reaction = ui.make_reaction_handler();
+                        let on_edit = ui.make_edit_handler();
                         // Seed the group state from the last previously-rendered
                         // message so the first appended widget gets correct spacing.
                         let prev_msg = prev_guids
@@ -2555,6 +2585,7 @@ impl Ui {
                             &previews,
                             &ui.preview_cards,
                             on_reaction.as_ref(),
+                            on_edit.as_ref(),
                             &reactions,
                             prev_msg,
                         );
@@ -2595,6 +2626,12 @@ impl Ui {
                             new_guids.push(m.guid.clone());
                         }
                         *ui.rendered_guids.borrow_mut() = new_guids;
+                        // Also register text for the new bubbles.
+                        for m in &new_tail {
+                            if let Some(text) = &m.text {
+                                ui.current_text.borrow_mut().insert(m.guid.clone(), text.clone());
+                            }
+                        }
                         ui.refresh_typing_row(is_group);
                         ui.update_unread_pill();
                         // morph_pending: if the typing dots were superseded by
@@ -2655,6 +2692,7 @@ impl Ui {
                     ChatUpdatePlan::Rebuild => {
                         let anchor = ui.unread.borrow().as_ref().map(|(g, _)| g.clone());
                         let on_reaction = ui.make_reaction_handler();
+                        let on_edit = ui.make_edit_handler();
                         let (marker, chip_map) = populate_messages(
                             &ui.msg_container,
                             &msgs,
@@ -2663,6 +2701,7 @@ impl Ui {
                             &previews,
                             &ui.preview_cards,
                             on_reaction.as_ref(),
+                            on_edit.as_ref(),
                             &reactions,
                         );
                         *ui.current_chips.borrow_mut() = chip_map;
@@ -2677,6 +2716,7 @@ impl Ui {
                             &ui.rendered_guids,
                             &ui.current_receipt_text,
                             &ui.receipt_label,
+                            &ui.current_text,
                         );
                         if ui.morph_pending.replace(false) {
                             if let Some(last) = ui.msg_container.last_child() {
@@ -2790,6 +2830,7 @@ impl Ui {
                 // and the floating pill is dismissed.
                 let anchor = ui.unread.borrow().as_ref().map(|(g, _)| g.clone());
                 let on_reaction = ui.make_reaction_handler();
+                let on_edit = ui.make_edit_handler();
                 let (widgets, marker, chip_map) = build_message_widgets(
                     &older,
                     is_group,
@@ -2797,6 +2838,7 @@ impl Ui {
                     &previews,
                     &ui.preview_cards,
                     on_reaction.as_ref(),
+                    on_edit.as_ref(),
                     &reactions,
                     None,
                 );
@@ -2936,6 +2978,7 @@ impl Ui {
                 *ui.page_has_more.borrow_mut() = true;
                 *ui.page_loading.borrow_mut() = false;
                 let on_reaction = ui.make_reaction_handler();
+                let on_edit = ui.make_edit_handler();
                 let (marker, chip_map) = populate_messages(
                     &ui.msg_container,
                     &msgs,
@@ -2944,6 +2987,7 @@ impl Ui {
                     &previews,
                     &ui.preview_cards,
                     on_reaction.as_ref(),
+                    on_edit.as_ref(),
                     &reactions,
                 );
                 *ui.current_chips.borrow_mut() = chip_map;
@@ -2958,6 +3002,7 @@ impl Ui {
                     &ui.rendered_guids,
                     &ui.current_receipt_text,
                     &ui.receipt_label,
+                    &ui.current_text,
                 );
                 let to = match &marker {
                     Some(w) => ScrollTo::Widget(w.clone()),
@@ -3261,6 +3306,86 @@ impl Ui {
         );
     }
 
+    /// Edit the text of a previously-sent message in the open chat. Mirrors
+    /// `send_text` for the apply-then-send pattern, with one key difference:
+    /// the target message's GUID is preserved (we update an existing row, not
+    /// insert a new one), so the planner uses the `EditText` in-place path
+    /// (the old forced rebuild is no longer needed).
+    #[cfg(feature = "rustpush")]
+    fn send_edit(&self, target_guid: String, edit_part: u64, new_text: String) {
+        let Some(chat) = self.open_summary.borrow().clone() else {
+            eprintln!("send_edit: no open chat; cannot edit");
+            return;
+        };
+        let Some(my_handle) = self_handle(&chat.participants, &self.handles) else {
+            eprintln!("send_edit: no self handle in chat; cannot edit");
+            return;
+        };
+        let chat_ref = chat_ref_of(&chat);
+        let chat_id = chat.id;
+        let is_group = chat.is_group;
+
+        let store = self.store.clone();
+        let backend = self.backend.clone();
+        let client = self.client.clone();
+        let ui = self.clone();
+
+        let guid_for_apply = target_guid.clone();
+        let text_for_apply = new_text.clone();
+        let guid_for_send = target_guid.clone();
+        let text_for_send = new_text.clone();
+        let new_guid = new_guid();
+
+        gtk_bridge::spawn(
+            async move {
+                store
+                    .apply(Ingest::Edited {
+                        guid: guid_for_apply,
+                        text: text_for_apply,
+                    })
+                    .await?;
+                Ok::<(), anyhow::Error>(())
+            },
+            move |res| {
+                if let Err(e) = res {
+                    eprintln!("edit store apply failed: {e:#}");
+                }
+
+                // The planner's EditText path handles the in-place text
+                // update. No forced rebuild needed.
+                ui.reload_messages(chat_id, is_group);
+                ui.reload_chats(|_| {});
+
+                // Fire the network send in the background. On failure, v1 just
+                // logs — the local edit stays. A follow-up can revert by
+                // applying Ingest::Edited with the previous text.
+                let chat_ref_for_send = chat_ref.clone();
+                let my_handle_for_send = my_handle.clone();
+                gtk_bridge::spawn(
+                    async move {
+                        backend
+                            .send_edit(
+                                &client,
+                                &chat_ref_for_send,
+                                &my_handle_for_send,
+                                &guid_for_send,
+                                edit_part,
+                                text_for_send,
+                                new_guid,
+                            )
+                            .await?;
+                        Ok::<(), anyhow::Error>(())
+                    },
+                    move |res| {
+                        if let Err(e) = res {
+                            eprintln!("edit send failed: {e:#}");
+                        }
+                    },
+                );
+            },
+        );
+    }
+
     /// Build a closure suitable as the `on_reaction` callback for
     /// `populate_messages` / `build_message_widgets`. With the `rustpush` feature
     /// it dispatches to `send_reaction`; without it, it logs a stub message.
@@ -3276,6 +3401,146 @@ impl Ui {
         {
             Some(Rc::new(move |_guid, index, _target_text| {
                 eprintln!("reaction {} send skipped (rustpush feature disabled)", index);
+            }))
+        }
+    }
+
+    /// Build a closure suitable as the `on_edit` callback for
+    /// `populate_messages` / `build_message_widgets`.
+    ///
+    /// Unit 5: no-op — the button appears and the popover closes but nothing
+    /// is sent. Unit 6 will replace this with code that opens the editor;
+    /// Unit 7 will replace it again with code that does the full send.
+    fn make_edit_handler(&self) -> Option<Rc<EditHandler>> {
+        // Unit 5 returned a no-op. Unit 6: opens an editor popover with a
+        // multi-line TextView pre-filled with the current text, plus Save
+        // and Cancel buttons. Save extracts the new text and fires the
+        // save callback (no-op for this unit), then closes the popover.
+        // Cancel just closes the popover.
+        let ui = self.clone();
+        Some(Rc::new(move |target_guid: String, current_text: String| {
+            // Build the popover
+            let popover = gtk::Popover::builder()
+                .autohide(true)
+                .build();
+
+            // Outer container
+            let vbox = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(8)
+                .margin_start(8)
+                .margin_end(8)
+                .margin_top(8)
+                .margin_bottom(8)
+                .width_request(320)
+                .build();
+
+            // TextView (multi-line)
+            let buffer = gtk::TextBuffer::builder().text(&current_text).build();
+            let text_view = gtk::TextView::builder()
+                .buffer(&buffer)
+                .wrap_mode(gtk::WrapMode::Word)
+                .height_request(120)
+                .build();
+            vbox.append(&text_view);
+
+            // Button row
+            let hbox = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(8)
+                .halign(gtk::Align::End)
+                .build();
+
+            let cancel_btn = gtk::Button::builder().label("Cancel").build();
+            let save_btn = gtk::Button::builder()
+                .label("Save")
+                .css_classes(["suggested-action"])
+                .build();
+            hbox.append(&cancel_btn);
+            hbox.append(&save_btn);
+            vbox.append(&hbox);
+
+            popover.set_child(Some(&vbox));
+
+            // Save: extract text, call save handler (no-op for Unit 6), popdown.
+            let popover_save = popover.clone();
+            let save_handler = ui.make_edit_save_handler();
+            let buffer_for_save = buffer.clone();
+            let guid_for_save = target_guid.clone();
+            save_btn.connect_clicked(move |_| {
+                let (start, end) = buffer_for_save.bounds();
+                let new_text = buffer_for_save
+                    .text(&start, &end, false)
+                    .to_string();
+                if !new_text.trim().is_empty() {
+                    if let Some(cb) = save_handler.as_ref() {
+                        cb(guid_for_save.clone(), new_text);
+                    }
+                }
+                popover_save.popdown();
+            });
+
+            // Cancel: just popdown.
+            let popover_cancel = popover.clone();
+            cancel_btn.connect_clicked(move |_| {
+                popover_cancel.popdown();
+            });
+
+            // Unparent the popover when it closes (avoids accumulating hidden
+            // children in content_page after Cancel or outside-click). Clear
+            // the focus first so GTK doesn't move focus to the next focusable
+            // widget (which happens to be the rename_button in the topbar,
+            // causing an unwanted blue focus outline to appear there).
+            popover.connect_closed(move |p| {
+                if let Some(root) = p.root() {
+                    root.set_focus(None::<&gtk::Widget>);
+                }
+                p.unparent();
+            });
+
+            // Anchor the popover to the source bubble so it appears next to
+            // the message being edited (instead of the default position on
+            // content_page, which lands under the compose area). If the
+            // bubble is no longer in the widget tree (e.g., the chat was
+            // rebuilt between right-click and popover-open), fall back to
+            // the default position.
+            if let Some(entry) = ui.current_chips.borrow().get(&target_guid) {
+                if let Some(rect) = entry.bubble.compute_bounds(&ui.content_page) {
+                    // compute_bounds gives graphene::Rect (f32);
+                    // set_pointing_to wants gdk::Rectangle (i32).
+                    let gdk_rect = gtk::gdk::Rectangle::new(
+                        rect.x() as i32,
+                        rect.y() as i32,
+                        rect.width() as i32,
+                        rect.height() as i32,
+                    );
+                    popover.set_pointing_to(Some(&gdk_rect));
+                }
+            }
+
+            popover.set_parent(&ui.content_page);
+            popover.popup();
+        }))
+    }
+
+    /// Build a closure suitable as the Save-button callback inside the editor
+    /// popover.
+    ///
+    /// Unit 6: no-op — the editor opens, accepts input, and Save closes it
+    /// without dispatching anything. Unit 7 replaces this with code that
+    /// calls `send_edit`.
+    fn make_edit_save_handler(&self) -> Option<Rc<EditSaveHandler>> {
+        #[cfg(feature = "rustpush")]
+        {
+            let ui = self.clone();
+            Some(Rc::new(move |guid, text| {
+                ui.send_edit(guid, 0, text);
+            }))
+        }
+        #[cfg(not(feature = "rustpush"))]
+        {
+            Some(Rc::new(move |_guid, _text| {
+                eprintln!("edit save skipped (rustpush feature disabled)");
             }))
         }
     }
@@ -3585,6 +3850,7 @@ fn build_message_widgets(
     previews: &std::collections::HashMap<(String, i64), MessageLinkPreview>,
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
     on_reaction: Option<&Rc<ReactionHandler>>,
+    on_edit: Option<&Rc<EditHandler>>,
     reactions: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
     prev: Option<&StoredMessage>,
 ) -> (Vec<gtk::Widget>, Option<gtk::Widget>, std::collections::HashMap<String, ChipEntry>) {
@@ -3627,7 +3893,7 @@ fn build_message_widgets(
             .get(&m.guid)
             .map(|chips| reaction_chips_row(chips));
         let ctx = MessageContext { m, show_header, top, previews, preview_cards };
-        let (row, bubble_or_overlay) = message_widget(ctx, is_group, on_reaction, chip.as_ref());
+        let (row, bubble_or_overlay) = message_widget(ctx, is_group, on_reaction, on_edit, chip.as_ref());
         let bubble_widget = match &bubble_or_overlay {
             Some(b) => b.clone(),
             None => row.clone(),
@@ -3657,6 +3923,7 @@ fn sync_tracked_state_after_rebuild(
     rendered_guids: &Rc<RefCell<Vec<String>>>,
     current_receipt_text: &Rc<RefCell<Option<String>>>,
     receipt_label: &Rc<RefCell<Option<gtk::Label>>>,
+    current_text: &Rc<RefCell<std::collections::HashMap<String, String>>>,
 ) {
     // The old receipt_label handle is now stale (the widget was destroyed by
     // clear_box). Drop it before re-extracting.
@@ -3667,11 +3934,30 @@ fn sync_tracked_state_after_rebuild(
         .filter(|m| m.associated_guid.is_none())
         .map(|m| m.guid.clone())
         .collect();
+    *current_text.borrow_mut() = msgs
+        .iter()
+        .filter(|m| m.associated_guid.is_none())
+        .filter_map(|m| m.text.as_ref().map(|t| (m.guid.clone(), t.clone())))
+        .collect();
     if let Some(label) = extract_receipt_label(container) {
         let text = label.text().to_string();
         *receipt_label.borrow_mut() = Some(label);
         *current_receipt_text.borrow_mut() = Some(text);
     }
+}
+
+/// Walk the bubble widget tree to find the inner `gtk::Label`. The bubble
+/// may be a bare `gtk::Box` (no chip) or a `gtk::Overlay` (with chip); in
+/// the latter case, the label is the first child of the overlay's wrapped
+/// bubble box.
+fn find_label_in_bubble(bubble: &gtk::Widget) -> Option<gtk::Label> {
+    let inner = if bubble.is::<gtk::Overlay>() {
+        bubble.first_child()?
+    } else {
+        bubble.clone()
+    };
+    let label_widget = inner.first_child()?;
+    label_widget.downcast::<gtk::Label>().ok()
 }
 
 /// Walk msg_container to find the receipt label. The typing indicator row
@@ -3700,6 +3986,7 @@ fn populate_messages(
     previews: &std::collections::HashMap<(String, i64), MessageLinkPreview>,
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
     on_reaction: Option<&Rc<ReactionHandler>>,
+    on_edit: Option<&Rc<EditHandler>>,
     reactions: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
 ) -> (Option<gtk::Widget>, std::collections::HashMap<String, ChipEntry>) {
     clear_box(container);
@@ -3760,7 +4047,7 @@ fn populate_messages(
             .get(&m.guid)
             .map(|chips| reaction_chips_row(chips));
         let ctx = MessageContext { m, show_header, top, previews, preview_cards };
-        let (row, bubble_or_overlay) = message_widget(ctx, is_group, on_reaction, chip.as_ref());
+        let (row, bubble_or_overlay) = message_widget(ctx, is_group, on_reaction, on_edit, chip.as_ref());
         let bubble_widget = match &bubble_or_overlay {
             Some(b) => b.clone(),
             None => row.clone(),
@@ -4328,10 +4615,11 @@ fn message_widget(
     ctx: MessageContext<'_>,
     is_group: bool,
     on_reaction: Option<&Rc<ReactionHandler>>,
+    on_edit: Option<&Rc<EditHandler>>,
     chip: Option<&gtk::Widget>,
 ) -> (gtk::Widget, Option<gtk::Widget>) {
     if ctx.m.is_from_me {
-        own_message(ctx, chip)
+        own_message(ctx, on_edit, chip)
     } else {
         incoming_message(ctx, is_group, on_reaction, chip)
     }
@@ -4449,6 +4737,7 @@ fn incoming_message(
         previews,
         preview_cards,
         show_picker.as_ref(),
+        None,
         chip,
     );
     line.append(&body_col);
@@ -4466,6 +4755,7 @@ fn incoming_message(
 /// Returns `(row_widget, bubble_or_overlay)`.
 fn own_message(
     ctx: MessageContext<'_>,
+    on_edit: Option<&Rc<EditHandler>>,
     chip: Option<&gtk::Widget>,
 ) -> (gtk::Widget, Option<gtk::Widget>) {
     let MessageContext { m, show_header, top, previews, preview_cards } = ctx;
@@ -4501,10 +4791,25 @@ fn own_message(
         line.append(&icon);
     }
 
-    let (body_col, bubble_or_overlay) = message_body(m, true, previews, preview_cards, None, chip);
+    // Build the optional Edit menu closure for text-only own messages.
+    let is_text_only = m.attachments.is_empty()
+        && m.text.as_deref().is_some_and(|t| !t.trim().is_empty());
+    let show_edit: Option<Rc<dyn Fn()>> = if is_text_only {
+        on_edit.map(|cb| -> Rc<dyn Fn()> {
+            let cb = cb.clone();
+            let target_guid = m.guid.clone();
+            let current_text = extract_target_text(m);
+            Rc::new(move || cb(target_guid.clone(), current_text.clone()))
+        })
+    } else {
+        None
+    };
+
+    let (body_col, bubble_or_overlay) = message_body(m, true, previews, preview_cards, None, show_edit.as_ref(), chip);
     line.append(&body_col);
 
     row.append(&line);
+
     (row.upcast(), bubble_or_overlay)
 }
 
@@ -4523,6 +4828,7 @@ fn message_body(
     previews: &std::collections::HashMap<(String, i64), MessageLinkPreview>,
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
     show_picker: Option<&Rc<dyn Fn()>>,
+    show_edit: Option<&Rc<dyn Fn()>>,
     chip: Option<&gtk::Widget>,
 ) -> (gtk::Widget, Option<gtk::Widget>) {
     let col = gtk::Box::builder()
@@ -4560,13 +4866,13 @@ fn message_body(
     let is_tapback = m.associated_guid.is_some();
     let bubble_or_overlay: Option<gtk::Widget> = if has_text || is_tapback {
         let bubble = bubble_box(own);
-        bubble.append(&bubble_label(&body_text(m), show_picker));
+        bubble.append(&bubble_label(&body_text(m), show_picker, show_edit));
         let result = bubble_with_chip(&bubble, own, chip);
         col.append(&result);
         Some(result)
     } else if m.attachments.is_empty() {
         let bubble = bubble_box(own);
-        bubble.append(&bubble_label("(no text)", show_picker));
+        bubble.append(&bubble_label("(no text)", show_picker, show_edit));
         let result = bubble_with_chip(&bubble, own, chip);
         col.append(&result);
         Some(result)
@@ -5428,7 +5734,7 @@ fn bubble_box(own: bool) -> gtk::Box {
 
 /// The wrapped, width-capped, left-justified text inside a bubble.
 /// URLs in the text are rendered as clickable links that open in the system browser.
-fn bubble_label(text: &str, show_picker: Option<&Rc<dyn Fn()>>) -> gtk::Label {
+fn bubble_label(text: &str, show_picker: Option<&Rc<dyn Fn()>>, show_edit: Option<&Rc<dyn Fn()>>) -> gtk::Label {
     let markup = text_to_markup(text);
     let label = gtk::Label::builder()
         .label(&markup)
@@ -5447,8 +5753,11 @@ fn bubble_label(text: &str, show_picker: Option<&Rc<dyn Fn()>>) -> gtk::Label {
     // so clicking into this label drops the previous one's highlight + cursor.
     register_selectable_label(&label);
 
-    // Append a "Reaction" item to the label's built-in context menu
-    // (Copy / Select All / …) when a show_picker callback is wired.
+    // Append "Reaction" and/or "Edit" items to the label's built-in context
+    // menu (Copy / Select All / …) when the corresponding callbacks are wired.
+    let menu = gtk::gio::Menu::new();
+    let mut has_any = false;
+
     if let Some(picker) = show_picker {
         let action_group = gtk::gio::SimpleActionGroup::new();
         let open_action = gtk::gio::SimpleAction::new("open", None);
@@ -5456,9 +5765,22 @@ fn bubble_label(text: &str, show_picker: Option<&Rc<dyn Fn()>>) -> gtk::Label {
         open_action.connect_activate(move |_, _| picker());
         action_group.add_action(&open_action);
         label.insert_action_group("reaction", Some(&action_group));
-
-        let menu = gtk::gio::Menu::new();
         menu.append(Some("Reaction"), Some("reaction.open"));
+        has_any = true;
+    }
+
+    if let Some(edit) = show_edit {
+        let action_group = gtk::gio::SimpleActionGroup::new();
+        let trigger_action = gtk::gio::SimpleAction::new("trigger", None);
+        let edit = Rc::clone(edit);
+        trigger_action.connect_activate(move |_, _| edit());
+        action_group.add_action(&trigger_action);
+        label.insert_action_group("edit", Some(&action_group));
+        menu.append(Some("Edit"), Some("edit.trigger"));
+        has_any = true;
+    }
+
+    if has_any {
         label.set_extra_menu(Some(&menu));
     }
 
@@ -6151,6 +6473,9 @@ pub enum ChatUpdatePlan {
     Noop,
     UpdateReceipt { new_text: String },
     UpdateChips { changes: Vec<ChipChange> },
+    /// A single bubble's text changed (an edit). The UI updates the label
+    /// in place without rebuilding the view.
+    EditText { guid: String, new_text: String },
     Append {
         new_tail: Vec<StoredMessage>,
         receipt: ReceiptAction,
@@ -6184,6 +6509,7 @@ pub fn plan_chat_update(
     prev_guids: &[String],
     prev_receipt: Option<&str>,
     prev_reactions: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
+    prev_text: &std::collections::HashMap<String, String>,
     new_msgs: &[StoredMessage],
     new_reactions: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
 ) -> ChatUpdatePlan {
@@ -6211,16 +6537,41 @@ pub fn plan_chat_update(
         // Same set of non-tapback guids → in-place update possible.
         let receipt_changed = new_receipt.as_deref() != prev_receipt;
         let chips_changed = !chip_changes.is_empty();
-        match (receipt_changed, chips_changed) {
-            (false, false) => ChatUpdatePlan::Noop,
-            (true, false) => match new_receipt {
+        // Build new_text map for the non-tapback rows.
+        let new_text: std::collections::HashMap<String, String> = new_msgs
+            .iter()
+            .filter(|m| m.associated_guid.is_none())
+            .filter_map(|m| m.text.as_ref().map(|t| (m.guid.clone(), t.clone())))
+            .collect();
+        // Find the first guid whose text changed (single EditText per plan;
+        // further changes are picked up on the next refresh).
+        let text_change: Option<(String, String)> = prev_text
+            .iter()
+            .find_map(|(guid, old_text)| {
+                new_text.get(guid).and_then(|new_t| {
+                    if new_t != old_text {
+                        Some((guid.clone(), new_t.clone()))
+                    } else {
+                        None
+                    }
+                })
+            });
+        let text_changed = text_change.is_some();
+        match (receipt_changed, chips_changed, text_changed) {
+            (false, false, false) => ChatUpdatePlan::Noop,
+            (true, false, false) => match new_receipt {
                 Some(text) => ChatUpdatePlan::UpdateReceipt { new_text: text },
                 None => ChatUpdatePlan::Rebuild,
             },
-            (false, true) => ChatUpdatePlan::UpdateChips {
+            (false, true, false) => ChatUpdatePlan::UpdateChips {
                 changes: chip_changes,
             },
-            (true, true) => ChatUpdatePlan::Rebuild,
+            (false, false, true) => {
+                let (guid, new_text) = text_change.unwrap();
+                ChatUpdatePlan::EditText { guid, new_text }
+            }
+            // Any other combination → multiple changes, fall through to Rebuild.
+            _ => ChatUpdatePlan::Rebuild,
         }
     } else if new_guids.len() > prev_len
         && new_guids[..prev_len]
@@ -6573,6 +6924,7 @@ mod plan_chat_update_tests {
     //! [`super::plan_chat_update`] directly.  No GTK initialisation needed.
     use super::*;
     use std::collections::BTreeMap;
+    use std::collections::HashMap;
 
     // ── test helpers ────────────────────────────────────────────────
 
@@ -6625,6 +6977,19 @@ mod plan_chat_update_tests {
     /// Empty reaction map shorthand.
     fn no_reactions() -> BTreeMap<String, Vec<LiveReactionSummary>> {
         BTreeMap::new()
+    }
+
+    /// Empty text map shorthand.
+    fn no_text() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    /// Like `m` but with explicit text.
+    fn m_text(guid: &str, is_from_me: bool, date: i64, text: &str) -> StoredMessage {
+        StoredMessage {
+            text: Some(text.to_string()),
+            ..m(guid, is_from_me, date)
+        }
     }
 
     // ── tests ──────────────────────────────────────────────────────
@@ -6713,7 +7078,7 @@ mod plan_chat_update_tests {
             m("A", false, 1000),
             delivered(m("B", true, 2000), 3000),
         ];
-        assert_noop(plan_chat_update(&prev, Some("Delivered"), &no_reactions(), &new, &no_reactions()));
+        assert_noop(plan_chat_update(&prev, Some("Delivered"), &no_reactions(), &no_text(), &new, &no_reactions()));
     }
 
     #[test]
@@ -6726,7 +7091,7 @@ mod plan_chat_update_tests {
         // prev_receipt was the zero-width placeholder (sent message at bottom
         // with no real receipt yet).
         assert_update_receipt(
-            plan_chat_update(&prev, Some("\u{200b}"), &no_reactions(), &new, &no_reactions()),
+            plan_chat_update(&prev, Some("\u{200b}"), &no_reactions(), &no_text(), &new, &no_reactions()),
             "Delivered",
         );
     }
@@ -6738,7 +7103,7 @@ mod plan_chat_update_tests {
             m("A", false, 1000),
             read(delivered(m("B", true, 2000), 3000), 4000),
         ];
-        match plan_chat_update(&prev, Some("Delivered"), &no_reactions(), &new, &no_reactions()) {
+        match plan_chat_update(&prev, Some("Delivered"), &no_reactions(), &no_text(), &new, &no_reactions()) {
             ChatUpdatePlan::UpdateReceipt { new_text } => {
                 assert!(
                     new_text.starts_with("Read "),
@@ -6759,7 +7124,7 @@ mod plan_chat_update_tests {
             m("C", false, 4000),
         ];
         assert_append_keep(
-            plan_chat_update(&prev, Some("Delivered"), &no_reactions(), &new, &no_reactions()),
+            plan_chat_update(&prev, Some("Delivered"), &no_reactions(), &no_text(), &new, &no_reactions()),
             &["C"],
         );
     }
@@ -6769,7 +7134,7 @@ mod plan_chat_update_tests {
         let prev = guids(&["A"]);
         let new = vec![m("A", false, 1000), m("B", true, 2000)];
         assert_append_set(
-            plan_chat_update(&prev, None, &no_reactions(), &new, &no_reactions()),
+            plan_chat_update(&prev, None, &no_reactions(), &no_text(), &new, &no_reactions()),
             &["B"],
             "\u{200b}",
         );
@@ -6784,7 +7149,7 @@ mod plan_chat_update_tests {
             m("C", false, 3000), // new incoming after last sent
         ];
         assert_append_remove(
-            plan_chat_update(&prev, Some("\u{200b}"), &no_reactions(), &new, &no_reactions()),
+            plan_chat_update(&prev, Some("\u{200b}"), &no_reactions(), &no_text(), &new, &no_reactions()),
             &["C"],
         );
     }
@@ -6799,7 +7164,7 @@ mod plan_chat_update_tests {
             m("D", false, 4000),
         ];
         assert_append_keep(
-            plan_chat_update(&prev, None, &no_reactions(), &new, &no_reactions()),
+            plan_chat_update(&prev, None, &no_reactions(), &no_text(), &new, &no_reactions()),
             &["B", "C", "D"],
         );
     }
@@ -6808,40 +7173,68 @@ mod plan_chat_update_tests {
     fn plan_chat_update_rebuild_on_deletion() {
         let prev = guids(&["A", "B", "C"]);
         let new = vec![m("A", false, 1000), m("C", false, 3000)];
-        assert_rebuild(plan_chat_update(&prev, None, &no_reactions(), &new, &no_reactions()));
+        assert_rebuild(plan_chat_update(&prev, None, &no_reactions(), &no_text(), &new, &no_reactions()));
     }
 
     #[test]
     fn plan_chat_update_rebuild_on_reorder() {
         let prev = guids(&["A", "B"]);
         let new = vec![m("B", false, 2000), m("A", false, 1000)];
-        assert_rebuild(plan_chat_update(&prev, None, &no_reactions(), &new, &no_reactions()));
+        assert_rebuild(plan_chat_update(&prev, None, &no_reactions(), &no_text(), &new, &no_reactions()));
     }
 
     #[test]
-    fn plan_chat_update_edit_in_middle_is_noop_limitation() {
-        // The plan function only compares guid sets + receipt state.  A
-        // message body change (edit) does NOT affect either, so the function
-        // returns Noop.  This is a known limitation: the user will see the
-        // edit on the next real refresh.  The test documents this behaviour
-        // rather than asserting Rebuild, because the plan is intentionally
-        // guid-based and edits are invisible to it.
+    fn plan_chat_update_edit_returns_edit_text() {
+        // The plan function now compares text in addition to guids/receipt. A
+        // message body change (edit) returns EditText when no other state
+        // changed. The UI then updates that one bubble's label in place.
         let prev = guids(&["A", "B", "C"]);
-        // Same guids but different text on B — the plan can't see text
-        // changes by design.
+        let prev_text: HashMap<String, String> = [
+            ("A", "old A"),
+            ("B", "old B"),
+            ("C", "old C"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
         let new = vec![
             m("A", false, 1000),
-            m("B", false, 2000),
+            // B's text changed (edit)
+            m_text("B", false, 2000, "new B"),
             m("C", false, 3000),
         ];
-        assert_noop(plan_chat_update(&prev, None, &no_reactions(), &new, &no_reactions()));
+        match plan_chat_update(&prev, None, &no_reactions(), &prev_text, &new, &no_reactions()) {
+            ChatUpdatePlan::EditText { guid, new_text } => {
+                assert_eq!(guid, "B", "EditText targets the changed message");
+                assert_eq!(new_text, "new B", "EditText carries the new text");
+            }
+            other => panic!("expected EditText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_chat_update_no_text_change_is_noop() {
+        // Even with prev_text supplied, no actual text change returns Noop.
+        let prev = guids(&["A", "B"]);
+        let prev_text: HashMap<String, String> = [
+            ("A", "same A"),
+            ("B", "same B"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let new = vec![
+            m_text("A", false, 1000, "same A"),
+            m_text("B", false, 2000, "same B"),
+        ];
+        assert_noop(plan_chat_update(&prev, None, &no_reactions(), &prev_text, &new, &no_reactions()));
     }
 
     #[test]
     fn plan_chat_update_rebuild_when_prev_guids_empty_with_messages() {
         let prev: Vec<String> = vec![];
         let new = vec![m("A", false, 1000), m("B", false, 2000)];
-        assert_rebuild(plan_chat_update(&prev, None, &no_reactions(), &new, &no_reactions()));
+        assert_rebuild(plan_chat_update(&prev, None, &no_reactions(), &no_text(), &new, &no_reactions()));
     }
 
     #[test]
@@ -6857,7 +7250,7 @@ mod plan_chat_update_tests {
             delivered(m("B", true, 2000), 3000),
             tapback(m("T1", false, 1500), "A"),
         ];
-        assert_noop(plan_chat_update(&prev, Some("Delivered"), &no_reactions(), &new, &no_reactions()));
+        assert_noop(plan_chat_update(&prev, Some("Delivered"), &no_reactions(), &no_text(), &new, &no_reactions()));
     }
 
     #[test]
@@ -6871,7 +7264,7 @@ mod plan_chat_update_tests {
             tapback(m("T1", false, 1500), "A"),
         ];
         assert_append_keep(
-            plan_chat_update(&prev, None, &no_reactions(), &new, &no_reactions()),
+            plan_chat_update(&prev, None, &no_reactions(), &no_text(), &new, &no_reactions()),
             &["B"],
         );
     }
@@ -6918,7 +7311,7 @@ mod plan_chat_update_tests {
         let prev_r = no_reactions();
         let new_r = rmap(&[("A", vec![chip(0, 1, false)])]);
         assert_update_chips(
-            plan_chat_update(&prev, None, &prev_r, &new, &new_r),
+            plan_chat_update(&prev, None, &prev_r, &no_text(), &new, &new_r),
             vec![ChipChange {
                 target_guid: "A".to_string(),
                 new_chips: vec![chip(0, 1, false)],
@@ -6933,7 +7326,7 @@ mod plan_chat_update_tests {
         let prev_r = rmap(&[("A", vec![chip(0, 1, false)])]);
         let new_r = rmap(&[("A", vec![chip(0, 1, false), chip(1, 1, false)])]);
         assert_update_chips(
-            plan_chat_update(&prev, None, &prev_r, &new, &new_r),
+            plan_chat_update(&prev, None, &prev_r, &no_text(), &new, &new_r),
             vec![ChipChange {
                 target_guid: "A".to_string(),
                 new_chips: vec![chip(0, 1, false), chip(1, 1, false)],
@@ -6949,7 +7342,7 @@ mod plan_chat_update_tests {
         // Key is absent in new_reactions — should treat as empty.
         let new_r = no_reactions();
         assert_update_chips(
-            plan_chat_update(&prev, None, &prev_r, &new, &new_r),
+            plan_chat_update(&prev, None, &prev_r, &no_text(), &new, &new_r),
             vec![ChipChange {
                 target_guid: "A".to_string(),
                 new_chips: vec![],
@@ -6962,7 +7355,7 @@ mod plan_chat_update_tests {
         let prev = guids(&["A"]);
         let new = vec![m("A", false, 1000)];
         let r = rmap(&[("A", vec![chip(0, 1, false)])]);
-        assert_noop(plan_chat_update(&prev, None, &r, &new, &r));
+        assert_noop(plan_chat_update(&prev, None, &r, &no_text(), &new, &r));
     }
 
     #[test]
@@ -6976,7 +7369,7 @@ mod plan_chat_update_tests {
         let new_r = rmap(&[("A", vec![chip(0, 1, false)]), ("B", vec![chip(1, 2, true)])]);
         // Only B changed (A is the same).
         assert_update_chips(
-            plan_chat_update(&prev, None, &prev_r, &new, &new_r),
+            plan_chat_update(&prev, None, &prev_r, &no_text(), &new, &new_r),
             vec![ChipChange {
                 target_guid: "B".to_string(),
                 new_chips: vec![chip(1, 2, true)],
@@ -6999,6 +7392,7 @@ mod plan_chat_update_tests {
             &prev,
             Some("Delivered"),
             &prev_r,
+            &no_text(),
             &new,
             &new_r,
         ));
@@ -7018,7 +7412,7 @@ mod plan_chat_update_tests {
         let prev_r = rmap(&[("A", vec![chip(0, 1, false)])]);
         let new_r = rmap(&[("A", vec![chip(0, 1, false), chip(1, 1, false)])]);
         assert_append_keep(
-            plan_chat_update(&prev, None, &prev_r, &new, &new_r),
+            plan_chat_update(&prev, None, &prev_r, &no_text(), &new, &new_r),
             &["B"],
         );
     }

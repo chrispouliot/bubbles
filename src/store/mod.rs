@@ -458,6 +458,12 @@ pub fn apply_blocking(c: &mut Connection, ingest: Ingest) -> rusqlite::Result<()
                 params![category as i64, guid],
             )?;
         }
+        Ingest::Edited { guid, text } => {
+            tx.execute(
+                "UPDATE message SET text = ?1 WHERE guid = ?2",
+                params![text, guid],
+            )?;
+        }
         Ingest::Ignored(_) => {}
     }
     tx.commit()
@@ -1924,5 +1930,47 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, 5, "user_version must be 5 after migration");
+    }
+
+    #[test]
+    fn edited_ingest_updates_message_text() {
+        let mut c = db();
+        apply_blocking(&mut c, Ingest::Message(sent("G1", 1000))).unwrap();
+        apply_blocking(
+            &mut c,
+            Ingest::Edited {
+                guid: "G1".into(),
+                text: "Edited body text".into(),
+            },
+        )
+        .unwrap();
+
+        let chats = query_chats(&c).unwrap();
+        let msgs = query_messages(&c, chats[0].id).unwrap();
+        assert_eq!(msgs.len(), 1, "edit did not insert a new row");
+        assert_eq!(msgs[0].text.as_deref(), Some("Edited body text"));
+        assert_eq!(msgs[0].guid, "G1");
+        assert!(msgs[0].is_from_me, "edit preserved is_from_me");
+        assert_eq!(msgs[0].date, 1000, "edit did not change date");
+    }
+
+    #[test]
+    fn edited_ingest_on_unknown_guid_is_a_noop() {
+        let mut c = db();
+        apply_blocking(&mut c, Ingest::Message(sent("EXISTS", 1000))).unwrap();
+        apply_blocking(
+            &mut c,
+            Ingest::Edited {
+                guid: "MISSING".into(),
+                text: "nope".into(),
+            },
+        )
+        .unwrap();
+
+        let chats = query_chats(&c).unwrap();
+        let msgs = query_messages(&c, chats[0].id).unwrap();
+        assert_eq!(msgs.len(), 1, "edit did not insert a phantom row");
+        assert_eq!(msgs[0].guid, "EXISTS");
+        assert_eq!(msgs[0].text.as_deref(), Some("From me"));
     }
 }

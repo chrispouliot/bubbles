@@ -29,10 +29,11 @@ use tokio::sync::{broadcast, Mutex};
 
 use rustpush::{
     APSConnection, APSMessage, AppleAccount, ArcAnisetteClient, Attachment,
-    CircleClientSession, ConversationData, DebugMutex, DefaultAnisetteProvider, IDSNGMIdentity,
-    IDSUser, IMClient, IdmsAuthListener, IndexedMessagePart, LPLinkMetadata, LinkMeta,
-    LoginState as RpLoginState, MMCSFile, Message, MessageInst, MessagePart, MessageParts,
-    MessageType, NormalMessage, ReactMessage, Reaction, ReactMessageType, VerifyBody as RpVerifyBody,
+    CircleClientSession, ConversationData, DebugMutex, DefaultAnisetteProvider, EditMessage,
+    IDSNGMIdentity, IDSUser, IMClient, IdmsAuthListener, IndexedMessagePart, LPLinkMetadata,
+    LinkMeta, LoginState as RpLoginState, MMCSFile, Message, MessageInst, MessagePart,
+    MessageParts, MessageType, NormalMessage, ReactMessage, Reaction, ReactMessageType,
+    VerifyBody as RpVerifyBody,
 };
 
 use crate::store::{
@@ -593,6 +594,32 @@ impl Backend for RustpushBackend {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn send_edit(
+        &self,
+        c: &ImClient,
+        chat: &ChatRef,
+        my_handle: &str,
+        target_guid: &str,
+        edit_part: u64,
+        new_text: String,
+        new_guid: String,
+    ) -> Result<()> {
+        let _ = new_guid; // we use new_guid() inside build_edit_message_inst
+        let imclient = client(c).clone();
+        let inst = build_edit_message_inst(chat, my_handle, target_guid, edit_part, new_text);
+        let inst = Mutex::new(inst);
+        crate::retry::retry(3, std::time::Duration::from_millis(500), || async {
+            let mut guard = inst.lock().await;
+            imclient
+                .send(&mut guard)
+                .await
+                .map_err(|e| anyhow::anyhow!("send edit failed: {e:?}"))
+        })
+        .await?;
+        Ok(())
+    }
+
     async fn send_attachment(
         &self,
         c: &ImClient,
@@ -812,6 +839,10 @@ pub fn ingest_from(inst: &MessageInst, my_handles: &[String]) -> Ingest {
                 associated_type,
             }),
             None => Ingest::Ignored("react-nonstandard"),
+        },
+        Message::Edit(e) => Ingest::Edited {
+            guid: e.tuuid.clone(),
+            text: e.new_parts.raw_text(),
         },
         Message::Read => Ingest::Receipt(Receipt::Read { guid, date }),
         Message::Delivered => Ingest::Receipt(Receipt::Delivered { guid, date }),
@@ -1197,6 +1228,30 @@ fn build_react_message_inst(
     inst
 }
 
+/// Build a [`MessageInst`] ready to send as an edit to a previously-sent
+/// message. Sets `inst.id` to a fresh GUID so the receiver can correlate it.
+fn build_edit_message_inst(
+    chat: &ChatRef,
+    my_handle: &str,
+    target_guid: &str,
+    edit_part: u64,
+    new_text: String,
+) -> MessageInst {
+    let conversation = conversation_from(chat);
+    let edit = EditMessage {
+        tuuid: target_guid.to_string(),
+        edit_part,
+        new_parts: MessageParts(vec![IndexedMessagePart {
+            part: MessagePart::Text(new_text, Default::default()),
+            idx: None,
+            ext: None,
+        }]),
+    };
+    let mut inst = MessageInst::new(conversation, my_handle, Message::Edit(edit));
+    inst.id = new_guid();
+    inst
+}
+
 /// Send a Delivered (`read=false`) or Read (`read=true`) receipt for `inst`,
 /// addressed from whichever of our `handles` is in the conversation.
 async fn send_receipt_for(
@@ -1549,5 +1604,183 @@ mod tests {
         }
         assert_eq!(parts2.0[0].idx, None, "single part idx should be None");
         assert!(parts2.0[0].ext.is_none(), "single part ext should be None");
+    }
+
+    /// Pin: the pure helper that builds the `MessageInst` for `send_edit`:
+    ///
+    /// * sets `inst.id` to a non-empty, unique value (regression guard: a
+    ///   missing or hardcoded id would cause the edited message to not
+    ///   correlate on the receiver side);
+    /// * wraps the caller's `(target_guid, edit_part, new_text)` into a
+    ///   `Message::Edit(EditMessage { tuuid, edit_part, new_parts })` where
+    ///   `new_parts` is a single-element `MessageParts` containing
+    ///   `MessagePart::Text(new_text, Default::default())`;
+    /// * carries `my_handle` through to `inst.sender`.
+    ///
+    /// Two calls must produce distinct ids — a correct implementation uses
+    /// `new_guid()` (or an equivalent per-call GUID generator), not a
+    /// hardcoded constant.
+    #[test]
+    fn build_edit_message_inst_wire_payload() {
+        let chat = ChatRef {
+            participants: vec!["mailto:a@icloud.com".into()],
+            display_name: None,
+            service: Some("iMessage".into()),
+        };
+        let my_handle = "tel:+15555550123";
+
+        let inst = build_edit_message_inst(
+            &chat,
+            my_handle,
+            "target-guid-xyz",
+            0,
+            "Edited body".to_string(),
+        );
+
+        // 1. inst.id is non-empty — regression guard.
+        assert!(
+            !inst.id.is_empty(),
+            "inst.id should be a freshly-generated GUID, not empty"
+        );
+
+        // 2. inst.sender carries the my_handle argument through.
+        assert_eq!(
+            inst.sender.as_deref(),
+            Some(my_handle),
+            "inst.sender should equal the my_handle argument"
+        );
+
+        // 3. inst.message is a Message::Edit carrying the caller's payload.
+        // NOTE: `rustpush::Message` has only `Display`, no `Debug` — the
+        // panic on a non-Edit variant must use `{other}`, not `{other:?}`.
+        match &inst.message {
+            Message::Edit(em) => {
+                assert_eq!(
+                    em.tuuid, "target-guid-xyz",
+                    "tuuid should be the target GUID"
+                );
+                assert_eq!(em.edit_part, 0, "edit_part should be 0");
+
+                assert_eq!(
+                    em.new_parts.0.len(),
+                    1,
+                    "new_parts should contain exactly one part"
+                );
+
+                match &em.new_parts.0[0].part {
+                    MessagePart::Text(t, _) => {
+                        assert_eq!(t, "Edited body", "text content should be preserved");
+                    }
+                    _ => panic!("expected MessagePart::Text in new_parts[0]"),
+                }
+            }
+            other => panic!("expected Message::Edit, got {other}"),
+        }
+    }
+
+    /// Pin: two calls to `build_edit_message_inst` must produce distinct
+    /// `inst.id` values — guards against a regression that hardcodes the
+    /// GUID to a constant.
+    #[test]
+    fn build_edit_message_inst_unique_ids() {
+        let chat = ChatRef {
+            participants: vec!["mailto:a@icloud.com".into()],
+            display_name: None,
+            service: Some("iMessage".into()),
+        };
+        let my_handle = "tel:+15555550123";
+
+        let inst_a = build_edit_message_inst(
+            &chat,
+            my_handle,
+            "target-guid-xyz",
+            0,
+            "Edited body".to_string(),
+        );
+        let inst_b = build_edit_message_inst(
+            &chat,
+            my_handle,
+            "target-guid-xyz",
+            0,
+            "Edited body".to_string(),
+        );
+
+        assert_ne!(
+            inst_a.id, inst_b.id,
+            "two calls to build_edit_message_inst must produce distinct ids"
+        );
+    }
+
+    /// Pin: `ingest_from` maps `Message::Edit` to `Ingest::Edited` carrying the
+    /// target message GUID and the replacement text from `EditMessage.new_parts.raw_text()`.
+    ///
+    /// This is the core mapping behavior for the "edit message" feature — the
+    /// receive loop uses `Ingest::Edited` to locate and update the stored message
+    /// in `Store::apply`.
+    #[test]
+    fn ingest_from_edit_returns_edited_ingest() {
+        let chat = ChatRef {
+            participants: vec!["tel:+15555550123".into()],
+            display_name: None,
+            service: Some("iMessage".into()),
+        };
+
+        let inst = build_edit_message_inst(
+            &chat,
+            "tel:+15555550123",
+            "TARGET-GUID-ABC",
+            0,
+            "Edited body text".to_string(),
+        );
+
+        let result = ingest_from(&inst, &["tel:+15555550123".to_string()]);
+
+        match result {
+            Ingest::Edited { guid, text } => {
+                assert_eq!(
+                    guid, "TARGET-GUID-ABC",
+                    "guid should be the EditMessage.tuuid, i.e. the target message guid"
+                );
+                assert_eq!(
+                    text, "Edited body text",
+                    "text should be the concatenated raw_text from EditMessage.new_parts"
+                );
+            }
+            other => panic!("expected Ingest::Edited, got {other:?}"),
+        }
+    }
+
+    /// Pin: the guid in `Ingest::Edited` is the **target** message GUID
+    /// (`EditMessage.tuuid`), NOT `MessageInst.id` (the edit's own identity).
+    /// This is a regression guard — using `inst.id` would make the store
+    /// update the wrong message.
+    #[test]
+    fn ingest_from_edit_guid_is_target_not_inst_id() {
+        let chat = ChatRef {
+            participants: vec!["tel:+15555550123".into()],
+            display_name: None,
+            service: Some("iMessage".into()),
+        };
+
+        let inst = build_edit_message_inst(
+            &chat,
+            "tel:+15555550123",
+            "TARGET-GUID-ABC",
+            0,
+            "Edited body text".to_string(),
+        );
+
+        let inst_id = inst.id.clone();
+        let result = ingest_from(&inst, &[] as &[String]);
+
+        match result {
+            Ingest::Edited { guid, .. } => {
+                assert_ne!(
+                    guid, inst_id,
+                    "guid must NOT be inst.id — it should be the EditMessage.tuuid target"
+                );
+            }
+            other => panic!("expected Ingest::Edited, got {other:?}"),
+        }
     }
 }

@@ -189,6 +189,21 @@ impl Backend for StubBackend {
         Ok(())
     }
 
+    #[cfg(feature = "rustpush")]
+    #[allow(clippy::too_many_arguments)]
+    async fn send_edit(
+        &self,
+        _client: &ImClient,
+        _chat: &ChatRef,
+        _my_handle: &str,
+        _target_guid: &str,
+        _edit_part: u64,
+        _new_text: String,
+        _new_guid: String,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     async fn send_attachment(
         &self,
         _client: &ImClient,
@@ -329,6 +344,41 @@ mod tests {
         assert!(
             result.is_ok(),
             "StubBackend::send_reaction should return Ok(()) for any inputs, got {result:?}"
+        );
+    }
+
+    #[cfg(feature = "rustpush")]
+    #[tokio::test]
+    async fn send_edit_returns_ok() {
+        // Pin: the `Backend::send_edit` method exists on `StubBackend` with
+        // this exact signature, and the stub returns `Ok(())` for any edit
+        // payload (the whole point of the stub is offline iteration, so the
+        // edit send is a no-op success).
+
+        let backend = StubBackend;
+        let client = ImClient::new(());
+        let chat = sample_chat_ref();
+        let my_handle = "tel:+15555550123";
+        let target_guid = "target-guid-abc";
+        let edit_part: u64 = 0;
+        let new_text = "Edited message text".to_string();
+        let new_guid = "new-guid-xyz".to_string();
+
+        let result = backend
+            .send_edit(
+                &client,
+                &chat,
+                my_handle,
+                target_guid,
+                edit_part,
+                new_text,
+                new_guid,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "StubBackend::send_edit should return Ok(()) for any inputs, got {result:?}"
         );
     }
 

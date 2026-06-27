@@ -333,6 +333,20 @@ pub trait Backend: Send + Sync {
         reaction: &ReactMessageType,
     ) -> Result<()>;
 
+    /// Send an edit to a previously-sent message in `chat`.
+    #[cfg(feature = "rustpush")]
+    #[allow(clippy::too_many_arguments)]
+    async fn send_edit(
+        &self,
+        client: &ImClient,
+        chat: &ChatRef,
+        my_handle: &str,
+        target_guid: &str,
+        edit_part: u64,
+        new_text: String,
+        new_guid: String,
+    ) -> Result<()>;
+
     /// Upload a file to MMCS and send it as an attachment. Returns the locally
     /// persistable record (with a cached `local_path`) on success.
     /// `text` is the optional caption carried with the attachment.
