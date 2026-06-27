@@ -143,7 +143,7 @@
         # software centers.
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "bubbles";
-          version = "0.1.0";
+          version = "0.2.0";
 
           # Explicit source allowlist via `lib.fileset` — only these paths are
           # copied into the build. This is deliberately independent of HOW the
