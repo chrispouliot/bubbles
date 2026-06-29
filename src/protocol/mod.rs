@@ -385,6 +385,20 @@ pub trait Backend: Send + Sync {
 
     /// Wipe the persisted login so the next launch starts at onboarding.
     fn sign_out(&self);
+
+    // --- 8. sync ---
+
+    /// Run one CloudKit sync session to backfill missed messages. Called on
+    /// launch (with a 48-hour cutoff for the first sync) and on wake (with
+    /// no cutoff, since the continuation token tracks progress). Returns a
+    /// `SyncResult` with stats; logs the result. The continuation token is
+    /// in-memory only for now (a follow-up will persist it across launches).
+    #[cfg(feature = "rustpush")]
+    async fn sync_missed_messages(
+        &self,
+        store: &Store,
+        cutoff_ms: i64,
+    ) -> crate::sync::SyncResult;
 }
 
 /// Walk the error chain and return the [`SendErrorCategory`] that best

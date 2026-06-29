@@ -193,6 +193,24 @@ impl<T: AnisetteProvider> TokenProvider<T> {
         }
         self.mme_delegate.lock().await.as_ref().expect("no MME?").tokens.get(token).ok_or(PushError::TokenMissing).cloned()
     }
+
+    // BUBBLES PATCH: getter/setter for MME cache (to be upstreamed)
+    /// Returns the cached MME delegate and when it was last refreshed.
+    /// Returns `None` if no MME auth has been performed yet (the cache is
+    /// populated lazily by `get_mme_token`).
+    pub async fn mme_state(&self) -> Option<(MobileMeDelegateResponse, SystemTime)> {
+        let delegate = self.mme_delegate.lock().await.clone();
+        let refreshed = *self.mme_refreshed.lock().await;
+        delegate.map(|d| (d, refreshed))
+    }
+
+    /// Sets the MME delegate and refresh timestamp. Used by the host app
+    /// to inject a cached MME from disk (avoiding the need to re-authenticate
+    /// on every launch when the cached token is still fresh).
+    pub async fn set_mme_state(&self, delegate: MobileMeDelegateResponse, refreshed: SystemTime) {
+        *self.mme_delegate.lock().await = Some(delegate);
+        *self.mme_refreshed.lock().await = refreshed;
+    }
 }
 
 #[derive(Deserialize)]
@@ -202,7 +220,8 @@ pub struct IDSDelegateResponse {
     pub profile_id: String,
 }
 
-#[derive(Deserialize)]
+// BUBBLES PATCH: added Serialize + Clone for MME cache
+#[derive(Deserialize, Serialize, Clone)]
 pub struct MobileMeDelegateResponse {
     pub tokens: HashMap<String, String>,
     #[serde(default)]

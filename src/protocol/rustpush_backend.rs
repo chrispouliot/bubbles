@@ -22,18 +22,18 @@
 //!   VerifyBody    <- rustpush::VerifyBody
 //!   ImClient      <- Arc<IMClient>
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use tokio::sync::{broadcast, Mutex};
 
 use rustpush::{
     APSConnection, APSMessage, AppleAccount, ArcAnisetteClient, Attachment,
-    CircleClientSession, ConversationData, DebugMutex, DefaultAnisetteProvider, EditMessage,
-    IDSNGMIdentity, IDSUser, IMClient, IdmsAuthListener, IndexedMessagePart, LPLinkMetadata,
-    LinkMeta, LoginState as RpLoginState, MMCSFile, Message, MessageInst, MessagePart,
-    MessageParts, MessageType, NormalMessage, ReactMessage, Reaction, ReactMessageType,
-    VerifyBody as RpVerifyBody,
+    CircleClientSession, ConversationData, DebugMutex, DebugRwLock, DefaultAnisetteProvider,
+    EditMessage, IDSNGMIdentity, IDSUser, IMClient, IdmsAuthListener, IndexedMessagePart,
+    LPLinkMetadata, LinkMeta, LoginState as RpLoginState, MMCSFile, Message, MessageInst,
+    MessagePart, MessageParts, MessageType, NormalMessage, OSConfig, ReactMessage, Reaction,
+    ReactMessageType, TokenProvider, VerifyBody as RpVerifyBody,
 };
 
 use crate::store::{
@@ -65,6 +65,25 @@ struct CircleHandle {
 
 pub struct RustpushBackend {
     state_path: String,
+    /// In-memory AppleAccount handle; used by `sync_missed_messages` to build
+    /// the TokenProvider / CloudKitClient / KeychainClient for batch sync.
+    /// Populated after a successful login (via `try_auth`).
+    /// Not persisted across launches.
+    account: StdMutex<Option<AppleAcct>>,
+    /// In-memory anisette client handle; used by `sync_missed_messages`.
+    /// Populated after `make_anisette` is called.
+    anisette: StdMutex<Option<Anis>>,
+    /// In-memory OS config; used by `sync_missed_messages`.
+    /// Populated by `setup_push` (or `restore_session`).
+    config: StdMutex<Option<api::JoinedOSConfig>>,
+    /// Stored APS connection; used by `reconstruct_account` to call
+    /// `try_auth` with `creds: None`.
+    /// Populated by `setup_push` (or `restore_session`).
+    conn: StdMutex<Option<Arc<BufferedApsConn>>>,
+    /// Cached MME data loaded from disk in `reconstruct_account`.
+    /// Used by `sync_missed_messages` to inject into the TokenProvider,
+    /// avoiding a full `do_login` when the cache is fresh.
+    cached_mme: StdMutex<Option<Arc<crate::sync::CachedMme>>>,
 }
 
 impl RustpushBackend {
@@ -72,6 +91,226 @@ impl RustpushBackend {
         // Caller must have run api::do_first_time_init(&state_path) once at boot.
         Self {
             state_path: state_path.into(),
+            account: StdMutex::new(None),
+            anisette: StdMutex::new(None),
+            config: StdMutex::new(None),
+            conn: StdMutex::new(None),
+            cached_mme: StdMutex::new(None),
+        }
+    }
+
+    /// Reconstruct the AppleAccount from the encrypted credentials in
+    /// `gsa.plist` via `login_email_pass`. On success, stores the
+    /// `AppleAccount` in `self.account` and returns `Ok(())`. On failure
+    /// (missing gsa.plist, decryption error, network auth failure), logs
+    /// a warning and returns `Err(())` without updating `self.account`.
+    ///
+    /// This is the auth path that lets the sync run on every launch (not
+    /// just the first). It's called from `sync_missed_messages` when the
+    /// session state is incomplete.
+    async fn reconstruct_account(&self) -> Result<(), ()> {
+        let conn_arc = self.conn.lock().unwrap().clone();
+        let conn = match conn_arc {
+            Some(c) => c,
+            None => {
+                log::debug!("reconstruct_account: no stored connection, skipping");
+                return Err(());
+            }
+        };
+        let config = match self.config.lock().unwrap().clone() {
+            Some(c) => c,
+            None => {
+                log::debug!("reconstruct_account: no stored config, skipping");
+                return Err(());
+            }
+        };
+
+        // Check that gsa.plist exists before attempting reconstruction.
+        let state_dir = std::path::PathBuf::from(&self.state_path);
+        let gsa_path = state_dir.join("gsa.plist");
+        if !gsa_path.exists() {
+            log::debug!("reconstruct_account: no gsa.plist at {}, skipping", gsa_path.display());
+            return Err(());
+        }
+
+        // Check cloud sync enabled config.
+        let bubbles_config = crate::sync::read_config(
+            &state_dir.join(crate::sync::CONFIG_FILENAME),
+        );
+        if !bubbles_config.cloud_sync_enabled {
+            log::info!("reconstruct_account: cloud sync disabled in config, skipping");
+            return Err(());
+        }
+
+        // Check sync backoff.
+        let last_error_secs = crate::sync::read_last_sync_error(
+            &state_dir.join(crate::sync::LAST_SYNC_ERROR_FILENAME),
+        );
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if !crate::sync::should_sync_now(
+            last_error_secs,
+            now_secs,
+            crate::sync::DEFAULT_BACKOFF_SECS,
+        ) {
+            log::info!(
+                "reconstruct_account: in sync backoff (last error at {:?}), skipping",
+                last_error_secs,
+            );
+            return Err(());
+        }
+
+        // Recreate the anisette from the stored connection.
+        let inner = conn.inner();
+        let anisette = api::make_anisette(self.state_path.clone(), &config, inner).await;
+        // Store the anisette even if try_auth later fails — it's expensive
+        // to recreate and may be reusable.
+        *self.anisette.lock().unwrap() = Some(anisette.clone());
+
+        // Try loading the cached MME from disk. If present and fresh,
+        // store it on self.cached_mme so sync_missed_messages can inject
+        // it into the TokenProvider, avoiding a full do_login.
+        let cached_mme_valid = if let Some(cached_mme) = crate::sync::load_cached_mme(&state_dir) {
+            if !crate::sync::mme_token_is_expired(&cached_mme, std::time::SystemTime::now()) {
+                log::info!(
+                    "reconstruct_account: cached MME token present and fresh (age: {:?}), will skip do_login",
+                    std::time::SystemTime::now()
+                        .duration_since(cached_mme.refreshed)
+                        .ok()
+                );
+                *self.cached_mme.lock().unwrap() = Some(Arc::new(cached_mme));
+                true
+            } else {
+                log::debug!("reconstruct_account: cached MME token expired, will do do_login");
+                *self.cached_mme.lock().unwrap() = None;
+                false
+            }
+        } else {
+            log::debug!("reconstruct_account: no cached MME token, will do do_login");
+            *self.cached_mme.lock().unwrap() = None;
+            false
+        };
+
+        // Call try_auth with creds: None — reads gsa.plist and decrypts the
+        // password via GSAConfig::get_password() (uses the AES keystore
+        // initialized at boot in do_first_time_init, no idms needed).
+        match api::try_auth(
+            self.state_path.clone(),
+            &config,
+            inner,
+            &anisette,
+            None,  // <- key: None means "reconstruct from gsa.plist"
+        ).await {
+            Ok((account, _login_state)) => {
+                // Only do do_login if we don't have a fresh cached MME.
+                // When the cache is fresh, we inject the saved MME into the
+                // TokenProvider in sync_missed_messages, avoiding the network
+                // call to login_apple_delegates.
+                if !cached_mme_valid {
+                    if let Err(e) = api::do_login(
+                        self.state_path.clone(),
+                        &account,
+                        None,
+                        &config,
+                    ).await {
+                        log::warn!("reconstruct_account: do_login failed: {e:?}");
+                        // Continue anyway — the account is still partially usable, and
+                        // sync_missed_messages will report the failure clearly. Storing
+                        // the account lets a future attempt (e.g., on the next launch or
+                        // wake) try do_login again without re-doing try_auth.
+                    }
+                } else {
+                    log::info!("reconstruct_account: skipped do_login (using cached MME)");
+                }
+
+                // Save the MME delegate to disk for future launches.
+                // If the cache was valid, we already have the delegate bytes
+                // in self.cached_mme — no need to create a TokenProvider and
+                // call get_mme_token. Otherwise we create a fresh TokenProvider,
+                // call get_mme_token, and serialize the result.
+                if cached_mme_valid {
+                    // Re-save the cached bytes with a fresh timestamp.
+                    if let Some(cached) = self.cached_mme.lock().unwrap().clone() {
+                        let mme = crate::sync::CachedMme {
+                            delegate_bytes: cached.delegate_bytes.clone(),
+                            refreshed: std::time::SystemTime::now(),
+                        };
+                        if let Err(e) = crate::sync::save_cached_mme(&state_dir, &mme) {
+                            log::warn!("reconstruct_account: save_cached_mme failed: {e}");
+                        } else {
+                            log::info!("reconstruct_account: MME token saved to disk");
+                        }
+                    }
+                } else {
+                    let config_arc: Arc<dyn OSConfig> = match &config {
+                        api::JoinedOSConfig::MacOS(conf) => conf.clone(),
+                        api::JoinedOSConfig::Relay(conf) => conf.clone(),
+                    };
+                    let token_provider = TokenProvider::new(account.clone(), config_arc);
+                    let mme_extracted = match token_provider.get_mme_token("mmeAuthToken").await {
+                        Ok(_token) => token_provider.mme_state().await,
+                        Err(e) => {
+                            log::warn!(
+                                "reconstruct_account: get_mme_token failed: {e:?}"
+                            );
+                            None
+                        }
+                    };
+                    if let Some((delegate, _refreshed)) = mme_extracted {
+                        let bytes = {
+                            let mut buf = Vec::new();
+                            if let Err(e) = plist::to_writer_xml(&mut buf, &delegate) {
+                                log::warn!(
+                                    "reconstruct_account: serialize MME delegate failed: {e}"
+                                );
+                                Vec::new()
+                            } else {
+                                buf
+                            }
+                        };
+                        let mme = crate::sync::CachedMme {
+                            delegate_bytes: bytes,
+                            refreshed: std::time::SystemTime::now(),
+                        };
+                        if let Err(e) = crate::sync::save_cached_mme(&state_dir, &mme) {
+                            log::warn!("reconstruct_account: save_cached_mme failed: {e}");
+                        } else {
+                            log::info!("reconstruct_account: MME token saved to disk");
+                        }
+                    } else {
+                        log::debug!("reconstruct_account: MME delegate not available after get_mme_token");
+                    }
+                }
+
+                log::info!("reconstruct_account: successfully reconstructed AppleAccount");
+                // Clear any previous sync error — a successful reconstruction
+                // means the backoff should be reset.
+                if let Err(e) = crate::sync::clear_last_sync_error(
+                    &state_dir.join(crate::sync::LAST_SYNC_ERROR_FILENAME),
+                ) {
+                    log::warn!("clear_last_sync_error failed: {e}");
+                }
+                *self.account.lock().unwrap() = Some(account);
+                Ok(())
+            }
+            Err(e) => {
+                log::warn!("reconstruct_account: try_auth failed: {e:?}");
+                // Anisette is still set; account is not. Subsequent attempts
+                // can reuse the anisette.
+                let unix_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                if let Err(write_err) = crate::sync::write_last_sync_error(
+                    &state_dir.join(crate::sync::LAST_SYNC_ERROR_FILENAME),
+                    unix_secs,
+                ) {
+                    log::warn!("write_last_sync_error failed: {write_err}");
+                }
+                Err(())
+            }
         }
     }
 }
@@ -266,6 +505,8 @@ impl Backend for RustpushBackend {
     }
 
     async fn setup_push(&self, config: &Config, identity: &Identity) -> Result<Connection> {
+        // Store the OS config for later use by sync_missed_messages.
+        *self.config.lock().unwrap() = Some(cfg(config).clone());
         // `state: None` = fresh connection. For session restore,
         // pass the saved Option<APSState> here instead.
         let (conn, err) =
@@ -273,12 +514,15 @@ impl Backend for RustpushBackend {
         if let Some(e) = err {
             log::warn!("setup_push returned a non-fatal error: {e:?}");
         }
+        *self.conn.lock().unwrap() = Some(conn.clone());
         let idms = api::make_idms(&conn).await;
         Ok(Connection::new(ConnHandle { conn, idms }))
     }
 
     async fn make_anisette(&self, config: &Config, connection: &Connection) -> Result<Anisette> {
         let a = api::make_anisette(self.state_path.clone(), cfg(config), conn(connection).conn.inner()).await;
+        // Store for later use by sync_missed_messages.
+        *self.anisette.lock().unwrap() = Some(a.clone());
         Ok(Anisette::new(a))
     }
 
@@ -299,6 +543,8 @@ impl Backend for RustpushBackend {
             creds,
         )
         .await?;
+        // Store for later use by sync_missed_messages.
+        *self.account.lock().unwrap() = Some(account.clone());
         Ok((Account::new(account), map_state(state)))
     }
 
@@ -471,6 +717,8 @@ impl Backend for RustpushBackend {
 
         let identity = api::decode_identity(&saved.identity)?;
         let config = saved.os_config.clone();
+        // Store for later use by sync_missed_messages.
+        *self.config.lock().unwrap() = Some(config.clone());
 
         // Reconnect APNs reusing the saved push state (no fresh activation).
         let (conn, err) =
@@ -478,6 +726,7 @@ impl Backend for RustpushBackend {
         if let Some(e) = err {
             log::warn!("restore setup_push returned a non-fatal error: {e:?}");
         }
+        *self.conn.lock().unwrap() = Some(conn.clone());
         let idms = api::make_idms(&conn).await;
 
         // Rehydrate the messaging client straight from the persisted
@@ -861,6 +1110,129 @@ impl Backend for RustpushBackend {
 
     fn sign_out(&self) {
         api::clear_session(&self.state_path);
+    }
+
+    #[cfg(feature = "rustpush")]
+    async fn sync_missed_messages(
+        &self,
+        store: &crate::store::Store,
+        cutoff_ms: i64,
+    ) -> crate::sync::SyncResult {
+        // Best-effort: if the session state is incomplete (e.g. after a
+        // restart), try to reconstruct the AppleAccount from gsa.plist.
+        // On failure (the common case until the follow-up stores the APS
+        // connection), the method falls through to the default-return path.
+        if self.account.lock().unwrap().is_none() {
+            let _ = self.reconstruct_account().await;
+        }
+
+        // Need all three session handles; if any is missing, the session isn't
+        // fully set up yet, so we can't sync. Return a default result.
+        let account = self.account.lock().unwrap().clone();
+        let anisette = self.anisette.lock().unwrap().clone();
+        let config = self.config.lock().unwrap().clone();
+        let (account, anisette, config) = match (account, anisette, config) {
+            (Some(a), Some(an), Some(c)) => (a, an, c),
+            _ => {
+                log::debug!(
+                    "sync_missed_messages: session state not fully populated, skipping"
+                );
+                return crate::sync::SyncResult::default();
+            }
+        };
+
+        // Build Arc<dyn OSConfig> from the JoinedOSConfig by matching on the
+        // concrete variant — each inner type already implements OSConfig.
+        let config_arc: Arc<dyn OSConfig> = match &config {
+            api::JoinedOSConfig::MacOS(conf) => conf.clone(),
+            api::JoinedOSConfig::Relay(conf) => conf.clone(),
+        };
+
+        // Read persisted CloudKit and Keychain state from disk (written by
+        // `do_login` inside `api::verify_2fa`/`api::verify_2fa_sms`).
+        let dir = std::path::PathBuf::from(&self.state_path);
+        let cloudkit_state: rustpush::cloudkit::CloudKitState =
+            match plist::from_file(dir.join("cloudkit.plist")) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("sync: failed to read cloudkit.plist: {e}");
+                    return crate::sync::SyncResult::default();
+                }
+            };
+        let keychain_state: rustpush::keychain::KeychainClientState =
+            match plist::from_file(dir.join("keychain.plist")) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("sync: failed to read keychain.plist: {e}");
+                    return crate::sync::SyncResult::default();
+                }
+            };
+
+        // Build the TokenProvider from the in-memory AppleAccount.
+        // This is the same `TokenProvider` used by the CloudKit and Keychain
+        // clients to authenticate with Apple's token service.
+        let token_provider = TokenProvider::new(account.clone(), config_arc.clone());
+
+        // Inject the cached MME if present (set in reconstruct_account).
+        // This avoids the need for a fresh do_login / get_mme_token call when
+        // the cached token is still within the 7-day expiry window.
+        // The MobileMeDelegateResponse type is not re-exported from rustpush,
+        // so we deserialize via type inference from set_mme_state's signature.
+        let cached_mme_opt = self.cached_mme.lock().unwrap().clone();
+        // Mutex guard dropped here; safe to await below.
+        if let Some(cached_mme) = cached_mme_opt {
+            if let Ok(delegate) = plist::from_bytes(&cached_mme.delegate_bytes) {
+                token_provider
+                    .set_mme_state(delegate, cached_mme.refreshed)
+                    .await;
+                log::debug!("sync_missed_messages: injected cached MME into TokenProvider");
+            } else {
+                log::warn!("sync_missed_messages: failed to deserialize cached MME");
+            }
+        }
+
+        // Build the CloudKitClient.
+        let ck_client: Arc<rustpush::cloudkit::CloudKitClient<_>> = Arc::new(
+            rustpush::cloudkit::CloudKitClient {
+                state: DebugRwLock::new(cloudkit_state),
+                anisette: anisette.clone(),
+                config: config_arc.clone(),
+                token_provider: token_provider.clone(),
+            },
+        );
+
+        // Build the KeychainClient, wired to persist state changes back to
+        // disk via the `update_state` callback.
+        let kc_path = dir.join("keychain.plist");
+        let kc_client: Arc<rustpush::keychain::KeychainClient<_>> = Arc::new(
+            rustpush::keychain::KeychainClient {
+                anisette: anisette.clone(),
+                token_provider: token_provider.clone(),
+                state: DebugRwLock::new(keychain_state),
+                config: config_arc.clone(),
+                update_state: Box::new(move |update| {
+                    if let Err(e) = plist::to_file_xml(&kc_path, update) {
+                        log::warn!("sync: failed to write keychain.plist: {e}");
+                    }
+                }),
+                container: Mutex::new(None),
+                security_container: Mutex::new(None),
+                client: ck_client.clone(),
+            },
+        );
+
+        // Build the CloudMessagesClient — the HTTP client that talks to Apple's
+        // CloudKit sync endpoint.
+        let msg_client =
+            rustpush::cloud_messages::CloudMessagesClient::new(ck_client, kc_client);
+
+        // Empty handles for now — the IS_FROM_ME flag in CloudMessage.flags is
+        // the primary signal. A follow-up can read the registered handles from
+        // disk (id.plist) to add the handle-based fallback.
+        let my_handles: Vec<String> = Vec::new();
+        let chat_map = std::collections::HashMap::new();
+
+        crate::sync::sync_once(&msg_client, store, &my_handles, &chat_map, cutoff_ms).await
     }
 }
 

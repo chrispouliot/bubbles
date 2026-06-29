@@ -18,6 +18,9 @@ mod video;
 #[cfg(feature = "rustpush")]
 mod api;
 
+#[cfg(feature = "rustpush")]
+mod sync;
+
 // The Mac-hardware protobuf, compiled by build.rs into OUT_DIR. Referenced as
 // `crate::bbhwinfo` by the vendored api subset.
 #[cfg(feature = "rustpush")]

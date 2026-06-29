@@ -965,13 +965,98 @@ pub fn enter_messaging(
 
     // Receive loop -> persist -> pulse -> refresh.
     let (tx, rx) = async_channel::unbounded::<RecvEvent>();
-    let kick = backend.start_receiving(&connection, &client, handles, store, tx);
+    let kick = backend.start_receiving(&connection, &client, handles, store.clone(), tx);
     // Wire the wake-from-sleep handler to the receive loop's kick signal.
     let monitor = std::sync::Arc::new(crate::power::PowerMonitor::new());
     crate::power::wire_wake_to_receive_loop(&monitor, std::sync::Arc::clone(&kick));
+
+    // --- Threshold-gated launch sync ---
+    // Run on launch when the gap since `last_alive` exceeds 2 hours.
+    // On first launch the file doesn't exist → gap = ∞ → sync runs.
+    #[cfg(feature = "rustpush")]
+    {
+        let backend = backend.clone();
+        let store = store.clone();
+        crate::runtime::runtime().spawn(async move {
+            let state_dir = glib::user_data_dir().join("bubbles");
+            let now_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let threshold_ms = 2 * 60 * 60 * 1000;
+
+            let last_alive = crate::sync::read_last_alive(&state_dir);
+            if crate::sync::should_sync(last_alive, now_unix_ms, threshold_ms) {
+                let cutoff_ms = last_alive
+                    .unwrap_or(now_unix_ms - 48 * 60 * 60 * 1000)
+                    .max(now_unix_ms - 48 * 60 * 60 * 1000);
+                let sync_result = backend
+                    .sync_missed_messages(&store, cutoff_ms)
+                    .await;
+                log::info!("initial sync: {sync_result:?}");
+            } else {
+                log::info!("skipping initial sync: gap < 2h, trusting push");
+            }
+        });
+    }
+
+    // --- Wake-from-sleep sync gate ---
+    // Run a sync on resume if the sleep gap exceeded 2 hours.
+    #[cfg(feature = "rustpush")]
+    {
+        let backend = backend.clone();
+        let store = store.clone();
+        monitor.on_resume(move || {
+            let backend = backend.clone();
+            let store = store.clone();
+            crate::runtime::runtime().spawn(async move {
+                let state_dir = glib::user_data_dir().join("bubbles");
+                let now_unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let threshold_ms = 2 * 60 * 60 * 1000;
+
+                let last_alive = crate::sync::read_last_alive(&state_dir);
+                if crate::sync::should_sync(last_alive, now_unix_ms, threshold_ms) {
+                    let cutoff_ms = last_alive
+                        .unwrap_or(now_unix_ms - 48 * 60 * 60 * 1000)
+                        .max(now_unix_ms - 48 * 60 * 60 * 1000);
+                    let sync_result = backend
+                        .sync_missed_messages(&store, cutoff_ms)
+                        .await;
+                    log::info!("wake sync: {sync_result:?}");
+                } else {
+                    log::info!("wake sync: skipped (gap < 2h)");
+                }
+            });
+        });
+    }
+
     // Subscribe to OS resume events (Linux only).
     #[cfg(target_os = "linux")]
     crate::power::spawn_dbus_power_monitor(std::sync::Arc::clone(&monitor));
+
+    // --- Periodic last_alive save ---
+    // Write the current timestamp every 5 minutes so the threshold gate
+    // can detect the gap on next launch / wake. Best-effort: crashes lose
+    // up to 5 minutes of staleness (negligible vs. the 2-hour threshold).
+    #[cfg(feature = "rustpush")]
+    {
+        crate::runtime::runtime().spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                let state_dir = glib::user_data_dir().join("bubbles");
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                if let Err(e) = crate::sync::write_last_alive(&state_dir, now_ms) {
+                    log::warn!("periodic last_alive save failed: {e}");
+                }
+            }
+        });
+    }
     let ui_refresh = ui.clone();
     gtk_bridge::forward(rx, move |ev| match ev {
         RecvEvent::Applied => ui_refresh.schedule_refresh(),
@@ -1585,6 +1670,88 @@ impl Ui {
         display.add(&time_row);
 
         page.add(&display);
+
+        // --- Sync ---
+        let sync_group = adw::PreferencesGroup::builder()
+            .title("Sync")
+            .description("Sync missed messages from iCloud when the app is closed or the device was off.")
+            .build();
+        let config_path = glib::user_data_dir().join("bubbles").join(crate::sync::CONFIG_FILENAME);
+        let initial_config = crate::sync::read_config(&config_path);
+        let cloud_sync_switch = adw::SwitchRow::builder()
+            .title("Enable cloud sync")
+            .subtitle("Fetches missed messages from iCloud via Apple's servers. Disable to skip the sync entirely.")
+            .active(initial_config.cloud_sync_enabled)
+            .build();
+        {
+            let config_path = config_path.clone();
+            cloud_sync_switch.connect_active_notify(move |switch| {
+                let new_config = crate::sync::BubblesConfig {
+                    cloud_sync_enabled: switch.is_active(),
+                };
+                if let Err(e) = crate::sync::write_config(&config_path, &new_config) {
+                    log::warn!("failed to write config: {e}");
+                } else {
+                    log::info!("cloud_sync_enabled toggled to {}", switch.is_active());
+                }
+            });
+        }
+        sync_group.add(&cloud_sync_switch);
+
+        // Manual "Sync Now" button — forces a sync regardless of the
+        // cloud_sync_enabled toggle (which only gates the automatic launch-gate
+        // sync). This is useful when the user wants to pull missed messages
+        // immediately, e.g., after a long period offline.
+        #[cfg(feature = "rustpush")]
+        {
+            let sync_now_row = adw::ActionRow::builder()
+                .title("Sync Now")
+                .subtitle("Fetch missed messages from iCloud right now. Works even if automatic sync is disabled.")
+                .build();
+            let sync_now_button = gtk::Button::builder()
+                .label("Sync Now")
+                .halign(gtk::Align::End)
+                .valign(gtk::Align::Center)
+                .build();
+            sync_now_button.add_css_class("pill");
+            let sync_now_status = gtk::Label::new(Some(""));
+            sync_now_status.add_css_class("dim-label");
+            let sync_now_box = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(12)
+                .build();
+            sync_now_box.append(&sync_now_status);
+            sync_now_box.append(&sync_now_button);
+            sync_now_row.add_suffix(&sync_now_box);
+            {
+                let backend = self.backend.clone();
+                let store = self.store.clone();
+                let status_label = sync_now_status.clone();
+                let button = sync_now_button.clone();
+                sync_now_button.connect_clicked(move |btn| {
+                    btn.set_sensitive(false);
+                    status_label.set_text("Syncing…");
+                    let backend = backend.clone();
+                    let store = store.clone();
+                    let status_label = status_label.clone();
+                    let button = button.clone();
+                    glib::spawn_future_local(async move {
+                        let result = backend.sync_missed_messages(&store, i64::MIN).await;
+                        let summary = match result.messages_processed {
+                            0 => "No new messages".to_string(),
+                            1 => "Synced 1 message".to_string(),
+                            n => format!("Synced {n} messages"),
+                        };
+                        status_label.set_text(&summary);
+                        log::info!("manual sync: {summary}");
+                        button.set_sensitive(true);
+                    });
+                });
+            }
+            sync_group.add(&sync_now_row);
+        }
+
+        page.add(&sync_group);
 
         // --- Account ---
         let account = adw::PreferencesGroup::builder().title("Account").build();

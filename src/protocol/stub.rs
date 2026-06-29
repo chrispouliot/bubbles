@@ -255,6 +255,15 @@ impl Backend for StubBackend {
     }
 
     fn sign_out(&self) {}
+
+    #[cfg(feature = "rustpush")]
+    async fn sync_missed_messages(
+        &self,
+        _store: &crate::store::Store,
+        _cutoff_ms: i64,
+    ) -> crate::sync::SyncResult {
+        crate::sync::SyncResult::default()
+    }
 }
 
 #[allow(dead_code)]

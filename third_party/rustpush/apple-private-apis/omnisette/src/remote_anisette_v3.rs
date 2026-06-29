@@ -228,16 +228,37 @@ impl AnisetteClient {
             }
         }
 
-        let headers = http_client.post(path)
+        let response = http_client.post(path)
             .json(&body)
-            .send().await?
-            .json::<AnisetteHeaders>().await?;
+            .send().await?;
+
+        // BUBBLES PATCH: log the HTTP status so failures are diagnosable.
+        // Without this, body-decode failures lose the status code entirely.
+        // TODO: upstream this fix.
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let preview = if body_text.len() > 200 {
+                format!("{}...", &body_text[..200])
+            } else {
+                body_text.clone()
+            };
+            log::error!(
+                "anisette get_headers returned non-success status {}: body preview: {:?}",
+                status, preview
+            );
+        }
+
+        let headers: AnisetteHeaders = serde_json::from_str(&body_text)?;
         match headers {
             AnisetteHeaders::GetHeadersError { message } => {
                 if message.contains("-45061") {
                     Err(AnisetteError::AnisetteNotProvisioned)
                 } else {
-                    panic!("Unknown error {}", message)
+                    // BUBBLES PATCH: was `panic!("Unknown error {}", message)`, which crashes
+                    // the host app on any unrecognised server error. Return the error instead so
+                    // callers can handle it gracefully. TODO: upstream this fix.
+                    Err(AnisetteError::InvalidArgument(message))
                 }
             },
             AnisetteHeaders::Headers { machine_id, one_time_password, routing_info } => {
@@ -414,7 +435,13 @@ impl AnisetteProvider for RemoteAnisetteProviderV3 {
                     client.provision(state).await?;
                     plist::to_file_xml(config_path, state)?;
                     client.get_headers(&state).await?
-                } else { panic!() }
+                } else {
+                    // BUBBLES PATCH: was `panic!()`, which crashes the host app on any
+                    // non-AnisetteNotProvisioned error (e.g., network blip during reconstruction
+                    // returns AnisetteError::ReqwestError). The function returns Result, so
+                    // propagating the error is the right behavior. TODO: upstream this fix.
+                    return Err(err);
+                }
             },
         };
         Ok(data.get_headers())
