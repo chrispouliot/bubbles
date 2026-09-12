@@ -247,8 +247,15 @@ pub async fn process_sync_page(
 ) -> ProcessPageResult {
     let mut result = ProcessPageResult::default();
 
-    for (_guid, cm) in page {
+    for (record_id, cm) in page {
         let ingest = cloud_message_to_ingest(cm, my_handles, chat_map);
+        // Remember which record name carried this guid: a deletion tombstone
+        // later names only the record.
+        let stored_guid = match &ingest {
+            Ingest::Message(m) => Some(m.guid.clone()),
+            Ingest::Tapback(t) => Some(t.guid.clone()),
+            _ => None,
+        };
 
         // Extract the date for the cap check BEFORE applying (we need it
         // even if apply fails, to decide whether to stop paginating).
@@ -256,7 +263,8 @@ pub async fn process_sync_page(
             Ingest::Message(m) => Some(m.date),
             Ingest::Tapback(t) => Some(t.date),
             Ingest::LinkPreview(_) | Ingest::Receipt(_) | Ingest::SendFailed { .. }
-            | Ingest::Edited { .. } | Ingest::Attachments { .. } | Ingest::Ignored(_) => None,
+            | Ingest::Edited { .. } | Ingest::Attachments { .. } | Ingest::CloudRecordSeen { .. }
+            | Ingest::CloudRecordDeleted { .. } | Ingest::Ignored(_) => None,
         };
 
         // Ignored records don't count.
@@ -268,6 +276,13 @@ pub async fn process_sync_page(
             log::warn!("store.apply failed during sync: {e}");
             // Still count it as processed and check the cap — we don't
             // want to retry indefinitely on a persistent error.
+        } else if let Some(guid) = stored_guid.filter(|g| *g != record_id) {
+            if let Err(e) = store
+                .apply(Ingest::CloudRecordSeen { record_id: record_id.clone(), guid })
+                .await
+            {
+                log::warn!("store.apply cloud_record failed during sync: {e}");
+            }
         }
 
         result.count += 1;
@@ -381,6 +396,8 @@ pub struct SyncResult {
     /// CloudKit fetch error all land here so the UI can show the reason
     /// instead of "No new messages".
     pub error: Option<String>,
+    /// CloudKit deletion tombstones applied across all pages.
+    pub deleted: usize,
 }
 
 impl SyncResult {
@@ -419,16 +436,35 @@ pub async fn sync_once(
 
         result.pages_processed += 1;
 
-        // Filter out `None` (CloudKit deletion tombstones) for now — the
-        // page-processing path doesn't handle them yet. A follow-up unit
-        // will add proper deletion handling.
-        let page_only_some: HashMap<String, CloudMessage> = page
-            .into_iter()
-            .filter_map(|(k, v)| v.map(|cm| (k, cm)))
-            .collect();
+        // A `None` record is a CloudKit deletion tombstone: the record was
+        // removed on another device, and only its name is known.
+        let mut live: HashMap<String, CloudMessage> = HashMap::new();
+        let mut tombstones: Vec<String> = Vec::new();
+        for (record_id, record) in page {
+            match record {
+                Some(cm) => {
+                    live.insert(record_id, cm);
+                }
+                None => tombstones.push(record_id),
+            }
+        }
+        if !tombstones.is_empty() {
+            log::info!(
+                "sync_once: page {}: {} live records, {} tombstones",
+                result.pages_processed,
+                live.len(),
+                tombstones.len()
+            );
+        }
+        for record_id in tombstones {
+            match store.apply(Ingest::CloudRecordDeleted { record_id }).await {
+                Ok(()) => result.deleted += 1,
+                Err(e) => log::warn!("store.apply tombstone failed during sync: {e}"),
+            }
+        }
 
         let page_result = process_sync_page(
-            page_only_some,
+            live,
             my_handles,
             chat_map,
             store,
@@ -1555,6 +1591,43 @@ mod tests {
             SyncResult::failed("boom".into()).error.as_deref(),
             Some("boom"),
             "SyncResult::failed must carry the reason"
+        );
+    }
+
+    /// Pin: `None` records in a sync page are deletion tombstones and must be
+    /// applied, not skipped. The live record's CloudKit record name is
+    /// remembered so a later tombstone naming only the record still finds
+    /// the message.
+    #[tokio::test]
+    async fn sync_once_applies_tombstones_by_record_name_and_by_guid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("db.sqlite")).await.unwrap();
+        let now = now_apple_ns();
+        let chat_map = HashMap::new();
+
+        // Sync 1: two live records under record names that differ from the guids.
+        let mut page1: HashMap<String, Option<CloudMessage>> = HashMap::new();
+        page1.insert("rec-keep".into(), Some(make_cm("guid-keep", "alice@example.com", "keep me", now)));
+        page1.insert("rec-gone".into(), Some(make_cm("guid-gone", "bob@example.com", "delete me", now)));
+        let syncer = MockSyncer::new(vec![(b"t".to_vec(), page1, 3)]);
+        let first = super::sync_once(&syncer, &store, &[], &chat_map, i64::MIN).await;
+        assert_eq!(first.messages_processed, 2);
+        assert_eq!(first.deleted, 0);
+        assert_eq!(store.chats().await.unwrap().len(), 2);
+
+        // Sync 2: one tombstone by record name, one whose name is a guid.
+        let mut page2: HashMap<String, Option<CloudMessage>> = HashMap::new();
+        page2.insert("rec-gone".into(), None);
+        page2.insert("guid-keep".into(), None);
+        page2.insert("rec-unknown".into(), None);
+        let syncer = MockSyncer::new(vec![(b"t".to_vec(), page2, 3)]);
+        let second = super::sync_once(&syncer, &store, &[], &chat_map, i64::MIN).await;
+        assert_eq!(second.messages_processed, 0);
+        assert_eq!(second.deleted, 3, "every tombstone is applied, unknown ones as no-ops");
+        assert!(second.error.is_none());
+        assert!(
+            store.chats().await.unwrap().is_empty(),
+            "both messages were deleted, so their (now empty) chats are gone too"
         );
     }
 

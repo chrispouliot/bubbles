@@ -61,7 +61,7 @@ pub use avatar_edit::{AvatarEdit, apply_chat_edit};
 pub use keychain::{
     build_bottle_aware_prompt_closure, build_clique_password_dialog,
     build_password_prompt_closure, build_reauth_dialog, describe_escrow_metadata_for_user,
-    present_reauth_dialog,
+    present_reauth_dialog, present_reauth_dialog_with,
 };
 use builder::*;
 use media::*;
@@ -393,6 +393,15 @@ struct Ui {
     /// notification has been sent for the current LoggedOut episode, reset
     /// back to false when Registered arrives.
     reg_notified: Rc<Cell<bool>>,
+    /// True while an automatic 6005 registration recovery is running.
+    heal_in_flight: Rc<Cell<bool>>,
+    /// Set when that recovery failed on the Apple ID password itself. No
+    /// further automatic attempts until the user re-enters it, so a bad
+    /// saved password is never replayed against Apple on every retry cycle.
+    heal_blocked: Rc<Cell<bool>>,
+    /// True while the banner button opens the re-auth dialog rather than
+    /// preferences.
+    banner_reauth: Rc<Cell<bool>>,
     /// Selection mode state for the chat list. When `is_selecting()`, left-click
     /// on a row toggles selection instead of opening the chat. Right-click shows
     /// a context menu with Select/Delete actions.
@@ -680,6 +689,9 @@ pub fn enter_messaging(
         current_text: Rc::new(RefCell::new(std::collections::HashMap::new())),
         reg_banner: reg_banner.clone(),
         reg_notified: Rc::new(Cell::new(false)),
+        heal_in_flight: Rc::new(Cell::new(false)),
+        heal_blocked: Rc::new(Cell::new(false)),
+        banner_reauth: Rc::new(Cell::new(false)),
         chat_selection: Rc::new(RefCell::new(ChatSelectionState::new())),
     };
 
@@ -1137,9 +1149,17 @@ pub fn enter_messaging(
             }
         });
     }
-    // Banner "Sign Out…" button opens the sign-out confirmation dialog.
+    // Banner button: "Re-enter Password…" while a registration recovery is
+    // waiting on the Apple ID password, otherwise "Sign Out…" which opens
+    // the preferences page with the sign-out confirmation.
     let ui_for_banner = ui.clone();
-    reg_banner.connect_button_clicked(move |_| ui_for_banner.show_preferences());
+    reg_banner.connect_button_clicked(move |_| {
+        if ui_for_banner.banner_reauth.get() {
+            ui_for_banner.registration_heal().prompt_password();
+        } else {
+            ui_for_banner.show_preferences();
+        }
+    });
 
     let ui_refresh = ui.clone();
     gtk_bridge::forward(rx, move |ev| match ev {
@@ -1184,6 +1204,24 @@ pub fn enter_messaging(
                         app.withdraw_notification("registration");
                     }
                     ui_refresh.reg_notified.set(false);
+                    ui_refresh.heal_blocked.set(false);
+                    ui_refresh.banner_reauth.set(false);
+                }
+                RegistrationStatus::AuthExpired { error } => {
+                    // Apple rejected the auth cert. Refresh the credentials
+                    // behind the same device identity rather than telling the
+                    // user to sign out. While a previous attempt is waiting on
+                    // the password, keep that banner in place.
+                    if !ui_refresh.heal_blocked.get() {
+                        ui_refresh
+                            .reg_banner
+                            .set_title("iMessage registration expired — refreshing…");
+                        ui_refresh.reg_banner.set_button_label(None::<&str>);
+                        ui_refresh.reg_banner.set_tooltip_text(Some(error));
+                        ui_refresh.reg_banner.set_revealed(true);
+                        ui_refresh.banner_reauth.set(false);
+                    }
+                    ui_refresh.registration_heal().start();
                 }
                 RegistrationStatus::Registering => {
                     ui_refresh
@@ -1223,6 +1261,119 @@ pub fn enter_messaging(
             }
         }
     });
+}
+
+/// Everything the automatic 6005 registration recovery needs, cloneable so
+/// the dialog and task callbacks can carry it around.
+#[derive(Clone)]
+struct RegistrationHeal {
+    backend: Arc<dyn Backend>,
+    client: ImClient,
+    banner: adw::Banner,
+    in_flight: Rc<Cell<bool>>,
+    blocked_on_password: Rc<Cell<bool>>,
+    banner_reauth: Rc<Cell<bool>>,
+    notified: Rc<Cell<bool>>,
+}
+
+impl RegistrationHeal {
+    /// Run `Backend::heal_registration` once, unless one is already running
+    /// or a previous run is waiting on the Apple ID password.
+    fn start(&self) {
+        if self.in_flight.get() || self.blocked_on_password.get() {
+            return;
+        }
+        self.in_flight.set(true);
+        let backend = self.backend.clone();
+        let client = self.client.clone();
+        let (tx, rx) = oneshot::channel();
+        crate::runtime::runtime().spawn(async move {
+            let _ = tx.send(backend.heal_registration(&client).await);
+        });
+        let heal = self.clone();
+        glib::spawn_future_local(async move {
+            let result = rx.await;
+            heal.in_flight.set(false);
+            match result {
+                Ok(Ok(())) => {
+                    // The resource watcher reports Registered (or another
+                    // failure) once the re-registration finishes.
+                    log::info!("registration heal: credentials refreshed; re-registration submitted");
+                }
+                Ok(Err(reason)) if reason.contains(crate::protocol::APPLE_LOGIN_FAILED_PREFIX) => {
+                    log::warn!("registration heal needs the Apple ID password: {reason}");
+                    heal.blocked_on_password.set(true);
+                    heal.show_password_needed(&reason);
+                    heal.prompt_password();
+                }
+                Ok(Err(reason)) => {
+                    log::error!("registration heal failed: {reason}");
+                    heal.show_logged_out(&reason);
+                }
+                Err(_) => {
+                    log::error!("registration heal task was cancelled");
+                    heal.show_logged_out("registration recovery was interrupted");
+                }
+            }
+        });
+    }
+
+    fn show_password_needed(&self, reason: &str) {
+        self.banner
+            .set_title("Apple ID password needed to restore iMessage");
+        self.banner.set_button_label(Some("Re-enter Password…"));
+        self.banner.set_tooltip_text(Some(reason));
+        self.banner.set_revealed(true);
+        self.banner_reauth.set(true);
+    }
+
+    fn show_logged_out(&self, reason: &str) {
+        self.banner.set_title("Logged out by Apple — sign in again");
+        self.banner.set_button_label(Some("Sign Out…"));
+        self.banner.set_tooltip_text(Some(reason));
+        self.banner.set_revealed(true);
+        self.banner_reauth.set(false);
+        if !self.notified.replace(true) {
+            if let Some(app) = gtk::gio::Application::default() {
+                let n = gtk::gio::Notification::new("Logged out by Apple");
+                n.set_body(Some(reason));
+                app.send_notification(Some("registration"), &n);
+            }
+        }
+    }
+
+    /// Open the re-enter-password dialog; on success, clear the password
+    /// block and run the recovery again with the fresh credentials.
+    fn prompt_password(&self) {
+        let status_banner = self.banner.clone();
+        let heal = self.clone();
+        present_reauth_dialog_with(
+            self.backend.clone(),
+            move |status| status_banner.set_title(status),
+            move || {
+                heal.blocked_on_password.set(false);
+                heal.banner_reauth.set(false);
+                heal.banner.set_button_label(None::<&str>);
+                heal.banner
+                    .set_title("Signed in — refreshing iMessage registration…");
+                heal.start();
+            },
+        );
+    }
+}
+
+impl Ui {
+    fn registration_heal(&self) -> RegistrationHeal {
+        RegistrationHeal {
+            backend: self.backend.clone(),
+            client: self.client.clone(),
+            banner: self.reg_banner.clone(),
+            in_flight: self.heal_in_flight.clone(),
+            blocked_on_password: self.heal_blocked.clone(),
+            banner_reauth: self.banner_reauth.clone(),
+            notified: self.reg_notified.clone(),
+        }
+    }
 }
 
 /// A file the user has picked but not yet sent.

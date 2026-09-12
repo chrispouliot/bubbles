@@ -955,9 +955,7 @@ impl super::Ui {
                                 // offer to re-enter it right away, without
                                 // the full sign-out that also drops the
                                 // hardware pairing.
-                                if e.contains(
-                                    crate::protocol::rustpush_backend::APPLE_LOGIN_FAILED_PREFIX,
-                                ) {
+                                if e.contains(crate::protocol::APPLE_LOGIN_FAILED_PREFIX) {
                                     present_reauth_dialog(backend_ui.clone(), status_label.clone());
                                 }
                                 return;

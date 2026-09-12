@@ -179,7 +179,22 @@ pub enum RegistrationStatus {
         /// Human-readable error description.
         error: String,
     },
+    /// Apple rejected the IDS auth cert behind the registration (error 6005).
+    /// Re-registering with the same cert cannot fix this; the credentials
+    /// behind it have to be refreshed with a fresh Apple ID login
+    /// ([`Backend::heal_registration`]). The UI runs that recovery and only
+    /// reports a logout if it fails.
+    AuthExpired {
+        /// Human-readable error description.
+        error: String,
+    },
 }
+
+/// Prefix of every backend error that means the Apple ID password login
+/// itself did not complete (rejected password, missing saved credentials,
+/// interactive verification required). The UI matches on it to offer the
+/// "re-enter password" dialog instead of a sign-out.
+pub const APPLE_LOGIN_FAILED_PREFIX: &str = "Apple ID login failed";
 
 /// What the receive loop pulses to the UI. Stored events collapse to `Applied`
 /// (the UI re-queries); typing is ephemeral and carried inline.
@@ -435,6 +450,18 @@ pub trait Backend: Send + Sync {
         _password: &str,
     ) -> std::result::Result<String, String> {
         Err("re-authentication is not supported by this backend".to_string())
+    }
+
+    /// Recover from [`RegistrationStatus::AuthExpired`]: try a plain
+    /// re-register, and if Apple still rejects the auth cert, refresh the
+    /// Apple-account credentials behind it with a fresh login and re-register
+    /// with those. Reuses the existing device identity, push token and
+    /// identity keys, so no new device appears on the account. `Ok` means a
+    /// re-registration with fresh credentials was submitted; the resource
+    /// state watcher reports the outcome. Errors starting with
+    /// [`APPLE_LOGIN_FAILED_PREFIX`] need the user's password.
+    async fn heal_registration(&self, _client: &ImClient) -> std::result::Result<(), String> {
+        Err("registration recovery is not supported by this backend".to_string())
     }
 
     // --- 8. sync ---

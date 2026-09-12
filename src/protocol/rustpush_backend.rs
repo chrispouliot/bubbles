@@ -264,10 +264,133 @@ impl RustpushBackend {
     }
 }
 
-/// Prefix of every `reconstruct_account` / `reauth_with_password` error that
-/// means the Apple ID password login itself did not complete. The Sync Now
-/// UI matches on this to offer the "re-enter password" dialog.
-pub const APPLE_LOGIN_FAILED_PREFIX: &str = "Apple ID login failed";
+/// Diagnostic: log the record types, change kinds and field names present in
+/// a CloudKit zone, without decrypting any values. Apple keeps "Recently
+/// Deleted" messages and message edits in zones rustpush has no types for,
+/// so this is how their schema gets learned from real data before the sync
+/// acts on them. Never fails the sync; every problem is just logged.
+async fn log_zone_schema<P: rustpush::AnisetteProvider>(
+    client: &rustpush::cloud_messages::CloudMessagesClient<P>,
+    zone_name: &str,
+) {
+    use rustpush::cloudkit::{CloudKitSession, FetchRecordChangesOperation, NO_ASSETS};
+    use rustpush::cloudkit_proto::RetrieveChangesRequest;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let container = match client.get_container().await {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("zone schema {zone_name}: container unavailable: {e:?}");
+            return;
+        }
+    };
+    let zone = container.private_zone(zone_name.to_string());
+    let request = RetrieveChangesRequest {
+        sync_continuation_token: None,
+        zone_identifier: Some(zone),
+        requested_changes_types: Some(3),
+        assets_to_download: Some(NO_ASSETS.clone()),
+        newest_first: Some(true),
+        max_changes: Some(50),
+        ..Default::default()
+    };
+    let (_assets, response) = match container
+        .perform(&CloudKitSession::new(), FetchRecordChangesOperation(request))
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("zone schema {zone_name}: fetch failed: {e:?}");
+            return;
+        }
+    };
+
+    // (record type, record vs tombstone, change type) -> (count, field set)
+    let mut summary: BTreeMap<String, (usize, BTreeSet<String>)> = BTreeMap::new();
+    for change in &response.change {
+        let record_type = change
+            .record_type
+            .as_ref()
+            .map(|t| t.name().to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let kind = if change.record.is_some() { "record" } else { "tombstone" };
+        let entry = summary
+            .entry(format!("{record_type} [{kind}, change type {:?}]", change.r#type))
+            .or_default();
+        entry.0 += 1;
+        if let Some(record) = &change.record {
+            for field in &record.record_field {
+                let name = field
+                    .identifier
+                    .as_ref()
+                    .map(|i| i.name().to_string())
+                    .unwrap_or_default();
+                let value_type = field
+                    .value
+                    .as_ref()
+                    .map(|v| format!("{:?}", v.r#type()))
+                    .unwrap_or_default();
+                entry.1.insert(format!("{name}:{value_type}"));
+            }
+        }
+    }
+    log::info!(
+        "zone schema {zone_name}: {} changes in the newest page, status {}",
+        response.change.len(),
+        response.status()
+    );
+    for (what, (count, fields)) in summary {
+        log::info!(
+            "zone schema {zone_name}: {count} x {what}: fields [{}]",
+            fields.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+}
+
+impl RustpushBackend {
+    /// Recover from an IDS 6005 ("bad auth cert") on the identity resource.
+    ///
+    /// Step 1 is a plain re-register: cheap, and enough when Apple's state
+    /// was only momentarily inconsistent. `refresh_now` (not `refresh`) is
+    /// used because only it wakes the resource manager out of a backoff
+    /// sleep. Step 2 refreshes the Apple-account credentials behind the
+    /// registration with a full `do_login` (`reconstruct_account`) and
+    /// re-registers with the fresh IDS auth, which is the only thing that
+    /// clears a 6005 caused by a stale auth cert. Neither step touches the
+    /// hardware identity, the push token or the identity keys, so Apple sees
+    /// the same device renewing itself, not a new one.
+    async fn heal_6005(&self, imclient: &Arc<IMClient>) -> std::result::Result<(), String> {
+        match imclient.identity.refresh_now().await {
+            Ok(()) => {
+                log::info!("6005 heal: plain re-register succeeded");
+                return Ok(());
+            }
+            Err(e) => log::warn!(
+                "6005 heal: plain re-register failed ({e:?}); refreshing Apple account credentials"
+            ),
+        }
+        match self.reconstruct_account(true).await {
+            Ok(Some(new_user)) => {
+                // update_users swaps in the fresh IDSUser (new auth cert) and
+                // triggers a re-register that uses it.
+                imclient
+                    .identity
+                    .resource
+                    .update_users(vec![new_user])
+                    .await
+                    .map_err(|e| format!("re-register with refreshed credentials failed: {e:?}"))?;
+                log::info!("6005 heal: re-registered with refreshed Apple account credentials");
+                Ok(())
+            }
+            Ok(None) => Err(
+                "Apple account signed in, but refreshing the iMessage login (do_login) failed; \
+                 see the log for the cause"
+                    .to_string(),
+            ),
+            Err(reason) => Err(reason),
+        }
+    }
+}
 
 /// Stamp `last_sync_error` with "now" so the automatic launch/wake sync backs
 /// off instead of repeating a login that just failed.
@@ -347,21 +470,20 @@ pub fn registration_status_from(state: &rustpush::ResourceState) -> Registration
         rustpush::ResourceState::Generating => RegistrationStatus::Registering,
         rustpush::ResourceState::Failed(failure) => {
             let error = failure.error.to_string();
+            // IDS 6005 "bad authentication": Apple rejected our auth cert.
+            // The resource manager's own retry re-registers with the same
+            // cert and cannot recover; the credentials behind it have to be
+            // refreshed (`Backend::heal_registration`). Report it as its own
+            // state so the UI runs that recovery instead of announcing a
+            // logout, whatever `retry_wait` says.
+            if is_6005_error(&failure.error) {
+                return RegistrationStatus::AuthExpired { error };
+            }
             match failure.retry_wait {
-                Some(retry_in_s) => {
-                    // IDS 6005 "bad authentication" failures are permanent
-                    // auth errors — a passive retry loop will never recover.
-                    // Surface them as LoggedOut (re-auth required) even when
-                    // the resource manager suggests a retry_wait backoff.
-                    if is_6005_error(&failure.error) {
-                        RegistrationStatus::LoggedOut { error }
-                    } else {
-                        RegistrationStatus::TransientFailure {
-                            retry_in_s,
-                            error,
-                        }
-                    }
-                }
+                Some(retry_in_s) => RegistrationStatus::TransientFailure {
+                    retry_in_s,
+                    error,
+                },
                 None => RegistrationStatus::LoggedOut { error },
             }
         }
@@ -1121,72 +1243,15 @@ impl Backend for RustpushBackend {
                 log::warn!(
                     "send failed with IDS 6005; attempting cert self-heal (this can take a few seconds)"
                 );
-                // First, force a re-register on the IMClient's
-                // IdentityManager. If Apple's state has cleared since the
-                // last rereg, this succeeds and the cert is updated in
-                // place. If it times out or fails for any other reason
-                // (e.g. rereg endpoint hung — the typical case after a
-                // suspend), fall back to a full `do_login` via
-                // `reconstruct_account(force: true)`. That's the same path
-                // a fresh launch takes, so it always succeeds when the
-                // Apple account state on disk is intact — and the user
-                // reported that "quit and relaunch it works again," which
-                // is exactly this path.
-                let retry_send = || async {
-                    let mut guard = inst.lock().await;
-                    imclient.send(&mut guard).await
-                };
-                // Use `refresh_now` (not `refresh`) — `refresh` signals on
-                // `retry_signal`, which the ResourceManager's backoff sleep
-                // does not wait on, so a refresh-while-backoff just times
-                // out at MAX_RESOURCE_WAIT (30s). `refresh_now` signals on
-                // `retry_now_signal`, which the backoff sleep *does* wait
-                // on, so it actually wakes the sleep and triggers a fresh
-                // generation. Without this, the cert self-heal was a no-op
-                // every time the resource was in a backoff window.
-                match imclient.identity.refresh_now().await {
+                match self.heal_6005(&imclient).await {
                     Ok(()) => {
-                        log::info!("cert self-heal: re-register succeeded, retrying send");
-                        retry_send().await
+                        log::info!("cert self-heal succeeded, retrying send");
+                        let mut guard = inst.lock().await;
+                        imclient.send(&mut guard).await
                     }
-                    Err(rereg_err) => {
-                        log::warn!(
-                            "cert self-heal: re-register failed ({rereg_err:?}), \
-                             trying do_login fallback (this may take a few seconds)"
-                        );
-                        match self.reconstruct_account(true).await {
-                            Ok(Some(new_user)) => {
-                                log::info!(
-                                    "cert self-heal: do_login fallback succeeded, \
-                                     updating IdentityResource and retrying send"
-                                );
-                                // Update the IMClient's IdentityResource with the
-                                // fresh user data from do_login. update_users
-                                // replaces the users list and triggers a
-                                // re-register (refresh_now), which uses the fresh
-                                // cert/key material from the new IDSUser.
-                                imclient.identity.resource.update_users(vec![new_user]).await.ok();
-                                retry_send().await
-                            }
-                            Ok(None) => {
-                                // do_login failed but try_auth succeeded — the
-                                // account is reconstructed but no fresh user data
-                                // is available. Retry the send with whatever state
-                                // exists.
-                                log::warn!(
-                                    "cert self-heal: do_login returned no user, \
-                                     retrying send anyway"
-                                );
-                                retry_send().await
-                            }
-                            Err(reason) => {
-                                log::error!(
-                                    "cert self-heal: do_login fallback also failed ({reason}); \
-                                     original rereg error: {rereg_err:?}"
-                                );
-                                Err(e)
-                            }
-                        }
+                    Err(reason) => {
+                        log::error!("cert self-heal failed ({reason}); giving up on this send");
+                        Err(e)
                     }
                 }
             }
@@ -1557,6 +1622,15 @@ impl Backend for RustpushBackend {
         let msg_client =
             rustpush::cloud_messages::CloudMessagesClient::new(ck_client, kc_client);
 
+        // Manual sync only: log the shape of the zones Apple uses for
+        // "Recently Deleted" and message edits, so deletions that are not
+        // plain tombstones can be implemented from real data.
+        if force {
+            for zone in ["recoverableMessageDeleteZone", "messageUpdateZone"] {
+                log_zone_schema(&msg_client, zone).await;
+            }
+        }
+
         // Our registered handles back up the IS_FROM_ME flag for from-me
         // detection.
         let my_handles = api::registered_handles(&self.state_path);
@@ -1736,6 +1810,11 @@ impl Backend for RustpushBackend {
 
     async fn stored_apple_id(&self) -> Option<String> {
         api::stored_username(&self.state_path)
+    }
+
+    async fn heal_registration(&self, c: &ImClient) -> std::result::Result<(), String> {
+        let imclient = client(c).clone();
+        self.heal_6005(&imclient).await
     }
 
     async fn reauth_with_password(
@@ -4533,83 +4612,48 @@ mod tests {
         }
     }
 
-    /// Pin: an IDS 6005 "bad authentication" failure that arrives with a
-    /// non-None `retry_wait` must still be surfaced to the app as
-    /// `RegistrationStatus::LoggedOut` — not `TransientFailure`.
+    /// Pin: an IDS 6005 "bad authentication" failure maps to
+    /// `RegistrationStatus::AuthExpired`, whatever `retry_wait` says.
     ///
-    /// Background: at launch, the IdentityManager's auto-rereg can fail
-    /// with `PushError::AuthInvalid(IDSError(6005))` (Apple's
-    /// "Bad authentication, re-enter device details if persistent" — the
-    /// "stale IDS cert" symptom). The ResourceManager wraps that into a
-    /// `ResourceState::Failed(ResourceFailure { retry_wait: Some(N), error })`
-    /// and the receive loop forwards it to the UI via
-    /// `registration_status_from`. The current implementation keys
-    /// purely on `retry_wait`: any `Some(_)` → `TransientFailure`. That
-    /// is wrong for auth-invalid 6005 — Apple's 6005 means the existing
-    /// credentials are no longer accepted; a passive backoff retry won't
-    /// recover, and the user must re-onboard. Surfacing 6005 as a
-    /// transient retry causes the UI to show a "retrying..." banner that
-    /// never resolves instead of the re-auth prompt the user needs to
-    /// see.
-    ///
-    /// This test pins the contract: 6005 (any wrapping form the resource
-    /// manager might produce) must map to `LoggedOut`, with the
-    /// underlying 6005 / "authentication" cause preserved in the error
-    /// string so the UI can show a useful message.
+    /// Apple's 6005 means the IDS auth cert behind the registration is no
+    /// longer accepted. The resource manager keeps retrying the re-register
+    /// with that same cert (`retry_wait: Some`), which can never succeed, so
+    /// reporting it as `TransientFailure` shows a "retrying" banner that
+    /// never resolves. Reporting it as `LoggedOut` (the previous contract)
+    /// sent the user through a full sign-out, which also creates a new
+    /// device on the account. `AuthExpired` is what makes the UI run
+    /// `Backend::heal_registration`, which refreshes the credentials behind
+    /// the same device identity. The 6005 cause stays in the error string.
     #[test]
-    fn registration_status_maps_6005_retry_failure_to_logged_out() {
-        // The exact input the IdentityManager's resource state
-        // observer can produce at launch: a ResourceFailure carrying
-        // an AuthInvalid(6005) inner error, with the resource manager
-        // suggesting a 300s backoff retry. The pre-fix implementation
-        // keys on `retry_wait` alone and maps this to
-        // `TransientFailure { retry_in_s: 300, ... }`, which is the
-        // bug: the UI then loops a transient retry banner forever
-        // instead of prompting the user to re-auth.
-        let failure = rustpush::ResourceFailure {
-            retry_wait: Some(300),
-            error: Arc::new(rustpush::PushError::AuthInvalid(IDSError(6005))),
-        };
-        let state = rustpush::ResourceState::Failed(failure);
-
-        let status = super::registration_status_from(&state);
-
-        // PRIMARY assertion: must be LoggedOut (re-auth), NOT
-        // TransientFailure. The pre-fix code returns the latter.
-        match &status {
-            RegistrationStatus::LoggedOut { error } => {
-                // The error string must still surface the underlying
-                // 6005 / bad-authentication cause so the UI can
-                // render a useful message ("re-enter your Apple ID
-                // password", etc.) rather than a generic
-                // "logged out" string. The Display impl of
-                // `PushError::AuthInvalid(IDSError(6005))` includes
-                // both "6005" and "authentication" (the latter
-                // because IDSError's Display for 6005 is "Bad
-                // authentication, try again and re-enter device
-                // details if persistent. (6005)" and the
-                // thiserror wrapper prepends "Bad auth cert "). We
-                // accept either — both prove the 6005 cause is
-                // preserved.
-                assert!(
+    fn registration_status_maps_6005_failure_to_auth_expired() {
+        for retry_wait in [Some(300), None] {
+            let failure = rustpush::ResourceFailure {
+                retry_wait,
+                error: Arc::new(rustpush::PushError::AuthInvalid(IDSError(6005))),
+            };
+            let state = rustpush::ResourceState::Failed(failure);
+            match super::registration_status_from(&state) {
+                RegistrationStatus::AuthExpired { error } => assert!(
                     error.contains("6005") || error.contains("authentication"),
-                    "LoggedOut error string should mention the underlying \
-                     6005 / bad-authentication cause, got: {error:?}"
-                );
+                    "AuthExpired error string should mention the 6005 cause, got: {error:?}"
+                ),
+                other => panic!(
+                    "6005 with retry_wait {retry_wait:?} must map to AuthExpired, got {other:?}"
+                ),
             }
-            RegistrationStatus::TransientFailure { retry_in_s, error } => {
-                panic!(
-                    "6005 AuthInvalid with retry_wait:Some(300) must map to \
-                     LoggedOut (re-auth required), NOT TransientFailure \
-                     (silent retry loop). The UI is currently showing a \
-                     transient retry banner for a permanent auth failure. \
-                     retry_in_s={retry_in_s} error={error:?}"
-                );
-            }
-            other => panic!(
-                "expected LoggedOut for IDS 6005 AuthInvalid, got {other:?}"
-            ),
         }
+
+        // The wrapped form the receive path produces.
+        let wrapped = rustpush::ResourceFailure {
+            retry_wait: Some(600),
+            error: Arc::new(rustpush::PushError::DoNotRetry(Box::new(
+                rustpush::PushError::AuthInvalid(IDSError(6005)),
+            ))),
+        };
+        assert!(matches!(
+            super::registration_status_from(&rustpush::ResourceState::Failed(wrapped)),
+            RegistrationStatus::AuthExpired { .. }
+        ));
     }
 }
 

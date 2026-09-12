@@ -319,6 +319,22 @@ pub fn present_reauth_dialog(
     backend: std::sync::Arc<dyn crate::protocol::Backend>,
     status_label: gtk::Label,
 ) {
+    present_reauth_dialog_with(backend, move |status| status_label.set_text(status), || {});
+}
+
+/// [`present_reauth_dialog`] with callbacks instead of a label: `set_status`
+/// receives every progress/outcome line, and `on_success` runs once Apple
+/// accepted the password and the saved credentials were rewritten. Must be
+/// called on the GTK main thread.
+pub fn present_reauth_dialog_with(
+    backend: std::sync::Arc<dyn crate::protocol::Backend>,
+    set_status: impl Fn(&str) + 'static,
+    on_success: impl Fn() + 'static,
+) {
+    use std::rc::Rc;
+    let set_status: Rc<dyn Fn(&str)> = Rc::new(set_status);
+    let on_success: Rc<dyn Fn()> = Rc::new(on_success);
+
     // The saved username comes from a file, so read it on the tokio side and
     // only build the dialog once it is known.
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
@@ -338,27 +354,29 @@ pub fn present_reauth_dialog(
             let username = user_entry.text().to_string();
             let password = pass_entry.text().to_string();
             if username.is_empty() || password.is_empty() {
-                status_label.set_text("Enter both your Apple ID and password");
+                set_status("Enter both your Apple ID and password");
                 return;
             }
-            status_label.set_text("Signing in…");
+            set_status("Signing in…");
             let (tx, rx) = tokio::sync::oneshot::channel();
             let backend = backend.clone();
             crate::runtime::runtime().spawn(async move {
                 let _ = tx.send(backend.reauth_with_password(&username, &password).await);
             });
-            let status_label = status_label.clone();
+            let set_status = set_status.clone();
+            let on_success = on_success.clone();
             glib::spawn_future_local(async move {
                 match rx.await {
                     Ok(Ok(msg)) => {
                         log::info!("reauth: {msg}");
-                        status_label.set_text(&msg);
+                        set_status(&msg);
+                        on_success();
                     }
                     Ok(Err(e)) => {
                         log::error!("reauth: {e}");
-                        status_label.set_text(&format!("Sign-in failed: {e}"));
+                        set_status(&format!("Sign-in failed: {e}"));
                     }
-                    Err(_) => status_label.set_text("Sign-in failed"),
+                    Err(_) => set_status("Sign-in failed"),
                 }
             });
         });

@@ -150,6 +150,14 @@ pub enum Ingest {
         guid: String,
         attachments: Vec<AttachmentRecord>,
     },
+    /// The CloudKit record name under which `guid` was synced. A deletion
+    /// tombstone carries only the record name, so this is how it finds the
+    /// row later.
+    CloudRecordSeen { record_id: String, guid: String },
+    /// A CloudKit deletion tombstone: the record was deleted on another
+    /// device. Removes the message, its reactions and previews, and the chat
+    /// itself once nothing is left in it. Unknown records are a no-op.
+    CloudRecordDeleted { record_id: String },
     /// A recognized-but-unstored control event; the &str names the variant.
     #[allow(dead_code)]
     Ignored(&'static str),

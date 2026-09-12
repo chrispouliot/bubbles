@@ -192,6 +192,18 @@ pub fn migrate(c: &Connection) -> rusqlite::Result<()> {
         )?;
         v = 9;
     }
+    if v < 10 {
+        // CloudKit record name -> message guid, so a deletion tombstone
+        // (which carries only the record name) can find the row to remove.
+        c.execute_batch(
+            "CREATE TABLE cloud_record(
+                record_id TEXT PRIMARY KEY,
+                guid      TEXT NOT NULL
+             );
+             CREATE INDEX idx_cloud_record_guid ON cloud_record(guid);",
+        )?;
+        v = 10;
+    }
     c.pragma_update(None, "user_version", v)?;
     Ok(())
 }
@@ -658,9 +670,74 @@ pub fn apply_blocking(c: &mut Connection, ingest: Ingest) -> rusqlite::Result<()
             )?;
         }
         Ingest::Attachments { guid, attachments } => attach_files(&tx, &guid, &attachments)?,
+        Ingest::CloudRecordSeen { record_id, guid } => {
+            tx.execute(
+                "INSERT OR REPLACE INTO cloud_record(record_id, guid) VALUES (?1, ?2)",
+                params![record_id, guid],
+            )?;
+        }
+        Ingest::CloudRecordDeleted { record_id } => delete_cloud_record(&tx, &record_id)?,
         Ingest::Ignored(_) => {}
     }
     tx.commit()
+}
+
+/// Apply a CloudKit deletion tombstone. The record name maps to a guid
+/// through `cloud_record`; when no mapping exists the name is tried as the
+/// guid itself. Removes reactions targeting the message and its link
+/// previews, then the row (attachments cascade), and drops the chat when it
+/// is left empty, the same way a conversation deleted on the phone
+/// disappears there.
+fn delete_cloud_record(c: &Connection, record_id: &str) -> rusqlite::Result<()> {
+    let guid: String = c
+        .query_row(
+            "SELECT guid FROM cloud_record WHERE record_id = ?1",
+            params![record_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| record_id.to_string());
+    c.execute("DELETE FROM cloud_record WHERE record_id = ?1", params![record_id])?;
+
+    let chat_id: Option<i64> = c
+        .query_row(
+            "SELECT chat_id FROM message WHERE guid = ?1",
+            params![guid],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(chat_id) = chat_id else {
+        return Ok(());
+    };
+
+    c.execute("DELETE FROM message WHERE associated_guid = ?1", params![guid])?;
+    c.execute(
+        "DELETE FROM message_link_preview WHERE message_guid = ?1",
+        params![guid],
+    )?;
+    c.execute("DELETE FROM message WHERE guid = ?1", params![guid])?;
+
+    let remaining: i64 = c.query_row(
+        "SELECT COUNT(*) FROM message WHERE chat_id = ?1",
+        params![chat_id],
+        |r| r.get(0),
+    )?;
+    if remaining == 0 {
+        c.execute("DELETE FROM chat WHERE id = ?1", params![chat_id])?;
+        c.execute_batch(
+            "DELETE FROM handle
+             WHERE id NOT IN (SELECT handle_id FROM chat_participant)
+               AND id NOT IN (SELECT sender_handle_id FROM message WHERE sender_handle_id IS NOT NULL)",
+        )?;
+    } else {
+        c.execute(
+            "UPDATE chat SET last_message_date =
+                (SELECT MAX(date) FROM message WHERE chat_id = ?1)
+             WHERE id = ?1",
+            params![chat_id],
+        )?;
+    }
+    Ok(())
 }
 
 /// Inbound messages newer than `date` (a notification watermark), oldest-first.
@@ -1493,6 +1570,83 @@ mod tests {
             .map(|m| m.guid)
             .collect();
         assert!(still.contains(&"G-BARE".to_string()), "never move out of a properly keyed chat");
+    }
+
+    /// Pin: a CloudKit deletion tombstone removes the message it names (via
+    /// the record-name mapping, or the name used directly as the guid),
+    /// takes reactions on it along, and drops the chat once it is empty.
+    /// Unknown records and chats with other messages left are untouched.
+    #[test]
+    fn cloud_tombstone_removes_message_reactions_and_empty_chat() {
+        let mut c = db();
+        let other_chat = ChatRef {
+            participants: vec!["tel:+99999".into(), "mailto:me@icloud.com".into()],
+            display_name: None,
+            service: Some("iMessage".into()),
+        };
+
+        // Chat A: one message, mapped to a CloudKit record name, plus a reaction.
+        apply_blocking(&mut c, Ingest::Message(msg("M-A", 1000))).unwrap();
+        apply_blocking(
+            &mut c,
+            Ingest::CloudRecordSeen { record_id: "rec-A".into(), guid: "M-A".into() },
+        )
+        .unwrap();
+        apply_blocking(
+            &mut c,
+            Ingest::Tapback(Tapback {
+                guid: "T-A".into(),
+                chat: chat_1to1(),
+                sender: Some("mailto:asd@icloud.com".into()),
+                is_from_me: false,
+                date: 1001,
+                associated_guid: "M-A".into(),
+                associated_part: None,
+                associated_type: 2000,
+            }),
+        )
+        .unwrap();
+        // Chat B: two messages, record name equal to the guid.
+        apply_blocking(
+            &mut c,
+            Ingest::Message(IncomingMessage { chat: other_chat.clone(), ..msg("M-B1", 2000) }),
+        )
+        .unwrap();
+        apply_blocking(
+            &mut c,
+            Ingest::Message(IncomingMessage { chat: other_chat.clone(), ..msg("M-B2", 3000) }),
+        )
+        .unwrap();
+        assert_eq!(query_chats(&c).unwrap().len(), 2);
+
+        // Unknown record: no-op.
+        apply_blocking(&mut c, Ingest::CloudRecordDeleted { record_id: "rec-nope".into() }).unwrap();
+        assert_eq!(query_chats(&c).unwrap().len(), 2);
+
+        // Tombstone by record name: message, its reaction and the emptied chat go.
+        apply_blocking(&mut c, Ingest::CloudRecordDeleted { record_id: "rec-A".into() }).unwrap();
+        let chats = query_chats(&c).unwrap();
+        assert_eq!(chats.len(), 1, "chat A must be dropped once empty, got {:?}", chats.iter().map(|ch| &ch.key).collect::<Vec<_>>());
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM message WHERE guid IN ('M-A', 'T-A')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "message and its reaction must both be deleted");
+        let mapped: i64 = c
+            .query_row("SELECT COUNT(*) FROM cloud_record", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mapped, 0, "the record mapping is cleaned up with the message");
+
+        // Tombstone whose name is the guid itself: chat B keeps its other message.
+        apply_blocking(&mut c, Ingest::CloudRecordDeleted { record_id: "M-B2".into() }).unwrap();
+        let chats = query_chats(&c).unwrap();
+        assert_eq!(chats.len(), 1);
+        let left: Vec<String> = query_messages(&c, chats[0].id)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.guid)
+            .collect();
+        assert_eq!(left, vec!["M-B1".to_string()]);
+        assert_eq!(chats[0].last_message_date, Some(2000), "chat date recomputed after the delete");
     }
 
     #[test]
@@ -2549,7 +2703,7 @@ mod tests {
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 9, "user_version must be 9 after migration from a v4 base");
+        assert_eq!(v, 10, "user_version must be 10 after migration from a v4 base");
     }
 
     #[test]
@@ -3145,12 +3299,20 @@ mod tests {
     }
 
     #[test]
-    fn migration_bumps_user_version_to_9() {
+    fn migration_bumps_user_version_to_10() {
         let c = db();
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 9, "migration must bump user_version to 9");
+        assert_eq!(v, 10, "migration must bump user_version to 10");
+        let cloud_record_table: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'cloud_record'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cloud_record_table, 1, "v10 adds the cloud_record mapping table");
 
         let width_col: i64 = c
             .query_row(
