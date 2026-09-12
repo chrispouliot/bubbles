@@ -264,6 +264,108 @@ pub fn build_bottle_aware_prompt_closure(
     }
 }
 
+/// Build the "Re-enter Apple ID password" dialog. `username` prefills the
+/// Apple ID entry. Returns the dialog plus its two entries so the caller can
+/// read them in the response handler.
+///
+/// This is the light-weight alternative to Sign Out: it only re-runs the
+/// Apple ID password login and rewrites the saved credentials, keeping the
+/// hardware pairing and the iMessage registration.
+pub fn build_reauth_dialog(
+    username: Option<&str>,
+) -> (adw::AlertDialog, gtk::Entry, gtk::PasswordEntry) {
+    let dialog = adw::AlertDialog::new(
+        Some("Re-enter Apple ID Password"),
+        Some(
+            "Bubbles could not sign in to iCloud with the saved password. \
+             Enter your Apple ID password again. Your hardware pairing and \
+             iMessage registration are kept.",
+        ),
+    );
+
+    let box_ = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .build();
+
+    let user_entry = gtk::Entry::builder()
+        .placeholder_text("Apple ID")
+        .build();
+    if let Some(u) = username {
+        user_entry.set_text(u);
+    }
+    let pass_entry = gtk::PasswordEntry::builder()
+        .show_peek_icon(true)
+        .build();
+    pass_entry.set_placeholder_text(Some("Apple ID Password"));
+
+    box_.append(&user_entry);
+    box_.append(&pass_entry);
+
+    dialog.set_extra_child(Some(&box_));
+    dialog.add_responses(&[("cancel", "Cancel"), ("suggested", "Sign In")]);
+    dialog.set_response_appearance("suggested", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("suggested"));
+    dialog.set_close_response("cancel");
+
+    (dialog, user_entry, pass_entry)
+}
+
+/// Present the re-auth dialog and, on submit, run
+/// [`crate::protocol::Backend::reauth_with_password`] on the tokio runtime.
+/// Progress and the outcome are written to `status_label`. Must be called on
+/// the GTK main thread.
+pub fn present_reauth_dialog(
+    backend: std::sync::Arc<dyn crate::protocol::Backend>,
+    status_label: gtk::Label,
+) {
+    // The saved username comes from a file, so read it on the tokio side and
+    // only build the dialog once it is known.
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
+    {
+        let backend = backend.clone();
+        crate::runtime::runtime().spawn(async move {
+            let _ = tx.send(backend.stored_apple_id().await);
+        });
+    }
+    glib::spawn_future_local(async move {
+        let username = rx.await.ok().flatten();
+        let (dialog, user_entry, pass_entry) = build_reauth_dialog(username.as_deref());
+        dialog.connect_response(None, move |_, response_id| {
+            if response_id != "suggested" {
+                return;
+            }
+            let username = user_entry.text().to_string();
+            let password = pass_entry.text().to_string();
+            if username.is_empty() || password.is_empty() {
+                status_label.set_text("Enter both your Apple ID and password");
+                return;
+            }
+            status_label.set_text("Signing in…");
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let backend = backend.clone();
+            crate::runtime::runtime().spawn(async move {
+                let _ = tx.send(backend.reauth_with_password(&username, &password).await);
+            });
+            let status_label = status_label.clone();
+            glib::spawn_future_local(async move {
+                match rx.await {
+                    Ok(Ok(msg)) => {
+                        log::info!("reauth: {msg}");
+                        status_label.set_text(&msg);
+                    }
+                    Ok(Err(e)) => {
+                        log::error!("reauth: {e}");
+                        status_label.set_text(&format!("Sign-in failed: {e}"));
+                    }
+                    Err(_) => status_label.set_text("Sign-in failed"),
+                }
+            });
+        });
+        dialog.present(None::<&gtk::Window>);
+    });
+}
+
 /// Pure display helper: turn [`rustpush::keychain::EscrowMetadata`] into
 /// user-facing text containing enough information to know which device
 /// credential to enter.

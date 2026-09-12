@@ -882,6 +882,7 @@ impl super::Ui {
                     // so we pass None here (capturing an adw::Window would make
                     // the async block !Send).
                     let (tx, rx) = oneshot::channel();
+                    let backend_ui = backend.clone();
                     crate::runtime::runtime().spawn(async move {
                         // Fetch viable bottles first to decide which path
                         // to take (bottle-aware vs first-time establish vs
@@ -933,6 +934,13 @@ impl super::Ui {
                                 return;
                             }
                         };
+                        // A sync session that stopped on an error is a failure
+                        // even though it returns a result struct; surface the
+                        // reason instead of "No new messages".
+                        let result = result.and_then(|r| match r.error {
+                            Some(reason) => Err(reason),
+                            None => Ok(r),
+                        });
                         let summary = match result {
                             Ok(sync_result) => match sync_result.messages_processed {
                                 0 => "No new messages".to_string(),
@@ -943,6 +951,15 @@ impl super::Ui {
                                 log::error!("manual sync: {e}");
                                 status_label.set_text(&format!("Sync failed: {e}"));
                                 button.set_sensitive(true);
+                                // The saved password login is what failed:
+                                // offer to re-enter it right away, without
+                                // the full sign-out that also drops the
+                                // hardware pairing.
+                                if e.contains(
+                                    crate::protocol::rustpush_backend::APPLE_LOGIN_FAILED_PREFIX,
+                                ) {
+                                    present_reauth_dialog(backend_ui.clone(), status_label.clone());
+                                }
                                 return;
                             }
                         };
@@ -953,6 +970,40 @@ impl super::Ui {
                 });
             }
             sync_group.add(&sync_now_row);
+        }
+
+        // "Re-enter Apple ID password": re-runs only the password login and
+        // rewrites the saved credentials. Unlike Sign Out it keeps
+        // hw_info.plist / id.plist, so no hardware re-pairing is needed.
+        #[cfg(feature = "rustpush")]
+        {
+            let reauth_row = adw::ActionRow::builder()
+                .title("Apple ID password")
+                .subtitle("Re-enter your password if sync reports an Apple ID login failure. Keeps your hardware pairing and iMessage registration.")
+                .build();
+            let reauth_button = gtk::Button::builder()
+                .label("Re-enter…")
+                .halign(gtk::Align::End)
+                .valign(gtk::Align::Center)
+                .build();
+            reauth_button.add_css_class("pill");
+            let reauth_status = gtk::Label::new(Some(""));
+            reauth_status.add_css_class("dim-label");
+            let reauth_box = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(12)
+                .build();
+            reauth_box.append(&reauth_status);
+            reauth_box.append(&reauth_button);
+            reauth_row.add_suffix(&reauth_box);
+            {
+                let backend = self.backend.clone();
+                let status = reauth_status.clone();
+                reauth_button.connect_clicked(move |_| {
+                    present_reauth_dialog(backend.clone(), status.clone());
+                });
+            }
+            sync_group.add(&reauth_row);
         }
 
         page.add(&sync_group);

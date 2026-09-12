@@ -144,6 +144,12 @@ pub enum Ingest {
         guid: String,
         text: String,
     },
+    /// Files for a message that was stored before its attachments finished
+    /// downloading. A no-op if the message is unknown or already has files.
+    Attachments {
+        guid: String,
+        attachments: Vec<AttachmentRecord>,
+    },
     /// A recognized-but-unstored control event; the &str names the variant.
     #[allow(dead_code)]
     Ignored(&'static str),

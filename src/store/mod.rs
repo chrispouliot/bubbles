@@ -336,22 +336,10 @@ fn insert_message(c: &Connection, m: &IncomingMessage) -> rusqlite::Result<()> {
     // Attach files only on first insert (fan-out duplicates reuse the guid).
     let newly_inserted = c.changes() > 0;
     if newly_inserted && !m.attachments.is_empty() {
-        let msg_id = c.last_insert_rowid();
-        for a in &m.attachments {
-            let (width, height) = attachment_dimensions(a);
-            c.execute(
-                "INSERT INTO attachment
-                     (message_id, guid, mime_type, transfer_name, total_bytes,
-                      local_path, width, height, part_index, is_sticker,
-                      is_live_photo, pairing_id)
-                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-                params![
-                    msg_id, a.guid, a.mime, a.name, a.total_bytes,
-                    a.local_path, width, height, a.part_index, a.is_sticker as i64,
-                    a.is_live_photo as i64, a.pairing_id
-                ],
-            )?;
-        }
+        insert_attachments(c, c.last_insert_rowid(), &m.attachments)?;
+    }
+    if !newly_inserted {
+        relocate_from_placeholder(c, &m.guid, chat_id)?;
     }
     // Sending from any of our devices marks the conversation read up to that
     // point on all of them. Mirror that locally so a reply sent on the phone
@@ -375,6 +363,58 @@ fn insert_message(c: &Connection, m: &IncomingMessage) -> rusqlite::Result<()> {
     bump_chat_date(c, chat_id, m.date)
 }
 
+fn insert_attachments(
+    c: &Connection,
+    msg_id: i64,
+    attachments: &[AttachmentRecord],
+) -> rusqlite::Result<()> {
+    for a in attachments {
+        let (width, height) = attachment_dimensions(a);
+        c.execute(
+            "INSERT INTO attachment
+                 (message_id, guid, mime_type, transfer_name, total_bytes,
+                  local_path, width, height, part_index, is_sticker,
+                  is_live_photo, pairing_id)
+              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![
+                msg_id, a.guid, a.mime, a.name, a.total_bytes,
+                a.local_path, width, height, a.part_index, a.is_sticker as i64,
+                a.is_live_photo as i64, a.pairing_id
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Attach files to an already-stored message (the receive loop persists the
+/// row first and downloads afterwards). No-op when the message is unknown or
+/// already has attachments, so a fan-out duplicate cannot double up.
+fn attach_files(
+    c: &Connection,
+    guid: &str,
+    attachments: &[AttachmentRecord],
+) -> rusqlite::Result<()> {
+    let msg_id: Option<i64> = c
+        .query_row(
+            "SELECT id FROM message WHERE guid = ?1",
+            params![guid],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(msg_id) = msg_id else {
+        return Ok(());
+    };
+    let existing: i64 = c.query_row(
+        "SELECT COUNT(*) FROM attachment WHERE message_id = ?1",
+        params![msg_id],
+        |r| r.get(0),
+    )?;
+    if existing > 0 {
+        return Ok(());
+    }
+    insert_attachments(c, msg_id, attachments)
+}
+
 fn insert_tapback(c: &Connection, t: &Tapback) -> rusqlite::Result<()> {
     let chat_id = upsert_chat(c, &t.chat)?;
     let sender_id = match &t.sender {
@@ -391,7 +431,85 @@ fn insert_tapback(c: &Connection, t: &Tapback) -> rusqlite::Result<()> {
             t.associated_guid, t.associated_type, t.associated_part
         ],
     )?;
+    if c.changes() == 0 {
+        relocate_from_placeholder(c, &t.guid, chat_id)?;
+    }
     bump_chat_date(c, chat_id, t.date)
+}
+
+/// Move a message out of a chat the pre-fix cloud sync could not key
+/// properly. That sync stored a lone bare sender (`+12345`), or the literal
+/// `unknown-…` placeholder, as the whole participant set, so its messages
+/// never matched the chats the push path creates. When the same guid arrives
+/// again under a properly keyed chat, carry it over and drop the placeholder
+/// once nothing is left in it. Never moves a message *into* a placeholder,
+/// and never touches a chat that was keyed correctly.
+fn relocate_from_placeholder(c: &Connection, guid: &str, new_chat_id: i64) -> rusqlite::Result<()> {
+    let existing: Option<(i64, String)> = c
+        .query_row(
+            "SELECT m.chat_id, ch.key FROM message m
+             JOIN chat ch ON ch.id = m.chat_id
+             WHERE m.guid = ?1",
+            params![guid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((old_chat_id, old_key)) = existing else {
+        return Ok(());
+    };
+    if old_chat_id == new_chat_id || !is_placeholder_key(&old_key) {
+        return Ok(());
+    }
+    let new_key: String = c.query_row(
+        "SELECT key FROM chat WHERE id = ?1",
+        params![new_chat_id],
+        |r| r.get(0),
+    )?;
+    if is_placeholder_key(&new_key) {
+        return Ok(());
+    }
+    c.execute(
+        "UPDATE message SET chat_id = ?1 WHERE guid = ?2",
+        params![new_chat_id, guid],
+    )?;
+    let remaining: i64 = c.query_row(
+        "SELECT COUNT(*) FROM message WHERE chat_id = ?1",
+        params![old_chat_id],
+        |r| r.get(0),
+    )?;
+    if remaining == 0 {
+        c.execute("DELETE FROM chat_participant WHERE chat_id = ?1", params![old_chat_id])?;
+        c.execute("DELETE FROM chat WHERE id = ?1", params![old_chat_id])?;
+    } else {
+        c.execute(
+            "UPDATE chat SET last_message_date =
+                (SELECT MAX(date) FROM message WHERE chat_id = ?1)
+             WHERE id = ?1",
+            params![old_chat_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// A chat key only the old cloud-sync fallback could have produced. Keys are
+/// the `;`-joined normalised participant set, and a real conversation always
+/// carries our own handle plus at least one IDS URI, so a lone participant, an
+/// `unknown-…` placeholder, or a bare (non-URI) phone/email marks a fallback.
+fn is_placeholder_key(key: &str) -> bool {
+    let parts: Vec<&str> = key.split(';').filter(|p| !p.is_empty()).collect();
+    parts.len() < 2
+        || parts
+            .iter()
+            .any(|p| p.starts_with("unknown-") || is_bare_handle(p))
+}
+
+fn is_bare_handle(p: &str) -> bool {
+    if p.contains(':') {
+        return false;
+    }
+    p.starts_with('+')
+        || p.chars().next().is_some_and(|c| c.is_ascii_digit())
+        || p.contains('@')
 }
 
 // --- message-scoped link previews ---
@@ -539,6 +657,7 @@ pub fn apply_blocking(c: &mut Connection, ingest: Ingest) -> rusqlite::Result<()
                 params![text, guid],
             )?;
         }
+        Ingest::Attachments { guid, attachments } => attach_files(&tx, &guid, &attachments)?,
         Ingest::Ignored(_) => {}
     }
     tx.commit()
@@ -1264,6 +1383,116 @@ mod tests {
         assert_eq!(msgs[0].text.as_deref(), Some("Hello me"));
         assert_eq!(chats[0].last_message_date, Some(1000));
         assert_eq!(chats[0].participants.len(), 2);
+    }
+
+    /// Pin: the receive loop stores the message row first and downloads its
+    /// files afterwards, so files must attach to an existing row exactly once
+    /// and never create anything for an unknown guid.
+    #[test]
+    fn attachments_attach_to_stored_message_exactly_once() {
+        let mut c = db();
+        apply_blocking(&mut c, Ingest::Message(msg("G-ATT", 1000))).unwrap();
+
+        let att = AttachmentRecord {
+            guid: Some("A1".into()),
+            mime: Some("image/jpeg".into()),
+            name: Some("photo.jpg".into()),
+            total_bytes: Some(10),
+            local_path: Some("/nonexistent/photo.jpg".into()),
+            part_index: Some(0),
+            is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
+        };
+        let attach = |guid: &str| Ingest::Attachments {
+            guid: guid.into(),
+            attachments: vec![att.clone()],
+        };
+
+        // Download finished: the file lands on the stored row.
+        apply_blocking(&mut c, attach("G-ATT")).unwrap();
+        // A fan-out duplicate finishing its own download must not double up.
+        apply_blocking(&mut c, attach("G-ATT")).unwrap();
+        // Unknown message: nothing to attach to.
+        apply_blocking(&mut c, attach("G-UNKNOWN")).unwrap();
+
+        let rows: Vec<(String, String)> = c
+            .prepare("SELECT m.guid, a.transfer_name FROM attachment a JOIN message m ON m.id = a.message_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![("G-ATT".to_string(), "photo.jpg".to_string())]);
+    }
+
+    /// Pin: a message the old cloud-sync fallback filed under a placeholder
+    /// chat (a lone bare sender, or the `unknown-…` bucket) moves to the
+    /// properly keyed chat when the same guid arrives again, and the
+    /// placeholder disappears once empty. Properly keyed chats never move.
+    #[test]
+    fn duplicate_guid_relocates_out_of_placeholder_chats_only() {
+        let mut c = db();
+        let placeholder = |p: &str| ChatRef {
+            participants: vec![p.into()],
+            display_name: None,
+            service: Some("iMessage".into()),
+        };
+        let proper = ChatRef {
+            participants: vec!["tel:+12345".into(), "mailto:me@icloud.com".into()],
+            display_name: None,
+            service: Some("iMessage".into()),
+        };
+        let with_chat = |guid: &str, chat: &ChatRef, date: i64| IncomingMessage {
+            guid: guid.into(),
+            chat: chat.clone(),
+            sender: Some("tel:+12345".into()),
+            is_from_me: false,
+            text: Some("hi".into()),
+            date,
+            ..Default::default()
+        };
+
+        // Old sync: lone bare sender, and two messages in the unknown bucket.
+        apply_blocking(&mut c, Ingest::Message(with_chat("G-BARE", &placeholder("+12345"), 1000))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(with_chat("G-UNK-1", &placeholder("unknown-iMessage"), 2000))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(with_chat("G-UNK-2", &placeholder("unknown-iMessage"), 3000))).unwrap();
+        assert_eq!(query_chats(&c).unwrap().len(), 2);
+
+        // Fixed sync re-delivers two of them under the real chat.
+        apply_blocking(&mut c, Ingest::Message(with_chat("G-BARE", &proper, 1000))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(with_chat("G-UNK-1", &proper, 2000))).unwrap();
+
+        let chats = query_chats(&c).unwrap();
+        let keys: Vec<&str> = chats.iter().map(|ch| ch.key.as_str()).collect();
+        assert!(
+            !keys.contains(&"+12345"),
+            "the emptied bare-sender chat must be deleted, got {keys:?}"
+        );
+        let proper_chat = chats.iter().find(|ch| ch.key == proper.key()).expect("proper chat exists");
+        let moved: Vec<String> = query_messages(&c, proper_chat.id)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.guid)
+            .collect();
+        assert_eq!(moved, vec!["G-BARE".to_string(), "G-UNK-1".to_string()]);
+        let bucket = chats.iter().find(|ch| ch.key == "unknown-imessage").expect("bucket keeps its remaining message");
+        assert_eq!(query_messages(&c, bucket.id).unwrap().len(), 1);
+        assert_eq!(bucket.last_message_date, Some(3000), "bucket date recomputed after the move");
+
+        // A message already in a properly keyed chat stays put.
+        let other_proper = ChatRef {
+            participants: vec!["tel:+99999".into(), "mailto:me@icloud.com".into()],
+            display_name: None,
+            service: Some("iMessage".into()),
+        };
+        apply_blocking(&mut c, Ingest::Message(with_chat("G-BARE", &other_proper, 1000))).unwrap();
+        let still: Vec<String> = query_messages(&c, proper_chat.id)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.guid)
+            .collect();
+        assert!(still.contains(&"G-BARE".to_string()), "never move out of a properly keyed chat");
     }
 
     #[test]

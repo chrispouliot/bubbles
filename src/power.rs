@@ -37,8 +37,9 @@ pub fn handle_prepare_for_sleep(monitor: &PowerMonitor, sleeping: bool) {
 ///
 /// Spawned once at app scope from `main.rs` (the activation closure, before
 /// `build_window`). The monitor is threaded through to `enter_messaging` where
-/// wake callbacks (receive-loop kick, threshold-gated sync, and APS refresh)
-/// are registered. The D-Bus subscription runs for the lifetime of the process.
+/// wake callbacks (receive-loop backoff kick, threshold-gated sync, and APS
+/// refresh) are registered. The D-Bus subscription runs for the lifetime of
+/// the process.
 #[cfg(target_os = "linux")]
 pub fn spawn_dbus_power_monitor(monitor: Arc<PowerMonitor>) {
     crate::runtime::runtime().spawn(async move {
@@ -149,8 +150,10 @@ impl PowerMonitor {
 ///
 /// Registers a callback with `monitor` such that any subsequent resume event
 /// (signalled by `handle_prepare_for_sleep(monitor, false)`) calls
-/// `notify_one()` on `kick`. This is the wiring that makes a wake-from-sleep
-/// event re-subscribe the APNs receive loop.
+/// `notify_one()` on `kick`. The receive loop uses the kick only to cut short
+/// its reconnect backoff; it keeps its existing subscription (re-subscribing
+/// would discard queued, already-acknowledged messages). The actual APNs
+/// reconnect on wake is done by the `refresh_aps` resume callback.
 ///
 /// `handle_prepare_for_sleep(monitor, true)` (the about-to-sleep case) does
 /// NOT signal the kick.

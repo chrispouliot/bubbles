@@ -699,6 +699,9 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
         // Check which SRP protocol the server selected
         let selected_protocol = res.get("sp").and_then(|v| v.as_string()).unwrap_or("s2k");
+        info!(
+            "GSA SRP login: username={username} server_protocol={selected_protocol} iterations={iters}"
+        );
 
         let password_for_srp: Vec<u8> = if selected_protocol == "s2k_fo" {
             // s2k_fo: hex-encode the already-SHA256'd password bytes.

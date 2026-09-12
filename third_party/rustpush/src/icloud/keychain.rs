@@ -898,7 +898,7 @@ impl<Keys: KeystoreSignKey> KeychainUserIdentity<Keys> {
         })
     }
 
-    fn is_in_clique(&self) -> bool {
+    pub fn is_in_clique(&self) -> bool {
         self.current_state.includeds.contains(&self.identifier)
     }
 

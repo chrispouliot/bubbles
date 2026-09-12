@@ -41,6 +41,17 @@ pub fn cloud_message_to_ingest(
 ) -> Ingest {
     let proto: &MessageProto = &cm.msg_proto;
     let from_me = is_from_me(&cm.flags, &cm.sender, my_handles);
+    // Apple stores handles bare ("+12345", "alice@example.com"); the push
+    // path and the contact matcher use IDS URIs. An empty sender is how
+    // CloudKit marks our own messages, so it becomes `None`, not "".
+    let sender = normalize_handle(&cm.sender);
+    let chat = chat_ref_for(
+        &cm.chat_id,
+        &cm.service,
+        chat_map,
+        &cm.sender,
+        &cm.destination_caller_id,
+    );
 
     // --- Tapback? ---
     if let Some(target_guid) = &proto.associated_message_guid {
@@ -50,8 +61,8 @@ pub fn cloud_message_to_ingest(
         {
             return Ingest::Tapback(Tapback {
                 guid: cm.guid,
-                chat: chat_ref_for(&cm.chat_id, &cm.service, chat_map, &cm.sender, from_me, &cm.destination_caller_id),
-                sender: Some(cm.sender),
+                chat,
+                sender,
                 is_from_me: from_me,
                 date: apple_time_to_unix_ms(cm.time),
                 associated_guid: target_guid.clone(),
@@ -65,8 +76,8 @@ pub fn cloud_message_to_ingest(
     if let Some(ref text) = proto.text {
         return Ingest::Message(IncomingMessage {
             guid: cm.guid,
-            chat: chat_ref_for(&cm.chat_id, &cm.service, chat_map, &cm.sender, from_me, &cm.destination_caller_id),
-            sender: Some(cm.sender),
+            chat,
+            sender,
             is_from_me: from_me,
             text: Some(text.clone()),
             subject: proto.subject.clone(),
@@ -86,60 +97,126 @@ pub fn cloud_message_to_ingest(
 }
 
 /// Whether a message is "from me", based on the [`MessageFlags::IS_FROM_ME`] flag
-/// (primary signal) or a case-insensitive handle match against `my_handles`.
+/// (primary signal) or a normalised handle match against `my_handles`.
 fn is_from_me(flags: &MessageFlags, sender: &str, my_handles: &[String]) -> bool {
-    flags.contains(MessageFlags::IS_FROM_ME)
-        || my_handles.iter().any(|h| h.eq_ignore_ascii_case(sender))
+    if flags.contains(MessageFlags::IS_FROM_ME) {
+        return true;
+    }
+    match normalize_handle(sender) {
+        Some(s) => my_handles
+            .iter()
+            .filter_map(|h| normalize_handle(h))
+            .any(|h| h == s),
+        None => false,
+    }
 }
 
-/// Build a [`ChatRef`] from the cloud chat map, or a minimal fallback when the
-/// chat hasn't been synced yet.
+/// Normalise a handle as Apple stores it in CloudKit (bare `+12345`,
+/// `alice@example.com`, sometimes already `tel:`/`mailto:` prefixed) into the
+/// IDS URI form the push path and the contact matcher use (`tel:+12345`,
+/// `mailto:alice@example.com`). Returns `None` for empty input. Anything that
+/// is neither a phone number nor an email is kept verbatim.
+pub fn normalize_handle(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let lower = raw.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("mailto:") {
+        return (!rest.is_empty()).then(|| format!("mailto:{rest}"));
+    }
+    if lower.contains('@') {
+        return Some(format!("mailto:{lower}"));
+    }
+    let phone = lower.strip_prefix("tel:").unwrap_or(&lower);
+    let has_plus = phone.starts_with('+');
+    let digits: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return Some(raw.to_string());
+    }
+    Some(if has_plus || digits.len() != 10 {
+        format!("tel:+{digits}")
+    } else {
+        // Bare 10-digit NANP number: the same rule the compose box applies.
+        format!("tel:+1{digits}")
+    })
+}
+
+/// Split Apple's compound chat id (`iMessage;-;+12345` for a 1:1,
+/// `iMessage;+;chat123…` for a group) into `(service, kind, identifier)`.
+fn parse_chat_id(chat_id: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = chat_id.splitn(3, ';');
+    let service = parts.next()?;
+    let kind = parts.next()?;
+    let ident = parts.next()?;
+    if ident.is_empty() {
+        return None;
+    }
+    Some((service, kind, ident))
+}
+
+/// Build a [`ChatRef`] whose key matches what the push path produces for the
+/// same conversation.
 ///
-/// When cloud metadata is available, the participants and display name come
-/// from [`CloudChat`]. When metadata is absent, the raw compound `chat_id`
-/// (e.g. `iMessage;-;+12345`) must **not** be used as a participant because
-/// the UI splits participants on `;` and would produce fake labels. Instead
-/// the message `sender` handle is used as the sole participant — it is always
-/// a display-safe handle (email or phone URI).
+/// Push-path chats are keyed by the full participant set *including our own
+/// handle*, as IDS URIs. CloudKit hands us the pieces in Apple's chat.db
+/// shape instead: `sender` is the other party for incoming messages and empty
+/// for our own; `destination_caller_id` is our handle for the chat in both
+/// directions; `chat_id` names the other party for 1:1 chats. The chat-zone
+/// record (`chat_map`) carries the real participant list and group name, and
+/// is the only thing that can resolve a group.
+///
+/// The raw compound `chat_id` is never used as a participant: the UI splits
+/// participants on `;` and would render fake labels.
 fn chat_ref_for(
     chat_id: &str,
     service: &str,
     chat_map: &HashMap<String, CloudChat>,
     sender: &str,
-    from_me: bool,
     destination_caller_id: &str,
 ) -> ChatRef {
+    let mut participants: Vec<String> = Vec::new();
+    let mut display_name = None;
+
     if let Some(cloud_chat) = chat_map.get(chat_id) {
-        ChatRef {
-            participants: cloud_chat.participants.iter().map(|p| p.uri.clone()).collect(),
-            display_name: cloud_chat.display_name.clone(),
-            service: Some(service.to_string()),
-        }
+        // `ptcpts` lists the other members, like chat.db; we get added below
+        // through the handle the chat was last addressed from.
+        participants.extend(
+            cloud_chat
+                .participants
+                .iter()
+                .filter_map(|p| normalize_handle(&p.uri)),
+        );
+        participants.extend(normalize_handle(&cloud_chat.last_addressed_handle));
+        display_name = cloud_chat.display_name.clone().filter(|n| !n.is_empty());
     } else {
-        // Fallback: use the sender handle rather than the raw compound
-        // chat_id. The sender is always a display-safe handle (email, tel,
-        // etc.) — never the opaque compound chat_id.
-        //
-        // For from-me messages, also include the destination_caller_id (the
-        // other participant) so the resulting ChatRef keys like an existing
-        // local one-to-one chat and the message merges into it rather than
-        // creating a self-only chat.
-        let participants: Vec<String> = if sender.is_empty() {
-            // If sender is also empty, use a placeholder to keep the
-            // participant list non-empty. This should be extremely rare.
-            vec![format!("unknown-{}", service)]
-        } else {
-            let mut p = vec![sender.to_string()];
-            if from_me && !destination_caller_id.is_empty() {
-                p.push(destination_caller_id.to_string());
+        match parse_chat_id(chat_id) {
+            Some((_, "-", other)) => participants.extend(normalize_handle(other)),
+            Some((_, _, group)) => {
+                // A group we have no metadata for: key it by its own id so
+                // two unknown groups never merge into one bucket.
+                participants.push(format!("unknown-group:{group}"));
             }
-            p
-        };
-        ChatRef {
-            participants,
-            display_name: None,
-            service: Some(service.to_string()),
+            None => {}
         }
+    }
+    // Our side of the conversation, then whoever sent it (the other party
+    // for incoming messages, ourselves or nobody for our own).
+    participants.extend(normalize_handle(destination_caller_id));
+    participants.extend(normalize_handle(sender));
+
+    if participants.is_empty() {
+        // Nothing identifies the conversation. Keep the message rather than
+        // drop it, in a clearly labelled per-service bucket.
+        participants.push(format!("unknown-{service}"));
+    }
+    participants.sort();
+    participants.dedup();
+
+    ChatRef {
+        participants,
+        display_name,
+        service: Some(service.to_string()),
     }
 }
 
@@ -179,7 +256,7 @@ pub async fn process_sync_page(
             Ingest::Message(m) => Some(m.date),
             Ingest::Tapback(t) => Some(t.date),
             Ingest::LinkPreview(_) | Ingest::Receipt(_) | Ingest::SendFailed { .. }
-            | Ingest::Edited { .. } | Ingest::Ignored(_) => None,
+            | Ingest::Edited { .. } | Ingest::Attachments { .. } | Ingest::Ignored(_) => None,
         };
 
         // Ignored records don't count.
@@ -218,6 +295,71 @@ pub trait CloudKitSync: Send + Sync {
         &self,
         continuation_token: Option<Vec<u8>>,
     ) -> Result<(Vec<u8>, std::collections::HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>, i32), PushError>;
+
+    /// Fetch the next page of the chat zone. Same token and status semantics
+    /// as [`fetch_sync_page`](Self::fetch_sync_page). The default returns an
+    /// empty, complete page so mocks that only model messages keep working.
+    async fn fetch_chat_page(
+        &self,
+        _continuation_token: Option<Vec<u8>>,
+    ) -> Result<(Vec<u8>, std::collections::HashMap<String, Option<CloudChat>>, i32), PushError> {
+        Ok((Vec::new(), std::collections::HashMap::new(), 3))
+    }
+}
+
+/// Upper bound on chat-zone pages fetched per sync, a guard against a server
+/// that never reports completion.
+const MAX_CHAT_PAGES: usize = 50;
+
+/// Pull the CloudKit chat zone so synced messages can be keyed by their real
+/// participant set. Each chat is inserted under every identifier a message's
+/// `chat_id` might use: the record name, the chat guid, and the guid rebuilt
+/// from service + style + identifier. An error stops the walk and returns
+/// what was collected; a partial map only means more messages take the
+/// `chat_id` fallback.
+pub async fn fetch_cloud_chats(syncer: &dyn CloudKitSync) -> HashMap<String, CloudChat> {
+    let mut map = HashMap::new();
+    let mut token: Option<Vec<u8>> = None;
+    for _ in 0..MAX_CHAT_PAGES {
+        let (next, page, status) = match syncer.fetch_chat_page(token).await {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!(
+                    "fetch_cloud_chats: {e:?}; continuing with {} chat keys",
+                    map.len()
+                );
+                break;
+            }
+        };
+        for (record_id, chat) in page {
+            let Some(chat) = chat else { continue };
+            for key in chat_map_keys(&record_id, &chat) {
+                map.insert(key, chat.clone());
+            }
+        }
+        if status == 3 {
+            break;
+        }
+        token = Some(next);
+    }
+    log::info!("fetch_cloud_chats: {} chat keys", map.len());
+    map
+}
+
+/// Every key a message's `chat_id` might carry for this chat record.
+fn chat_map_keys(record_id: &str, chat: &CloudChat) -> Vec<String> {
+    let mut keys = vec![record_id.to_string()];
+    if !chat.guid.is_empty() {
+        keys.push(chat.guid.clone());
+    }
+    if !chat.chat_identifier.is_empty() {
+        // style 43 is a group, 45 a 1:1 (see `CloudChat::style`).
+        let kind = if chat.style == 43 { "+" } else { "-" };
+        keys.push(format!("{};{kind};{}", chat.service_name, chat.chat_identifier));
+    }
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 /// Summary of a single `sync_once` session.
@@ -234,6 +376,21 @@ pub struct SyncResult {
     /// The final continuation token (the last token returned by the server,
     /// or `None` if the loop stopped on the first page).
     pub final_token: Option<Vec<u8>>,
+    /// Why the session stopped early, if it did. `None` means every page
+    /// fetch succeeded. A failed sign-in, an unreadable state file, or a
+    /// CloudKit fetch error all land here so the UI can show the reason
+    /// instead of "No new messages".
+    pub error: Option<String>,
+}
+
+impl SyncResult {
+    /// A session that did no work because of `reason`.
+    pub fn failed(reason: String) -> Self {
+        Self {
+            error: Some(reason),
+            ..Self::default()
+        }
+    }
 }
 
 /// Run one CloudKit sync session: paginate via `syncer`, process each page
@@ -255,6 +412,7 @@ pub async fn sync_once(
             Ok(t) => t,
             Err(e) => {
                 log::error!("sync_once: fetch error: {e:?}");
+                result.error = Some(format!("{e}"));
                 break;
             }
         };
@@ -307,6 +465,13 @@ impl<P: rustpush::AnisetteProvider + Send + Sync> CloudKitSync for rustpush::clo
         continuation_token: Option<Vec<u8>>,
     ) -> Result<(Vec<u8>, std::collections::HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>, i32), PushError> {
         self.sync_messages(continuation_token).await
+    }
+
+    async fn fetch_chat_page(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+    ) -> Result<(Vec<u8>, std::collections::HashMap<String, Option<CloudChat>>, i32), PushError> {
+        self.sync_chats(continuation_token).await
     }
 }
 
@@ -948,9 +1113,12 @@ mod tests {
         match result {
             Ingest::Message(msg) => {
                 assert_eq!(msg.guid, "test-guid-1");
+                // Bare CloudKit handles are normalised to IDS URIs so the
+                // contact matcher (which only understands tel:/mailto:) can
+                // name the sender.
                 assert_eq!(
                     msg.sender,
-                    Some("friend@example.com".to_string()),
+                    Some("mailto:friend@example.com".to_string()),
                 );
                 assert!(!msg.is_from_me);
                 assert_eq!(
@@ -1362,6 +1530,34 @@ mod tests {
         assert_eq!(result.final_token, None);
     }
 
+    /// Pin: a fetch failure must be reported in `SyncResult::error` instead of
+    /// being swallowed into an "all good, 0 messages" result that the UI
+    /// renders as "No new messages".
+    #[tokio::test]
+    async fn sync_once_reports_fetch_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("db.sqlite")).await.unwrap();
+
+        // No pages queued: the very first fetch fails.
+        let syncer = MockSyncer::new(vec![]);
+        let result = super::sync_once(&syncer, &store, &[], &HashMap::new(), 0).await;
+
+        assert_eq!(result.messages_processed, 0);
+        assert!(!result.done);
+        let err = result
+            .error
+            .expect("a fetch failure must surface in SyncResult::error");
+        assert!(
+            err.contains("no more pages"),
+            "error must carry the fetch failure text, got: {err}"
+        );
+        assert_eq!(
+            SyncResult::failed("boom".into()).error.as_deref(),
+            Some("boom"),
+            "SyncResult::failed must carry the reason"
+        );
+    }
+
     #[tokio::test]
     async fn sync_once_done_stops_loop() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1653,5 +1849,254 @@ mod tests {
             cutoff_plus_1h, cutoff + 3_600_000,
             "cutoff must shift 1:1 with now_ms",
         );
+    }
+}
+
+#[cfg(test)]
+mod chat_mapping_tests {
+    //! Pin: CloudKit-synced messages must land in the same chat rows the push
+    //! path creates. Apple hands us bare handles, an empty sender for our own
+    //! messages, and a compound `chat_id`; the mapping has to turn that into
+    //! the push path's participant set (IDS URIs, including our own handle).
+
+    use super::*;
+    use std::collections::HashMap;
+    use rustpush::cloud_messages::{
+        CloudChat, CloudMessage, CloudParticipant, GZipWrapper, MessageFlags,
+        cloudmessagesp::MessageProto,
+    };
+    use crate::store::{ChatRef, Ingest};
+
+    fn cm(guid: &str, chat_id: &str, sender: &str, dcid: &str, flags: MessageFlags) -> CloudMessage {
+        CloudMessage {
+            utm: None,
+            r#type: 0,
+            error: 0,
+            chat_id: chat_id.to_string(),
+            sender: sender.to_string(),
+            time: 0,
+            msg_proto_2: None,
+            destination_caller_id: dcid.to_string(),
+            msg_proto: GZipWrapper(MessageProto {
+                text: Some("hi".to_string()),
+                ..Default::default()
+            }),
+            flags,
+            guid: guid.to_string(),
+            msg_proto_3: None,
+            service: "iMessage".to_string(),
+            msg_proto_4: None,
+        }
+    }
+
+    fn message(ingest: Ingest) -> IncomingMessage {
+        match ingest {
+            Ingest::Message(m) => m,
+            other => panic!("expected Ingest::Message, got {other:?}"),
+        }
+    }
+
+    fn push_key(participants: &[&str]) -> String {
+        ChatRef {
+            participants: participants.iter().map(|s| s.to_string()).collect(),
+            display_name: None,
+            service: Some("iMessage".into()),
+        }
+        .key()
+    }
+
+    #[test]
+    fn normalize_handle_maps_bare_handles_to_ids_uris() {
+        assert_eq!(normalize_handle("+12345").as_deref(), Some("tel:+12345"));
+        assert_eq!(normalize_handle("tel:+12345").as_deref(), Some("tel:+12345"));
+        assert_eq!(normalize_handle("(555) 123-4567").as_deref(), Some("tel:+15551234567"));
+        assert_eq!(normalize_handle("Alice@Example.com").as_deref(), Some("mailto:alice@example.com"));
+        assert_eq!(normalize_handle("mailto:Alice@Example.com").as_deref(), Some("mailto:alice@example.com"));
+        assert_eq!(normalize_handle(""), None);
+        assert_eq!(normalize_handle("   "), None);
+        assert_eq!(normalize_handle("urn:biz:acme").as_deref(), Some("urn:biz:acme"));
+    }
+
+    #[test]
+    fn incoming_bare_sender_keys_like_the_push_path_and_resolves_contacts() {
+        let m = message(cloud_message_to_ingest(
+            cm("g1", "iMessage;-;+12345", "+12345", "me@icloud.com", MessageFlags::IS_FINISHED),
+            &["mailto:me@icloud.com".to_string()],
+            &HashMap::new(),
+        ));
+        assert_eq!(
+            m.chat.key(),
+            push_key(&["tel:+12345", "mailto:me@icloud.com"]),
+            "an incoming 1:1 must key exactly like the push-path chat, got {:?}",
+            m.chat.participants
+        );
+        assert_eq!(
+            m.sender.as_deref(),
+            Some("tel:+12345"),
+            "the sender must be a tel: URI so the contact matcher can name it"
+        );
+        assert!(!m.is_from_me);
+    }
+
+    #[test]
+    fn our_own_message_with_empty_sender_keys_by_chat_id_not_unknown_bucket() {
+        let m = message(cloud_message_to_ingest(
+            cm(
+                "g2",
+                "iMessage;-;+12345",
+                "",
+                "me@icloud.com",
+                MessageFlags::IS_FINISHED | MessageFlags::IS_FROM_ME,
+            ),
+            &["mailto:me@icloud.com".to_string()],
+            &HashMap::new(),
+        ));
+        assert!(m.is_from_me);
+        assert_eq!(m.sender, None, "an empty CloudKit sender is nobody, not \"\"");
+        assert_eq!(
+            m.chat.key(),
+            push_key(&["tel:+12345", "mailto:me@icloud.com"]),
+            "our own message must land in the same 1:1 chat, got {:?}",
+            m.chat.participants
+        );
+        assert!(
+            !m.chat.participants.iter().any(|p| p.starts_with("unknown-")),
+            "a 1:1 chat id identifies the other party; no placeholder allowed"
+        );
+    }
+
+    #[test]
+    fn unknown_groups_never_merge_and_never_leak_the_raw_chat_id() {
+        let flags = MessageFlags::IS_FINISHED | MessageFlags::IS_FROM_ME;
+        let a = message(cloud_message_to_ingest(
+            cm("g3", "iMessage;+;chatAAA", "", "me@icloud.com", flags),
+            &[],
+            &HashMap::new(),
+        ));
+        let b = message(cloud_message_to_ingest(
+            cm("g4", "iMessage;+;chatBBB", "", "me@icloud.com", flags),
+            &[],
+            &HashMap::new(),
+        ));
+        assert_ne!(a.chat.key(), b.chat.key(), "two unresolved groups must not share a chat");
+        for m in [&a, &b] {
+            assert!(
+                !m.chat.participants.iter().any(|p| p.contains(';')),
+                "raw compound chat_id must never be a participant: {:?}",
+                m.chat.participants
+            );
+            assert!(m.chat.participants.iter().any(|p| p == "mailto:me@icloud.com"));
+        }
+    }
+
+    #[test]
+    fn chat_zone_record_supplies_members_name_and_our_handle() {
+        let mut chat_map = HashMap::new();
+        chat_map.insert(
+            "iMessage;+;chatAAA".to_string(),
+            CloudChat {
+                participants: vec![
+                    CloudParticipant { uri: "+12345".into() },
+                    CloudParticipant { uri: "tel:+67890".into() },
+                ],
+                last_addressed_handle: "me@icloud.com".into(),
+                display_name: Some("Weekend Crew".into()),
+                ..Default::default()
+            },
+        );
+        let m = message(cloud_message_to_ingest(
+            cm("g5", "iMessage;+;chatAAA", "+12345", "me@icloud.com", MessageFlags::IS_FINISHED),
+            &[],
+            &chat_map,
+        ));
+        assert_eq!(
+            m.chat.key(),
+            push_key(&["tel:+12345", "tel:+67890", "mailto:me@icloud.com"]),
+            "group members come from the chat zone, normalised, plus our own handle; got {:?}",
+            m.chat.participants
+        );
+        assert_eq!(m.chat.display_name.as_deref(), Some("Weekend Crew"));
+        assert!(m.chat.is_group());
+    }
+
+    #[test]
+    fn my_handles_mark_from_me_even_without_the_flag() {
+        let m = message(cloud_message_to_ingest(
+            cm("g6", "iMessage;-;+12345", "me@icloud.com", "me@icloud.com", MessageFlags::IS_FINISHED),
+            &["mailto:me@icloud.com".to_string()],
+            &HashMap::new(),
+        ));
+        assert!(m.is_from_me, "a bare sender matching a registered handle is ours");
+    }
+
+    struct ChatPages(tokio::sync::Mutex<std::collections::VecDeque<(Vec<u8>, HashMap<String, Option<CloudChat>>, i32)>>);
+
+    #[async_trait]
+    impl CloudKitSync for ChatPages {
+        async fn fetch_sync_page(
+            &self,
+            _continuation_token: Option<Vec<u8>>,
+        ) -> Result<(Vec<u8>, HashMap<String, Option<CloudMessage>>, i32), PushError> {
+            Err(PushError::ResourcePanic("messages not modelled".into()))
+        }
+
+        async fn fetch_chat_page(
+            &self,
+            _continuation_token: Option<Vec<u8>>,
+        ) -> Result<(Vec<u8>, HashMap<String, Option<CloudChat>>, i32), PushError> {
+            self.0
+                .lock()
+                .await
+                .pop_front()
+                .ok_or_else(|| PushError::ResourcePanic("no more chat pages".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_cloud_chats_walks_pages_and_keys_every_chat_id_form() {
+        let chat = CloudChat {
+            guid: "iMessage;-;+12345".into(),
+            chat_identifier: "+12345".into(),
+            service_name: "iMessage".into(),
+            style: 45,
+            ..Default::default()
+        };
+        let group = CloudChat {
+            guid: String::new(),
+            chat_identifier: "chatAAA".into(),
+            service_name: "iMessage".into(),
+            style: 43,
+            ..Default::default()
+        };
+        let mut page1 = HashMap::new();
+        page1.insert("rec-1".to_string(), Some(chat));
+        page1.insert("rec-gone".to_string(), None);
+        let mut page2 = HashMap::new();
+        page2.insert("rec-2".to_string(), Some(group));
+        let syncer = ChatPages(tokio::sync::Mutex::new(
+            vec![(b"t1".to_vec(), page1, 0), (b"t2".to_vec(), page2, 3)].into(),
+        ));
+
+        let map = fetch_cloud_chats(&syncer).await;
+
+        for key in ["rec-1", "iMessage;-;+12345", "rec-2", "iMessage;+;chatAAA"] {
+            assert!(map.contains_key(key), "missing chat map key {key}; have {:?}", map.keys());
+        }
+        assert!(!map.contains_key("rec-gone"), "tombstones must not be inserted");
+    }
+
+    #[tokio::test]
+    async fn fetch_cloud_chats_returns_partial_map_on_error() {
+        let chat = CloudChat {
+            guid: "iMessage;-;+1".into(),
+            ..Default::default()
+        };
+        let mut page1 = HashMap::new();
+        page1.insert("rec-1".to_string(), Some(chat));
+        // Page 1 says "more to come", then the mock runs out => error.
+        let syncer = ChatPages(tokio::sync::Mutex::new(vec![(b"t1".to_vec(), page1, 0)].into()));
+
+        let map = fetch_cloud_chats(&syncer).await;
+        assert!(map.contains_key("iMessage;-;+1"), "what was fetched before the error is kept");
     }
 }

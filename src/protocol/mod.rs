@@ -208,6 +208,11 @@ pub enum RecvEvent {
     /// The identity resource registration state changed. Carried inline so the
     /// UI can update the registration badge / banner without a full re-query.
     Registration(RegistrationStatus),
+    /// `count` pushed notifications were lost between the APNs socket and the
+    /// store (buffer overflow or receiver lag). rustpush had already
+    /// acknowledged them, so Apple will not resend; the only way to recover
+    /// them is a cloud sync.
+    Dropped { count: u64 },
 }
 
 #[async_trait]
@@ -412,6 +417,25 @@ pub trait Backend: Send + Sync {
 
     /// Wipe the persisted login so the next launch starts at onboarding.
     fn sign_out(&self);
+
+    /// The Apple ID username saved at sign-in, if a sign-in has completed.
+    /// Used to prefill the re-auth dialog.
+    async fn stored_apple_id(&self) -> Option<String> {
+        None
+    }
+
+    /// Re-run the Apple ID password login with a freshly typed password and,
+    /// on success, rewrite the saved credentials so the automatic replay
+    /// (cloud sync, cert self-heal) works again. Leaves the hardware pairing
+    /// and iMessage registration untouched. Returns a short status message
+    /// for the UI on success, and a user-facing reason on failure.
+    async fn reauth_with_password(
+        &self,
+        _username: &str,
+        _password: &str,
+    ) -> std::result::Result<String, String> {
+        Err("re-authentication is not supported by this backend".to_string())
+    }
 
     // --- 8. sync ---
 

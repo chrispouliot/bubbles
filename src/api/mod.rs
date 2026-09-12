@@ -142,6 +142,21 @@ pub fn restore_users(path: String) -> Option<Vec<IDSUser>> {
     plist::from_file::<_, Vec<IDSUser>>(dir.join("id.plist")).ok()
 }
 
+/// Handles registered with iMessage (from id.plist), as IDS URIs such as
+/// `tel:+1…` and `mailto:…`. Empty when no registration is saved.
+pub fn registered_handles(path: &str) -> Vec<String> {
+    restore_users(path.to_string())
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|u| {
+            u.registration
+                .get("com.apple.madrid")
+                .map(|r| r.handles.clone())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
 pub fn bin_serialize<S>(x: &[u8], s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -424,8 +439,31 @@ async fn get_login_config(conf_dir: &Path, conf: &JoinedOSConfig, conn: &APSConn
     } else {
         false
     };
+    debug!("login client info: require_mac={require_mac}");
 
     conf.get_gsa_config(&*conn.state.read().await, require_mac)
+}
+
+/// Short, non-reversible fingerprint of a secret so two log lines can be
+/// compared ("did the replay use the same bytes the sign-in saved?") without
+/// writing the secret itself to the log.
+fn secret_fingerprint(bytes: &[u8]) -> String {
+    let digest = sha2::Sha256::digest(bytes);
+    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hash_password(password: &str) -> Vec<u8> {
+    let mut password_hasher = sha2::Sha256::new();
+    password_hasher.update(password.as_bytes());
+    password_hasher.finalize().to_vec()
+}
+
+/// The Apple ID username saved by `do_login`, if a sign-in has completed.
+pub fn stored_username(path: &str) -> Option<String> {
+    let conf_dir = PathBuf::from_str(path).ok()?;
+    plist::from_file::<_, GSAConfig>(conf_dir.join("gsa.plist"))
+        .ok()
+        .map(|s| s.username)
 }
 
 pub async fn try_auth(path: String, conf: &JoinedOSConfig, conn: &APSConnection, anisette: &ArcAnisetteClient<DefaultAnisetteProvider>, creds: Option<(String, String)>) -> anyhow::Result<(Arc<Mutex<AppleAccount<DefaultAnisetteProvider>>>, LoginState)> {
@@ -433,17 +471,27 @@ pub async fn try_auth(path: String, conf: &JoinedOSConfig, conn: &APSConnection,
     info!("Here");
     let mut apple_account =
         AppleAccount::new_with_anisette(get_login_config(&conf_dir, conf, conn).await, anisette.clone())?;
-    
+
     let result = if let Some((username, password)) = creds {
         reset_user(&path);
 
-        let mut password_hasher = sha2::Sha256::new();
-        password_hasher.update(password.as_bytes());
-        let hashed_password = password_hasher.finalize();
-        (username, hashed_password.to_vec())
+        let hashed_password = hash_password(&password);
+        info!(
+            "Apple ID sign-in with typed password: username={username} password_hash_fp={} len={}",
+            secret_fingerprint(&hashed_password),
+            hashed_password.len()
+        );
+        (username, hashed_password)
     } else {
         let state = plist::from_file::<_, GSAConfig>(&conf_dir.join("gsa.plist"))?;
-        (state.username.clone(), state.get_password()?)
+        let hashed_password = state.get_password()?;
+        info!(
+            "replaying saved Apple ID login: username={} password_hash_fp={} len={}",
+            state.username,
+            secret_fingerprint(&hashed_password),
+            hashed_password.len()
+        );
+        (state.username.clone(), hashed_password)
     };
 
     let login_state = apple_account.login_email_pass(&result.0, &result.1).await?;
@@ -451,9 +499,32 @@ pub async fn try_auth(path: String, conf: &JoinedOSConfig, conn: &APSConnection,
     info!("Here3");
 
     let account = Arc::new(Mutex::new(apple_account));
-    
+
     info!("Here6");
     Ok((account, login_state))
+}
+
+/// Re-run the Apple ID password login with a freshly typed password.
+///
+/// Unlike `try_auth(creds: Some(..))` this does **not** wipe the per-user
+/// state files first: the hardware pairing, IDS registration and any iCloud
+/// Keychain state stay untouched, and `gsa.plist` is only rewritten by the
+/// caller's `do_login` once Apple has accepted the password.
+pub async fn reauth(path: String, conf: &JoinedOSConfig, conn: &APSConnection, anisette: &ArcAnisetteClient<DefaultAnisetteProvider>, username: &str, password: &str) -> anyhow::Result<(Arc<Mutex<AppleAccount<DefaultAnisetteProvider>>>, LoginState)> {
+    let conf_dir = PathBuf::from_str(&path).unwrap();
+    let mut apple_account =
+        AppleAccount::new_with_anisette(get_login_config(&conf_dir, conf, conn).await, anisette.clone())?;
+
+    let hashed_password = hash_password(password);
+    info!(
+        "Apple ID re-auth with typed password: username={username} password_hash_fp={} len={}",
+        secret_fingerprint(&hashed_password),
+        hashed_password.len()
+    );
+    let login_state = apple_account.login_email_pass(username, &hashed_password).await?;
+    info!("Apple ID re-auth login state: {login_state:?}");
+
+    Ok((Arc::new(Mutex::new(apple_account)), login_state))
 }
 
 pub async fn try_icloud_login(path: String, conf: &JoinedOSConfig, account: &Arc<Mutex<AppleAccount<DefaultAnisetteProvider>>>) -> anyhow::Result<Option<IDSUser>> {
@@ -491,11 +562,18 @@ pub async fn do_login(path: String, account: &Arc<Mutex<AppleAccount<DefaultAnis
     };
     
     
+    let saved_hash = account.hashed_password.clone().unwrap();
     let gsa_config = GSAConfig {
         username: account.username.clone().unwrap(),
-        encrypted_password: GSAConfig::encrypt(&account.hashed_password.clone().unwrap())?,
+        encrypted_password: GSAConfig::encrypt(&saved_hash)?,
         postdata_done: Some(true),
     };
+    info!(
+        "saving Apple ID credentials: username={} password_hash_fp={} len={}",
+        gsa_config.username,
+        secret_fingerprint(&saved_hash),
+        saved_hash.len()
+    );
     crate::persist::write_atomic(&conf_dir.join("gsa.plist"), &plist_to_buf(&gsa_config)?)?;
 
     let sk_path = conf_dir.join("statuskit.plist");

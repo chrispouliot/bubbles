@@ -60,7 +60,8 @@ pub use avatar_edit::{AvatarEdit, apply_chat_edit};
 #[allow(unused_imports)]
 pub use keychain::{
     build_bottle_aware_prompt_closure, build_clique_password_dialog,
-    build_password_prompt_closure, describe_escrow_metadata_for_user,
+    build_password_prompt_closure, build_reauth_dialog, describe_escrow_metadata_for_user,
+    present_reauth_dialog,
 };
 use builder::*;
 use media::*;
@@ -1143,6 +1144,27 @@ pub fn enter_messaging(
     let ui_refresh = ui.clone();
     gtk_bridge::forward(rx, move |ev| match ev {
         RecvEvent::Applied => ui_refresh.schedule_refresh(),
+        RecvEvent::Dropped { count } => {
+            log::error!(
+                "{count} pushed messages were dropped before they could be stored; \
+                 requesting a cloud sync to backfill them"
+            );
+            #[cfg(feature = "rustpush")]
+            {
+                let backend = ui_refresh.backend.clone();
+                let store = ui_refresh.store.clone();
+                crate::runtime::runtime().spawn(async move {
+                    let now_unix_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    let cutoff_ms = now_unix_ms - 48 * 60 * 60 * 1000;
+                    // Not forced: respects the cloud-sync toggle and backoff.
+                    let result = backend.sync_missed_messages(&store, cutoff_ms, false).await;
+                    log::info!("drop-triggered sync: {result:?}");
+                });
+            }
+        }
         RecvEvent::LinkPreviewUpdated { guid, part_idx } => {
             ui_refresh.refresh_link_card(&guid, part_idx)
         }

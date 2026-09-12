@@ -114,20 +114,25 @@ impl RustpushBackend {
     /// post-failure backoff are bypassed. This is used by the manual "Sync
     /// Now" button so the user can pull missed messages on demand even when
     /// automatic cloud sync is disabled or the last sync hit the backoff.
-    async fn reconstruct_account(&self, force: bool) -> Result<Option<IDSUser>, ()> {
+    ///
+    /// On failure the `Err` carries a user-facing reason. Reasons that start
+    /// with [`APPLE_LOGIN_FAILED_PREFIX`] mean the Apple ID password login
+    /// itself did not complete; the Sync Now UI offers the re-auth dialog
+    /// for those.
+    async fn reconstruct_account(&self, force: bool) -> Result<Option<IDSUser>, String> {
         let conn_arc = self.conn.lock().unwrap().clone();
         let conn = match conn_arc {
             Some(c) => c,
             None => {
-                log::debug!("reconstruct_account: no stored connection, skipping");
-                return Err(());
+                log::warn!("reconstruct_account: no stored APS connection");
+                return Err("no APS connection stored for this session".to_string());
             }
         };
         let config = match self.config.lock().unwrap().clone() {
             Some(c) => c,
             None => {
-                log::debug!("reconstruct_account: no stored config, skipping");
-                return Err(());
+                log::warn!("reconstruct_account: no stored OS config");
+                return Err("no OS config stored for this session".to_string());
             }
         };
 
@@ -135,8 +140,11 @@ impl RustpushBackend {
         let state_dir = std::path::PathBuf::from(&self.state_path);
         let gsa_path = state_dir.join("gsa.plist");
         if !gsa_path.exists() {
-            log::debug!("reconstruct_account: no gsa.plist at {}, skipping", gsa_path.display());
-            return Err(());
+            log::warn!("reconstruct_account: no gsa.plist at {}", gsa_path.display());
+            return Err(format!(
+                "{APPLE_LOGIN_FAILED_PREFIX}: no saved Apple ID credentials ({} is missing)",
+                gsa_path.display()
+            ));
         }
 
         // Check cloud sync enabled config (skipped when `force` is true so the
@@ -147,7 +155,7 @@ impl RustpushBackend {
             );
             if !bubbles_config.cloud_sync_enabled {
                 log::info!("reconstruct_account: cloud sync disabled in config, skipping");
-                return Err(());
+                return Err("cloud sync is disabled".to_string());
             }
 
             // Check sync backoff (also skipped when forced).
@@ -167,7 +175,9 @@ impl RustpushBackend {
                     "reconstruct_account: in sync backoff (last error at {:?}), skipping",
                     last_error_secs,
                 );
-                return Err(());
+                return Err(format!(
+                    "the last automatic sync failed (unix {last_error_secs:?}); waiting out the backoff"
+                ));
             }
         } else {
             log::info!("reconstruct_account: forced (manual sync) — skipping cloud_sync_enabled and backoff checks");
@@ -190,7 +200,22 @@ impl RustpushBackend {
             &anisette,
             None,  // <- key: None means "reconstruct from gsa.plist"
         ).await {
-            Ok((account, _login_state)) => {
+            Ok((account, login_state)) => {
+                if !matches!(login_state, RpLoginState::LoggedIn) {
+                    // Apple accepted the password but wants an interactive
+                    // step (2FA, extra verification). Nothing below works
+                    // without a PET, so report it instead of letting
+                    // do_login fail with an opaque "No pet!".
+                    let state = map_state(login_state);
+                    log::warn!(
+                        "reconstruct_account: Apple ID login needs interactive verification: {state:?}"
+                    );
+                    record_sync_error(&state_dir);
+                    return Err(format!(
+                        "{APPLE_LOGIN_FAILED_PREFIX}: Apple requires additional verification \
+                         ({state:?}); sign out and sign in again to complete it"
+                    ));
+                }
                 // Always run do_login. The previous "skip if MME is fresh"
                 // optimization caused the IDS cert to stay bad whenever the
                 // rereg failed (Apple's auth state rotates faster than the
@@ -232,19 +257,30 @@ impl RustpushBackend {
                 log::warn!("reconstruct_account: try_auth failed: {e:?}");
                 // Anisette is still set; account is not. Subsequent attempts
                 // can reuse the anisette.
-                let unix_secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                if let Err(write_err) = crate::sync::write_last_sync_error(
-                    &state_dir.join(crate::sync::LAST_SYNC_ERROR_FILENAME),
-                    unix_secs,
-                ) {
-                    log::warn!("write_last_sync_error failed: {write_err}");
-                }
-                Err(())
+                record_sync_error(&state_dir);
+                Err(format!("{APPLE_LOGIN_FAILED_PREFIX}: {e:#}"))
             }
         }
+    }
+}
+
+/// Prefix of every `reconstruct_account` / `reauth_with_password` error that
+/// means the Apple ID password login itself did not complete. The Sync Now
+/// UI matches on this to offer the "re-enter password" dialog.
+pub const APPLE_LOGIN_FAILED_PREFIX: &str = "Apple ID login failed";
+
+/// Stamp `last_sync_error` with "now" so the automatic launch/wake sync backs
+/// off instead of repeating a login that just failed.
+fn record_sync_error(state_dir: &std::path::Path) {
+    let unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if let Err(write_err) = crate::sync::write_last_sync_error(
+        &state_dir.join(crate::sync::LAST_SYNC_ERROR_FILENAME),
+        unix_secs,
+    ) {
+        log::warn!("write_last_sync_error failed: {write_err}");
     }
 }
 
@@ -391,19 +427,29 @@ where
 
 /// Long-running receive loop. Calls `subscribe` to obtain a broadcast
 /// receiver of inbound APS messages and processes each one via `process`.
-/// On `Lagged` the dropped count is logged and the loop continues; on
-/// `Closed` the loop re-subscribes (with infinite retry via
-/// [`subscribe_with_reconnect`]); on `kick.notified()` the loop
-/// re-subscribes. The `reconnect` closure is called when `subscribe`
-/// returns `Err(ConnectionDead)`. The loop never exits — it retries
-/// subscribe indefinitely until it succeeds.
-/// Extracted from `start_receiving` so the loop structure (subscribe +
-/// recv + error arms + reconnect) can be tested without a live APNs connection.
-async fn run_receive_loop<S, P, R, SFut, RFut>(
+///
+/// * On `Lagged(n)` the loop logs at error level, reports `n` through
+///   `on_dropped`, and continues. rustpush has already acknowledged those
+///   notifications to Apple, so they will not be redelivered; the caller's
+///   `on_dropped` is where a backfill sync gets triggered.
+/// * On `Closed` the loop re-subscribes (with infinite retry via
+///   [`subscribe_with_reconnect`]).
+/// * A `kick` (wake from sleep) only short-circuits the reconnect backoff in
+///   [`subscribe_with_reconnect`]. It deliberately does **not** re-subscribe:
+///   the broadcast receiver lives on the connection resource and survives
+///   socket regeneration, so a fresh receiver would only discard whatever was
+///   already queued on the old one. The reconnect itself is `refresh_aps`'s job.
+///
+/// The `reconnect` closure is called when `subscribe` returns
+/// `Err(ConnectionDead)`. The loop never exits — it retries subscribe
+/// indefinitely until it succeeds. Extracted from `start_receiving` so the
+/// loop structure can be tested without a live APNs connection.
+async fn run_receive_loop<S, P, R, D, SFut, RFut>(
     subscribe: S,
     process: P,
     kick: std::sync::Arc<tokio::sync::Notify>,
     reconnect: R,
+    on_dropped: D,
 )
 where
     S: Fn() -> Result<tokio::sync::broadcast::Receiver<APSMessage>, ConnectionDead> + Send,
@@ -411,6 +457,7 @@ where
     SFut: std::future::Future<Output = ()> + Send,
     R: Fn() -> RFut + Send,
     RFut: std::future::Future<Output = Result<(), ReconnectError>> + Send,
+    D: Fn(u64) + Send,
 {
     let mut rx = subscribe_with_reconnect(&subscribe, &reconnect, std::sync::Arc::clone(&kick)).await;
     log::info!("receive loop started");
@@ -419,7 +466,11 @@ where
             result = rx.recv() => match result {
                 Ok(msg) => process(msg).await,
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    log::warn!("receive lagged, dropped {n} messages");
+                    log::error!(
+                        "receive loop lagged: {n} APNs messages were dropped after being \
+                         acknowledged to Apple and will not be redelivered"
+                    );
+                    on_dropped(n);
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     log::warn!("receive channel closed, re-subscribing");
@@ -427,8 +478,7 @@ where
                 }
             },
             _ = kick.notified() => {
-                log::info!("kick received, re-subscribing");
-                rx = subscribe_with_reconnect(&subscribe, &reconnect, std::sync::Arc::clone(&kick)).await;
+                log::info!("wake kick received; keeping the current subscription");
             }
         }
     }
@@ -744,11 +794,39 @@ impl Backend for RustpushBackend {
             let state: std::sync::Arc<std::sync::Mutex<Arc<BufferedApsConn>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(conn));
 
+            // Anything dropped anywhere between the socket and the store was
+            // already acknowledged to Apple. Tell the UI so it can start a
+            // backfill sync instead of silently showing a gap.
+            let on_dropped = {
+                let notify = notify.clone();
+                move |count: u64| {
+                    let _ = notify.try_send(RecvEvent::Dropped { count });
+                }
+            };
+
             let subscribe = {
                 let state = std::sync::Arc::clone(&state);
+                let on_dropped = on_dropped.clone();
+                // Drops already reported; the counter is cumulative and this
+                // closure runs again on a `Closed` re-subscribe.
+                let reported = std::sync::atomic::AtomicU64::new(0);
                 move || -> Result<tokio::sync::broadcast::Receiver<APSMessage>, ConnectionDead> {
                     let conn = state.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                    Ok(api::subscribe_conn(&conn))
+                    let rx = api::subscribe_conn(&conn);
+                    // Messages that arrived between connecting and this first
+                    // subscribe were buffered; report any the buffer could
+                    // not hold.
+                    let dropped = conn.dropped_count();
+                    let new_drops = dropped.saturating_sub(
+                        reported.swap(dropped, std::sync::atomic::Ordering::Relaxed),
+                    );
+                    if new_drops > 0 {
+                        log::error!(
+                            "{new_drops} APNs messages were dropped before the receive loop attached"
+                        );
+                        on_dropped(new_drops);
+                    }
+                    Ok(rx)
                 }
             };
 
@@ -807,11 +885,23 @@ impl Backend for RustpushBackend {
                                         }
                                     }
                                 } else {
-                                    let mut ingest = ingest_from(&inst, &handles);
-                                    // Download any attachments and attach them to the record.
-                                    if let Ingest::Message(im) = &mut ingest {
-                                        im.attachments = download_inbound(&inst, conn.inner(), &im.guid).await;
-                                    }
+                                    let ingest = ingest_from(&inst, &handles);
+                                    // Persist first. rustpush already acknowledged
+                                    // this notification, so the row has to reach
+                                    // the store before anything slow happens.
+                                    // Attachments are downloaded afterwards, off
+                                    // this loop, and attached to the stored row.
+                                    let attachment_guid = match &ingest {
+                                        Ingest::Message(im)
+                                            if matches!(
+                                                &inst.message,
+                                                Message::Message(n) if n.parts.has_attachments()
+                                            ) =>
+                                        {
+                                            Some(im.guid.clone())
+                                        }
+                                        _ => None,
+                                    };
                                     if let Err(e) = store.apply(ingest).await {
                                         log::warn!("store apply error: {e:#}");
                                     }
@@ -854,8 +944,38 @@ impl Backend for RustpushBackend {
                                     if SEND_DELIVERED_RECEIPTS && is_incoming_content(&inst, &handles) {
                                         send_receipt_for(&imclient, &inst, &handles, false).await;
                                     }
-                                    // Pulse the UI; drop if no receiver is listening.
-                                    let _ = notify.send(RecvEvent::Applied).await;
+                                    match attachment_guid {
+                                        Some(guid) => {
+                                            // Download off the receive loop so a
+                                            // burst of media cannot stall it (and
+                                            // lag the broadcast receiver). The UI
+                                            // is pulsed once the files have landed,
+                                            // matching the old "message appears
+                                            // complete" behaviour.
+                                            let inst = inst.clone();
+                                            let conn = conn.clone();
+                                            let store = store.clone();
+                                            let notify = notify.clone();
+                                            crate::runtime::runtime().spawn(async move {
+                                                let _permit = ATTACHMENT_DOWNLOADS.acquire().await;
+                                                let attachments =
+                                                    download_inbound(&inst, conn.inner(), &guid).await;
+                                                if !attachments.is_empty() {
+                                                    if let Err(e) = store
+                                                        .apply(Ingest::Attachments { guid, attachments })
+                                                        .await
+                                                    {
+                                                        log::warn!("store apply attachments: {e:#}");
+                                                    }
+                                                }
+                                                let _ = notify.send(RecvEvent::Applied).await;
+                                            });
+                                        }
+                                        None => {
+                                            // Pulse the UI; drop if no receiver is listening.
+                                            let _ = notify.send(RecvEvent::Applied).await;
+                                        }
+                                    }
                                     // A real inbound message means they've stopped typing:
                                     // clear the indicator now rather than waiting for a
                                     // typing-stop that iMessage doesn't always send.
@@ -886,6 +1006,7 @@ impl Backend for RustpushBackend {
                 },
                 kick_spawn,
                 reconnect,
+                on_dropped,
             )
             .await
         });
@@ -1058,9 +1179,9 @@ impl Backend for RustpushBackend {
                                 );
                                 retry_send().await
                             }
-                            Err(()) => {
+                            Err(reason) => {
                                 log::error!(
-                                    "cert self-heal: do_login fallback also failed; \
+                                    "cert self-heal: do_login fallback also failed ({reason}); \
                                      original rereg error: {rereg_err:?}"
                                 );
                                 Err(e)
@@ -1340,21 +1461,24 @@ impl Backend for RustpushBackend {
         // On failure (the common case until the follow-up stores the APS
         // connection), the method falls through to the default-return path.
         if self.account.lock().unwrap().is_none() {
-            let _ = self.reconstruct_account(force).await;
+            if let Err(reason) = self.reconstruct_account(force).await {
+                log::warn!("sync_missed_messages: cannot sign in to iCloud: {reason}");
+                return crate::sync::SyncResult::failed(reason);
+            }
         }
 
         // Need all three session handles; if any is missing, the session isn't
-        // fully set up yet, so we can't sync. Return a default result.
+        // fully set up yet, so we can't sync.
         let account = self.account.lock().unwrap().clone();
         let anisette = self.anisette.lock().unwrap().clone();
         let config = self.config.lock().unwrap().clone();
         let (account, anisette, config) = match (account, anisette, config) {
             (Some(a), Some(an), Some(c)) => (a, an, c),
             _ => {
-                log::debug!(
-                    "sync_missed_messages: session state not fully populated, skipping"
+                log::warn!("sync_missed_messages: session state not fully populated");
+                return crate::sync::SyncResult::failed(
+                    "session is not fully signed in yet".to_string(),
                 );
-                return crate::sync::SyncResult::default();
             }
         };
 
@@ -1373,7 +1497,9 @@ impl Backend for RustpushBackend {
                 Ok(s) => s,
                 Err(e) => {
                     log::warn!("sync: failed to read cloudkit.plist: {e}");
-                    return crate::sync::SyncResult::default();
+                    return crate::sync::SyncResult::failed(format!(
+                        "cannot read cloudkit.plist: {e}"
+                    ));
                 }
             };
         let keychain_state: rustpush::keychain::KeychainClientState =
@@ -1381,7 +1507,9 @@ impl Backend for RustpushBackend {
                 Ok(s) => s,
                 Err(e) => {
                     log::warn!("sync: failed to read keychain.plist: {e}");
-                    return crate::sync::SyncResult::default();
+                    return crate::sync::SyncResult::failed(format!(
+                        "cannot read keychain.plist: {e}"
+                    ));
                 }
             };
 
@@ -1429,11 +1557,13 @@ impl Backend for RustpushBackend {
         let msg_client =
             rustpush::cloud_messages::CloudMessagesClient::new(ck_client, kc_client);
 
-        // Empty handles for now — the IS_FROM_ME flag in CloudMessage.flags is
-        // the primary signal. A follow-up can read the registered handles from
-        // disk (id.plist) to add the handle-based fallback.
-        let my_handles: Vec<String> = Vec::new();
-        let chat_map = std::collections::HashMap::new();
+        // Our registered handles back up the IS_FROM_ME flag for from-me
+        // detection.
+        let my_handles = api::registered_handles(&self.state_path);
+        // Chat zone first: it carries the participant set and group name a
+        // message record lacks. Without it every synced message is keyed by
+        // the chat_id fallback, which cannot resolve groups at all.
+        let chat_map = crate::sync::fetch_cloud_chats(&msg_client).await;
 
         crate::sync::sync_once(&msg_client, store, &my_handles, &chat_map, cutoff_ms).await
     }
@@ -1455,10 +1585,10 @@ impl Backend for RustpushBackend {
         // action (the user entered a password and clicked "Set Up"), so
         // the gates are not relevant here — the user has already opted
         // in by entering their password.
-        if self.account.lock().unwrap().is_none()
-            && self.reconstruct_account(true).await.is_err()
-        {
-            return Err("account not reconstructed: sign in first".to_string());
+        if self.account.lock().unwrap().is_none() {
+            if let Err(reason) = self.reconstruct_account(true).await {
+                return Err(format!("cannot sign in to iCloud: {reason}"));
+            }
         }
 
         // Need the in-memory session handles to build a TokenProvider.
@@ -1579,12 +1709,92 @@ impl Backend for RustpushBackend {
     }
 
     async fn is_keychain_clique_set_up(&self) -> bool {
+        // rustpush persists `user_identity` inside `new_user_identity`,
+        // *before* the Cuttlefish establish/joinWithVoucher call, so the key's
+        // presence only proves a setup was attempted. Membership lands in the
+        // identity's dynamic state once the join succeeds, which is what
+        // rustpush's own `is_in_clique` checks.
         let path = std::path::PathBuf::from(&self.state_path).join("keychain.plist");
-        let dict: plist::Dictionary = match plist::from_file(&path) {
-            Ok(d) => d,
-            Err(_) => return false,
+        let state: rustpush::keychain::KeychainClientState = match plist::from_file(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                log::debug!("is_keychain_clique_set_up: cannot read keychain.plist: {e}");
+                return false;
+            }
         };
-        dict.contains_key("user_identity")
+        let joined = state
+            .user_identity
+            .as_ref()
+            .map(|u| u.is_in_clique())
+            .unwrap_or(false);
+        log::info!(
+            "is_keychain_clique_set_up: identity_present={} joined={joined}",
+            state.user_identity.is_some()
+        );
+        joined
+    }
+
+    async fn stored_apple_id(&self) -> Option<String> {
+        api::stored_username(&self.state_path)
+    }
+
+    async fn reauth_with_password(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> std::result::Result<String, String> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "no APS connection stored for this session".to_string())?;
+        let config = self
+            .config
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "no OS config stored for this session".to_string())?;
+        let anisette = api::make_anisette(self.state_path.clone(), &config, conn.inner()).await;
+        *self.anisette.lock().unwrap() = Some(anisette.clone());
+
+        let (account, state) = api::reauth(
+            self.state_path.clone(),
+            &config,
+            conn.inner(),
+            &anisette,
+            username,
+            password,
+        )
+        .await
+        .map_err(|e| format!("{APPLE_LOGIN_FAILED_PREFIX}: {e:#}"))?;
+
+        match state {
+            RpLoginState::LoggedIn => {
+                api::do_login(self.state_path.clone(), &account, None, &config)
+                    .await
+                    .map_err(|e| {
+                        format!("Apple accepted the password, but saving the session failed: {e:#}")
+                    })?;
+                *self.account.lock().unwrap() = Some(account);
+                let state_dir = std::path::PathBuf::from(&self.state_path);
+                if let Err(e) = crate::sync::clear_last_sync_error(
+                    &state_dir.join(crate::sync::LAST_SYNC_ERROR_FILENAME),
+                ) {
+                    log::warn!("clear_last_sync_error failed: {e}");
+                }
+                log::info!("reauth_with_password: signed in as {username}; saved credentials rewritten");
+                Ok("Signed in. Saved credentials updated; try Sync Now again.".to_string())
+            }
+            other => {
+                let state = map_state(other);
+                log::warn!("reauth_with_password: Apple requires interactive verification: {state:?}");
+                Err(format!(
+                    "Apple accepted the password but requires additional verification \
+                     ({state:?}). Sign out and sign in again to complete it."
+                ))
+            }
+        }
     }
 
     async fn setup_keychain_clique_with_bottle(
@@ -1597,10 +1807,10 @@ impl Backend for RustpushBackend {
 
         // If the in-memory session isn't populated yet, reconstruct it
         // from gsa.plist first.
-        if self.account.lock().unwrap().is_none()
-            && self.reconstruct_account(true).await.is_err()
-        {
-            return Err("account not reconstructed: sign in first".to_string());
+        if self.account.lock().unwrap().is_none() {
+            if let Err(reason) = self.reconstruct_account(true).await {
+                return Err(format!("cannot sign in to iCloud: {reason}"));
+            }
         }
 
         let account = self.account.lock().unwrap().clone();
@@ -1690,12 +1900,12 @@ impl Backend for RustpushBackend {
 
         // If the in-memory session isn't populated yet, reconstruct it
         // from gsa.plist first.
-        if self.account.lock().unwrap().is_none()
-            && self.reconstruct_account(true).await.is_err()
-        {
-            return crate::protocol::BottlesLookup::Unavailable(
-                "get_viable_escrow_bottles: failed to reconstruct account".to_string(),
-            );
+        if self.account.lock().unwrap().is_none() {
+            if let Err(reason) = self.reconstruct_account(true).await {
+                return crate::protocol::BottlesLookup::Unavailable(format!(
+                    "cannot sign in to iCloud: {reason}"
+                ));
+            }
         }
 
         let account = self.account.lock().unwrap().clone();
@@ -2238,6 +2448,12 @@ fn cache_copy(src: &str, guid: &str, part: i64, name: &str) -> Option<std::path:
 
 /// Download every attachment on an inbound message into the cache, returning the
 /// records to persist. Failures are logged and skipped, not fatal.
+/// Cap on concurrent inbound attachment downloads. Downloads run off the
+/// receive loop (see `start_receiving`), so this keeps a media-heavy backlog
+/// from opening dozens of MMCS transfers at once.
+static ATTACHMENT_DOWNLOADS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(3));
+
 async fn download_inbound(
     inst: &MessageInst,
     conn: &APSConnection,
@@ -3271,7 +3487,7 @@ mod tests {
         let reconnect = || async { Ok::<(), ReconnectError>(()) };
         let _ = tokio::time::timeout(
             Duration::from_secs(1),
-            run_receive_loop(subscribe, process, std::sync::Arc::new(tokio::sync::Notify::new()), reconnect),
+            run_receive_loop(subscribe, process, std::sync::Arc::new(tokio::sync::Notify::new()), reconnect, |_| {}),
         )
         .await;
 
@@ -3282,11 +3498,15 @@ mod tests {
         );
     }
 
+    /// Pin: a wake-from-sleep kick must NOT re-subscribe. The broadcast
+    /// receiver lives on the connection resource and survives socket
+    /// regeneration, so a fresh receiver would only discard messages that were
+    /// already queued on the old one (and already acknowledged to Apple). The
+    /// reconnect itself is `refresh_aps`'s job.
     #[tokio::test]
-    async fn receive_loop_resubscribes_on_kick() {
+    async fn receive_loop_keeps_subscription_on_kick() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
-        use std::sync::Mutex;
         use std::time::Duration;
         use tokio::sync::broadcast;
         use tokio::sync::Notify;
@@ -3294,41 +3514,14 @@ mod tests {
         let subscribe_call_count = Arc::new(AtomicUsize::new(0));
         let processed_count = Arc::new(AtomicUsize::new(0));
 
-        // -- Pre-made receivers (not fresh subscribe() calls) so that the
-        //    receivers the subscribe closure returns already contain queued
-        //    messages.  A broadcast::Receiver created via Sender::subscribe()
-        //    starts at the current write tail and cannot see messages sent
-        //    before its creation, so we must make the receivers ahead of time.
         let (tx, _rx) = broadcast::channel::<APSMessage>(16);
-
-        // rx1: created before the first send — sees position 0.
-        let rx1 = tx.subscribe();
-        tx.send(APSMessage::Ping).unwrap();
-
-        // rx2: created before the second send — sees position 1.
-        let rx2 = tx.subscribe();
-        tx.send(APSMessage::Ping).unwrap();
-        // Keep tx alive (otherwise receivers would return Closed).
-        let _tx_keepalive = tx;
-
-        let rx1_cell = Mutex::new(Some(rx1));
-        let rx2_cell = Mutex::new(Some(rx2));
 
         let subscribe = {
             let call_count = Arc::clone(&subscribe_call_count);
+            let tx = tx.clone();
             move || -> Result<_, ConnectionDead> {
                 call_count.fetch_add(1, Ordering::SeqCst);
-                // Dispatch based on the *previous* count value so the first
-                // call (value 0) returns rx1 and all subsequent calls return rx2.
-                let prev = call_count.load(Ordering::SeqCst) - 1;
-                match prev {
-                    0 => Ok(rx1_cell.lock().unwrap().take().expect(
-                        "subscribe call 0: rx1 should be present",
-                    )),
-                    _ => Ok(rx2_cell.lock().unwrap().take().expect(
-                        "subscribe call 1+: rx2 should be present",
-                    )),
-                }
+                Ok(tx.subscribe())
             }
         };
 
@@ -3343,46 +3536,119 @@ mod tests {
         };
 
         let kick = Arc::new(Notify::new());
-
         let reconnect = || async { Ok::<(), ReconnectError>(()) };
 
-        // Spawn the loop in the background.
         let handle = {
             let kick = Arc::clone(&kick);
             tokio::spawn(async move {
-                run_receive_loop(subscribe, process, kick, reconnect).await;
+                run_receive_loop(subscribe, process, kick, reconnect, |_| {}).await;
             })
         };
 
-        // Give the loop time to process the first message and then await the kick.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // The first subscribe should have been called, and the first message processed.
-        assert!(
-            subscribe_call_count.load(Ordering::SeqCst) >= 1,
-            "subscribe should have been called at least once before kick"
-        );
-        assert!(
-            processed_count.load(Ordering::SeqCst) >= 1,
-            "at least one message should have been processed before kick"
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            subscribe_call_count.load(Ordering::SeqCst),
+            1,
+            "the loop subscribes exactly once at start"
         );
 
-        // Signal the kick — the loop should re-subscribe.
+        // Queue a message and kick straight after. Whether the loop consumes
+        // the message before or after the kick, it must not be lost and no
+        // second subscribe may happen.
+        tx.send(APSMessage::Ping).unwrap();
         kick.notify_one();
-
-        // Wait for the re-subscription and message processing.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        assert!(
-            subscribe_call_count.load(Ordering::SeqCst) >= 2,
-            "subscribe must be called a second time after kick.notify_one()"
+        assert_eq!(
+            subscribe_call_count.load(Ordering::SeqCst),
+            1,
+            "a kick must not re-subscribe (that would discard queued messages)"
         );
-        assert!(
-            processed_count.load(Ordering::SeqCst) >= 2,
-            "a second message must be processed after the kick triggers re-subscription"
+        assert_eq!(
+            processed_count.load(Ordering::SeqCst),
+            1,
+            "the message queued around the kick must still be processed"
         );
 
-        // Clean up: abort the background task so the test doesn't hang.
+        // The original receiver keeps delivering afterwards.
+        tx.send(APSMessage::Ping).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            processed_count.load(Ordering::SeqCst),
+            2,
+            "messages after the kick arrive on the same subscription"
+        );
+
+        handle.abort();
+    }
+
+    /// Pin: when the broadcast receiver lags, the loop reports the dropped
+    /// count through `on_dropped` (so the UI can start a backfill sync) and
+    /// keeps processing what is left.
+    #[tokio::test]
+    async fn receive_loop_reports_lag_through_on_dropped() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use tokio::sync::broadcast;
+        use tokio::sync::Notify;
+
+        // Capacity 2, five sends before the loop reads: the receiver is
+        // three behind on its first recv => Lagged(3), then the last two.
+        let (tx, _rx) = broadcast::channel::<APSMessage>(2);
+        let rx = tx.subscribe();
+        for _ in 0..5 {
+            tx.send(APSMessage::Ping).unwrap();
+        }
+        let _tx_keepalive = tx;
+
+        let rx_cell = Mutex::new(Some(rx));
+        let subscribe = move || -> Result<_, ConnectionDead> {
+            Ok(rx_cell
+                .lock()
+                .unwrap()
+                .take()
+                .expect("subscribe is called exactly once"))
+        };
+
+        let processed_count = Arc::new(AtomicUsize::new(0));
+        let process = {
+            let processed = Arc::clone(&processed_count);
+            move |_msg: APSMessage| {
+                let p = Arc::clone(&processed);
+                async move {
+                    p.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        };
+
+        let dropped = Arc::new(AtomicU64::new(0));
+        let on_dropped = {
+            let dropped = Arc::clone(&dropped);
+            move |n: u64| {
+                dropped.fetch_add(n, Ordering::SeqCst);
+            }
+        };
+
+        let reconnect = || async { Ok::<(), ReconnectError>(()) };
+        let handle = tokio::spawn(async move {
+            run_receive_loop(subscribe, process, Arc::new(Notify::new()), reconnect, on_dropped)
+                .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            3,
+            "the lagged count must be reported so a backfill sync can be triggered"
+        );
+        assert_eq!(
+            processed_count.load(Ordering::SeqCst),
+            2,
+            "the messages still in the channel must be processed after the lag"
+        );
+
         handle.abort();
     }
 
@@ -3455,7 +3721,7 @@ mod tests {
         let handle = {
             let kick = Arc::clone(&kick);
             tokio::spawn(async move {
-                run_receive_loop(subscribe, process, kick, reconnect).await;
+                run_receive_loop(subscribe, process, kick, reconnect, |_| {}).await;
             })
         };
 
@@ -3589,19 +3855,63 @@ mod tests {
         assert!(!backend.is_keychain_clique_set_up().await);
     }
 
-    /// Pin: `Backend::is_keychain_clique_set_up` — returns `true` when
-    /// `keychain.plist` exists and has a `user_identity` field (the clique
-    /// was set up and a user identity was persisted to disk).
+    /// Write a `keychain.plist` shaped like rustpush's `KeychainClientState`
+    /// with one user identity whose dynamic trust state lists `includeds`.
+    /// rustpush persists the identity *before* the Cuttlefish join, so an
+    /// identity whose `includeds` lacks its own identifier is exactly what a
+    /// failed or interrupted setup leaves behind.
+    fn write_keychain_fixture(dir: &std::path::Path, identifier: &str, includeds: &[&str]) {
+        use prost::Message as _;
+        use rustpush::cloudkit_proto::{PeerDynamicInfo, SignedInfo};
+
+        let dynamic = PeerDynamicInfo {
+            clock: Some(1),
+            includeds: includeds.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let info = SignedInfo {
+            info: Some(vec![]),
+            signature: Some(vec![]),
+        };
+
+        let mut identity = plist::Dictionary::new();
+        identity.insert("identifier".into(), plist::Value::String(identifier.into()));
+        identity.insert("info".into(), plist::Value::Data(info.encode_to_vec()));
+        identity.insert("signing_key".into(), plist::Value::String("keychain:sign".into()));
+        identity.insert("encryption_key".into(), plist::Value::String("keychain:enc".into()));
+        identity.insert("current_state".into(), plist::Value::Data(dynamic.encode_to_vec()));
+
+        let mut state = plist::Dictionary::new();
+        state.insert("dsid".into(), plist::Value::String("1".into()));
+        state.insert("adsid".into(), plist::Value::String("a".into()));
+        state.insert("host".into(), plist::Value::String("https://example.invalid".into()));
+        state.insert("state".into(), plist::Value::Dictionary(plist::Dictionary::new()));
+        state.insert("keystore".into(), plist::Value::Array(vec![]));
+        state.insert("items".into(), plist::Value::Dictionary(plist::Dictionary::new()));
+        state.insert("user_identity".into(), plist::Value::Dictionary(identity));
+        plist::to_file_xml(dir.join("keychain.plist"), &state).unwrap();
+    }
+
+    /// Pin: `Backend::is_keychain_clique_set_up` — a persisted `user_identity`
+    /// that never made it into the clique (its own identifier is missing from
+    /// `includeds`) must read as NOT set up. Treating it as set up is the bug
+    /// that skipped the password prompt forever after one failed attempt and
+    /// then failed every sync with "Not in clique".
     #[tokio::test]
-    async fn is_keychain_clique_set_up_returns_true_when_user_identity_present() {
+    async fn is_keychain_clique_set_up_returns_false_when_identity_not_joined() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("keychain.plist");
-        let mut dict = plist::Dictionary::new();
-        dict.insert(
-            "user_identity".into(),
-            plist::Value::Dictionary(plist::Dictionary::new()),
-        );
-        plist::to_file_xml(&path, &dict).unwrap();
+        write_keychain_fixture(tmp.path(), "peer-me", &[]);
+        let backend = RustpushBackend::new(tmp.path().to_string_lossy().to_string());
+        assert!(!backend.is_keychain_clique_set_up().await);
+    }
+
+    /// Pin: `Backend::is_keychain_clique_set_up` — returns `true` once the
+    /// identity's trust state includes its own identifier, which is what a
+    /// successful Cuttlefish join records.
+    #[tokio::test]
+    async fn is_keychain_clique_set_up_returns_true_when_identity_joined() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_keychain_fixture(tmp.path(), "peer-me", &["peer-phone", "peer-me"]);
         let backend = RustpushBackend::new(tmp.path().to_string_lossy().to_string());
         assert!(backend.is_keychain_clique_set_up().await);
     }
@@ -3626,22 +3936,27 @@ mod tests {
         assert_eq!(result.unwrap(), crate::sync::SyncResult::default());
     }
 
-    /// Pin: `decide_clique_setup_action` — when `keychain.plist` exists with a
-    /// `user_identity` field, `is_keychain_clique_set_up` returns `true`, so
-    /// the action should be `SyncNow`.
+    /// Pin: `decide_clique_setup_action` — when `keychain.plist` records an
+    /// identity that has joined the clique, the action is `SyncNow`.
     #[tokio::test]
     async fn decide_clique_setup_action_returns_sync_now_when_clique_set_up() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("keychain.plist");
-        let mut dict = plist::Dictionary::new();
-        dict.insert(
-            "user_identity".into(),
-            plist::Value::Dictionary(plist::Dictionary::new()),
-        );
-        plist::to_file_xml(&path, &dict).unwrap();
+        write_keychain_fixture(tmp.path(), "peer-me", &["peer-me"]);
         let backend = RustpushBackend::new(tmp.path().to_string_lossy().to_string());
         let action = crate::protocol::decide_clique_setup_action(&backend).await;
         assert_eq!(action, crate::protocol::CliqueSetupAction::SyncNow);
+    }
+
+    /// Pin: `decide_clique_setup_action` — an identity left behind by a
+    /// failed join must lead back to the password prompt, not to a sync that
+    /// can only fail with "Not in clique".
+    #[tokio::test]
+    async fn decide_clique_setup_action_returns_prompt_when_identity_not_joined() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_keychain_fixture(tmp.path(), "peer-me", &["peer-phone"]);
+        let backend = RustpushBackend::new(tmp.path().to_string_lossy().to_string());
+        let action = crate::protocol::decide_clique_setup_action(&backend).await;
+        assert_eq!(action, crate::protocol::CliqueSetupAction::PromptForPassword);
     }
 
     /// Pin: `decide_clique_setup_action` — when `keychain.plist` does not
@@ -4125,7 +4440,7 @@ mod tests {
         let handle = {
             let kick = Arc::clone(&kick);
             tokio::spawn(async move {
-                run_receive_loop(subscribe, process, kick, reconnect).await;
+                run_receive_loop(subscribe, process, kick, reconnect, |_| {}).await;
             })
         };
 
