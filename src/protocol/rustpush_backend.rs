@@ -81,6 +81,31 @@ pub struct RustpushBackend {
     /// `try_auth` with `creds: None`.
     /// Populated by `setup_push` (or `restore_session`).
     conn: StdMutex<Option<Arc<BufferedApsConn>>>,
+    /// Live state of the running cloud sync, read by the sidebar progress
+    /// display through `Backend::sync_progress`.
+    sync_progress: Arc<StdMutex<SyncProgress>>,
+}
+
+/// Marks a cloud sync as running for its whole duration, including every
+/// early-return path, and clears the flag when dropped.
+struct SyncActiveGuard(Arc<StdMutex<SyncProgress>>);
+
+impl SyncActiveGuard {
+    fn begin(progress: &Arc<StdMutex<SyncProgress>>) -> Self {
+        *progress.lock().unwrap() = SyncProgress {
+            active: true,
+            ..SyncProgress::default()
+        };
+        Self(Arc::clone(progress))
+    }
+}
+
+impl Drop for SyncActiveGuard {
+    fn drop(&mut self) {
+        let mut p = self.0.lock().unwrap();
+        p.active = false;
+        p.scanning = false;
+    }
 }
 
 impl RustpushBackend {
@@ -92,6 +117,7 @@ impl RustpushBackend {
             anisette: StdMutex::new(None),
             config: StdMutex::new(None),
             conn: StdMutex::new(None),
+            sync_progress: Arc::new(StdMutex::new(SyncProgress::default())),
         }
     }
 
@@ -261,6 +287,127 @@ impl RustpushBackend {
                 Err(format!("{APPLE_LOGIN_FAILED_PREFIX}: {e:#}"))
             }
         }
+    }
+}
+
+/// App-side CloudKit zone walker.
+///
+/// rustpush's own `sync_messages` / `sync_chats` always fetch newest-first,
+/// which suits a bounded window but not a resumable oldest-to-newest walk
+/// whose final token means "now". This reuses the same public container,
+/// zone-key and record-decryption calls with the walk direction as a
+/// parameter, and serves both orders through [`crate::sync::CloudKitSync`].
+struct CloudZoneFetcher<P: rustpush::AnisetteProvider> {
+    client: rustpush::cloud_messages::CloudMessagesClient<P>,
+}
+
+impl<P: rustpush::AnisetteProvider + Send + Sync> CloudZoneFetcher<P> {
+    async fn fetch_zone<T: rustpush::cloudkit_proto::CloudKitRecord>(
+        &self,
+        zone_name: &str,
+        token: Option<Vec<u8>>,
+        newest_first: bool,
+    ) -> std::result::Result<(Vec<u8>, std::collections::HashMap<String, Option<T>>, i32), PushError>
+    {
+        use rustpush::cloud_messages::MESSAGES_SERVICE;
+        use rustpush::cloudkit::{
+            pcs_keys_for_record, CloudKitSession, FetchRecordChangesOperation, NO_ASSETS,
+        };
+        use rustpush::cloudkit_proto::RetrieveChangesRequest;
+
+        let container = self.client.get_container().await?;
+        let zone = container.private_zone(zone_name.to_string());
+        let key = container
+            .get_zone_encryption_config(&zone, &self.client.keychain, &MESSAGES_SERVICE)
+            .await?;
+        let request = RetrieveChangesRequest {
+            sync_continuation_token: token,
+            zone_identifier: Some(zone.clone()),
+            requested_changes_types: Some(3),
+            assets_to_download: Some(NO_ASSETS.clone()),
+            newest_first: Some(newest_first),
+            ..Default::default()
+        };
+        let (_assets, response) = container
+            .perform(&CloudKitSession::new(), FetchRecordChangesOperation(request))
+            .await?;
+
+        let mut results = std::collections::HashMap::new();
+        for change in &response.change {
+            let identifier = change
+                .identifier
+                .as_ref()
+                .and_then(|i| i.value.as_ref())
+                .map(|v| v.name().to_string())
+                .unwrap_or_default();
+            let Some(record) = &change.record else {
+                results.insert(identifier, None);
+                continue;
+            };
+            if record.r#type.as_ref().map(|t| t.name()) != Some(T::record_type()) {
+                continue;
+            }
+            let pcskey = match pcs_keys_for_record(record, &key) {
+                Ok(k) => k,
+                Err(PushError::PCSRecordKeyMissing) => {
+                    container.clear_cache_zone_encryption_config(&zone).await;
+                    return Err(PushError::PCSRecordKeyMissing);
+                }
+                Err(e) => return Err(e),
+            };
+            results.insert(
+                identifier,
+                Some(T::from_record_encrypted(&record.record_field, Some(&pcskey))),
+            );
+        }
+        Ok((
+            response.sync_continuation_token().to_vec(),
+            results,
+            response.status(),
+        ))
+    }
+}
+
+#[async_trait]
+impl<P: rustpush::AnisetteProvider + Send + Sync> crate::sync::CloudKitSync for CloudZoneFetcher<P> {
+    async fn fetch_sync_page(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+    ) -> std::result::Result<
+        (Vec<u8>, std::collections::HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>, i32),
+        PushError,
+    > {
+        self.fetch_zone("messageManateeZone", continuation_token, true).await
+    }
+
+    async fn fetch_chat_page(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+    ) -> std::result::Result<
+        (Vec<u8>, std::collections::HashMap<String, Option<rustpush::cloud_messages::CloudChat>>, i32),
+        PushError,
+    > {
+        self.fetch_zone("chatManateeZone", continuation_token, true).await
+    }
+
+    async fn fetch_message_changes(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+    ) -> std::result::Result<
+        (Vec<u8>, std::collections::HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>, i32),
+        PushError,
+    > {
+        self.fetch_zone("messageManateeZone", continuation_token, false).await
+    }
+
+    async fn fetch_chat_changes(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+    ) -> std::result::Result<
+        (Vec<u8>, std::collections::HashMap<String, Option<rustpush::cloud_messages::CloudChat>>, i32),
+        PushError,
+    > {
+        self.fetch_zone("chatManateeZone", continuation_token, false).await
     }
 }
 
@@ -1521,6 +1668,10 @@ impl Backend for RustpushBackend {
         cutoff_ms: i64,
         force: bool,
     ) -> crate::sync::SyncResult {
+        // Shows "syncing" in the sidebar until this function returns, by any
+        // path.
+        let _active = SyncActiveGuard::begin(&self.sync_progress);
+
         // Best-effort: if the session state is incomplete (e.g., after a
         // restart), try to reconstruct the AppleAccount from gsa.plist.
         // On failure (the common case until the follow-up stores the APS
@@ -1577,6 +1728,8 @@ impl Backend for RustpushBackend {
                     ));
                 }
             };
+        // Which Apple account the sync cursor must belong to.
+        let account_dsid = keychain_state.dsid.clone();
 
         // Build the TokenProvider from the in-memory AppleAccount.
         // This is the same `TokenProvider` used by the CloudKit and Keychain
@@ -1622,24 +1775,115 @@ impl Backend for RustpushBackend {
         let msg_client =
             rustpush::cloud_messages::CloudMessagesClient::new(ck_client, kc_client);
 
+        let fetcher = CloudZoneFetcher { client: msg_client };
+
         // Manual sync only: log the shape of the zones Apple uses for
         // "Recently Deleted" and message edits, so deletions that are not
         // plain tombstones can be implemented from real data.
         if force {
             for zone in ["recoverableMessageDeleteZone", "messageUpdateZone"] {
-                log_zone_schema(&msg_client, zone).await;
+                log_zone_schema(&fetcher.client, zone).await;
             }
         }
 
         // Our registered handles back up the IS_FROM_ME flag for from-me
         // detection.
         let my_handles = api::registered_handles(&self.state_path);
-        // Chat zone first: it carries the participant set and group name a
-        // message record lacks. Without it every synced message is keyed by
-        // the chat_id fallback, which cannot resolve groups at all.
-        let chat_map = crate::sync::fetch_cloud_chats(&msg_client).await;
 
-        crate::sync::sync_once(&msg_client, store, &my_handles, &chat_map, cutoff_ms).await
+        // Token-based sync, the way a real device does it. The chat zone is
+        // walked first and cached on disk (record name -> chat) so a message
+        // arriving in a later incremental run still resolves to its
+        // conversation. Then the message zone is walked from the saved
+        // cursor: the first time through reads the whole history so the
+        // token ends up meaning "now" (storing only the recent window), and
+        // every run after that fetches just what changed, deletions
+        // included, however long the app was closed.
+        let mut cursor = crate::sync::read_cursor(&dir);
+        let mut chat_cache = crate::sync::read_cloud_chats(&dir);
+        crate::sync::ensure_cursor_account(&dir, &mut cursor, &mut chat_cache, &account_dsid);
+        {
+            let mut p = self.sync_progress.lock().unwrap();
+            p.scanning = !cursor.messages_complete;
+            p.records_scanned = cursor.records_scanned;
+        }
+        match crate::sync::sync_chats_with_cursor(&fetcher, &mut chat_cache, &mut cursor).await {
+            Ok(applied) => {
+                if let Err(e) = crate::sync::write_cloud_chats(&dir, &chat_cache) {
+                    log::warn!("cannot persist chat cache: {e}");
+                }
+                if let Err(e) = crate::sync::write_cursor(&dir, &cursor) {
+                    log::warn!("cannot persist sync cursor: {e}");
+                }
+                log::info!(
+                    "chat zone: {applied} changes applied, {} chats cached",
+                    chat_cache.len()
+                );
+            }
+            Err(e) => log::warn!(
+                "chat zone sync failed ({e:?}); continuing with {} cached chats",
+                chat_cache.len()
+            ),
+        }
+        let chat_map = crate::sync::chat_lookup_map(&chat_cache);
+
+        if !cursor.messages_complete {
+            match fetcher.client.count_records().await {
+                Ok(summary) => {
+                    log::info!(
+                        "initial CloudKit scan starting (resuming: {}); zone summary {:?}",
+                        cursor.messages_token.is_some(),
+                        summary.messages_summary
+                    );
+                    // Apple's count covers live records only; the change
+                    // feed also replays deleted and replaced ones, so a
+                    // previous completed scan is the better estimate. The UI
+                    // falls back to an activity pulse once either is passed.
+                    let apple_count = summary
+                        .messages_summary
+                        .first()
+                        .copied()
+                        .filter(|n| *n > 0)
+                        .map(|n| n as u64)
+                        .unwrap_or(0);
+                    let estimate = apple_count.max(cursor.last_scan_total);
+                    self.sync_progress.lock().unwrap().total_estimate =
+                        (estimate > 0).then_some(estimate);
+                }
+                Err(e) => log::info!(
+                    "initial CloudKit scan starting (resuming: {}); record count unavailable: {e:?}",
+                    cursor.messages_token.is_some()
+                ),
+            }
+        }
+
+        // During the initial scan only the recent window is stored. Never let
+        // that window be narrower than 48 hours, even when the caller's
+        // cutoff (a recent last-alive stamp) is closer than that.
+        let now_ms = now_ms();
+        let apply_since_ms = cutoff_ms.min(now_ms - 48 * 60 * 60 * 1000);
+        let cursor_dir = dir.clone();
+        let progress = Arc::clone(&self.sync_progress);
+        crate::sync::sync_messages_with_cursor(
+            &fetcher,
+            store,
+            &my_handles,
+            &chat_map,
+            &mut cursor,
+            apply_since_ms,
+            |c| {
+                if let Err(e) = crate::sync::write_cursor(&cursor_dir, c) {
+                    log::warn!("cannot persist sync cursor: {e}");
+                }
+                let mut p = progress.lock().unwrap();
+                p.scanning = !c.messages_complete;
+                p.records_scanned = c.records_scanned;
+            },
+        )
+        .await
+    }
+
+    fn sync_progress(&self) -> SyncProgress {
+        self.sync_progress.lock().unwrap().clone()
     }
 
     async fn setup_keychain_clique(

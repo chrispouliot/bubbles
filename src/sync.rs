@@ -320,6 +320,24 @@ pub trait CloudKitSync: Send + Sync {
     ) -> Result<(Vec<u8>, std::collections::HashMap<String, Option<CloudChat>>, i32), PushError> {
         Ok((Vec::new(), std::collections::HashMap::new(), 3))
     }
+
+    /// Oldest-to-newest page of the message zone, for the token-based walk.
+    /// The token returned at the end of a completed walk is a resume point
+    /// for later changes.
+    async fn fetch_message_changes(
+        &self,
+        _continuation_token: Option<Vec<u8>>,
+    ) -> Result<(Vec<u8>, std::collections::HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>, i32), PushError> {
+        Err(PushError::ResourcePanic("incremental message fetch not supported".into()))
+    }
+
+    /// Oldest-to-newest page of the chat zone, for the token-based walk.
+    async fn fetch_chat_changes(
+        &self,
+        _continuation_token: Option<Vec<u8>>,
+    ) -> Result<(Vec<u8>, std::collections::HashMap<String, Option<CloudChat>>, i32), PushError> {
+        Err(PushError::ResourcePanic("incremental chat fetch not supported".into()))
+    }
 }
 
 /// Upper bound on chat-zone pages fetched per sync, a guard against a server
@@ -398,6 +416,11 @@ pub struct SyncResult {
     pub error: Option<String>,
     /// CloudKit deletion tombstones applied across all pages.
     pub deleted: usize,
+    /// Records read during the initial scan but outside the stored window.
+    pub scanned: usize,
+    /// True when the message zone has been walked to its end, i.e. the saved
+    /// token now means "now" and later runs are incremental.
+    pub scan_complete: bool,
 }
 
 impl SyncResult {
@@ -2171,5 +2194,682 @@ mod chat_mapping_tests {
 
         let map = fetch_cloud_chats(&syncer).await;
         assert!(map.contains_key("iMessage;-;+1"), "what was fetched before the error is kept");
+    }
+}
+
+// ─── Token-based (incremental) sync ─────────────────────────────────────────
+//
+// A real device walks each CloudKit zone once at setup, keeps the server's
+// change token, and afterwards fetches only what changed. The bounded
+// newest-first walk above cannot do that: its token is a position in a
+// reversed walk, so resuming from it goes *older*, not newer. This section
+// does it the device's way. The message zone is walked oldest to newest; the
+// first time through reads the whole history to obtain a token that means
+// "now" (storing only the recent window), and every run after that fetches
+// just the delta, deletions included, however long the app was closed.
+
+/// Filename of the persisted CloudKit change cursor.
+pub const CLOUD_SYNC_CURSOR_FILENAME: &str = "cloud_sync_cursor.plist";
+/// Filename of the persisted chat-zone cache (record name -> chat).
+pub const CLOUD_CHATS_FILENAME: &str = "cloud_chats.plist";
+
+/// Where the incremental sync stands. Persisted after every page so an
+/// interrupted initial scan resumes where it stopped instead of restarting.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct SyncCursor {
+    /// Continuation token for the message zone; `None` means "from the start".
+    #[serde(default)]
+    pub messages_token: Option<plist::Data>,
+    /// True once the message zone has been walked to its end. Until then
+    /// every sync continues the initial scan.
+    #[serde(default)]
+    pub messages_complete: bool,
+    #[serde(default)]
+    pub chats_token: Option<plist::Data>,
+    #[serde(default)]
+    pub chats_complete: bool,
+    /// Records read so far in the initial scan, for progress and diagnostics.
+    #[serde(default)]
+    pub records_scanned: u64,
+    /// Records the last completed scan read in total. Apple's own record
+    /// count only covers live records, so this is the better progress
+    /// estimate if a rescan is ever needed.
+    #[serde(default)]
+    pub last_scan_total: u64,
+    /// The Apple account (DSID) these tokens belong to. Tokens are zone
+    /// cursors for one account; a different account signing in must start
+    /// from scratch rather than fail every sync with someone else's token.
+    #[serde(default)]
+    pub account_dsid: Option<String>,
+}
+
+/// Ensure the persisted cursor and chat cache belong to `dsid`. On a
+/// mismatch both are reset to empty, the same as a first run. Returns
+/// whether a reset happened.
+pub fn ensure_cursor_account(state_dir: &Path, cursor: &mut SyncCursor, cache: &mut CloudChatCache, dsid: &str) -> bool {
+    match cursor.account_dsid.as_deref() {
+        Some(current) if current == dsid => false,
+        Some(_) => {
+            log::warn!("cloud sync state belongs to another Apple account; starting a fresh scan");
+            *cursor = SyncCursor {
+                account_dsid: Some(dsid.to_string()),
+                ..SyncCursor::default()
+            };
+            cache.clear();
+            if let Err(e) = write_cursor(state_dir, cursor) {
+                log::warn!("cannot persist sync cursor: {e}");
+            }
+            if let Err(e) = write_cloud_chats(state_dir, cache) {
+                log::warn!("cannot persist chat cache: {e}");
+            }
+            true
+        }
+        None => {
+            // A cursor written before accounts were tracked: it was made by
+            // the account that is signed in now, so claim it rather than
+            // throw away a scan.
+            cursor.account_dsid = Some(dsid.to_string());
+            if let Err(e) = write_cursor(state_dir, cursor) {
+                log::warn!("cannot persist sync cursor: {e}");
+            }
+            false
+        }
+    }
+}
+
+impl SyncCursor {
+    fn messages_token_bytes(&self) -> Option<Vec<u8>> {
+        self.messages_token.as_ref().map(|d| d.as_ref().to_vec())
+    }
+    fn chats_token_bytes(&self) -> Option<Vec<u8>> {
+        self.chats_token.as_ref().map(|d| d.as_ref().to_vec())
+    }
+}
+
+pub fn read_cursor(state_dir: &Path) -> SyncCursor {
+    plist::from_file(state_dir.join(CLOUD_SYNC_CURSOR_FILENAME)).unwrap_or_default()
+}
+
+pub fn write_cursor(state_dir: &Path, cursor: &SyncCursor) -> io::Result<()> {
+    plist::to_file_xml(state_dir.join(CLOUD_SYNC_CURSOR_FILENAME), cursor).map_err(io::Error::other)
+}
+
+/// True when an initial scan was started but has not reached the end of the
+/// message zone. The launch and wake gates run a sync in that case even when
+/// the app was only briefly away, so the scan finishes.
+pub fn scan_pending(state_dir: &Path) -> bool {
+    let cursor = read_cursor(state_dir);
+    cursor.messages_token.is_some() && !cursor.messages_complete
+}
+
+/// Chat-zone records by CloudKit record name, kept on disk between runs so a
+/// message arriving in a later incremental sync still resolves to its
+/// conversation.
+pub type CloudChatCache = HashMap<String, CloudChat>;
+
+pub fn read_cloud_chats(state_dir: &Path) -> CloudChatCache {
+    plist::from_file(state_dir.join(CLOUD_CHATS_FILENAME)).unwrap_or_default()
+}
+
+pub fn write_cloud_chats(state_dir: &Path, cache: &CloudChatCache) -> io::Result<()> {
+    plist::to_file_xml(state_dir.join(CLOUD_CHATS_FILENAME), cache).map_err(io::Error::other)
+}
+
+/// Expand the on-disk cache into the lookup map `chat_ref_for` uses, keyed by
+/// every identifier a message's `chat_id` might carry.
+pub fn chat_lookup_map(cache: &CloudChatCache) -> HashMap<String, CloudChat> {
+    let mut map = HashMap::new();
+    for (record_id, chat) in cache {
+        for key in chat_map_keys(record_id, chat) {
+            map.insert(key, chat.clone());
+        }
+    }
+    map
+}
+
+/// True when CloudKit says our continuation token is no longer valid and the
+/// walk has to restart from the beginning.
+pub fn is_change_token_expired(err: &PushError) -> bool {
+    matches!(
+        err,
+        PushError::CloudKitError(e)
+            if e.error.as_ref().is_some_and(|er| er.error_description() == ".changeTokenExpired")
+    )
+}
+
+/// Upper bound on pages per run; a guard against a server that never reports
+/// completion. A full history scan of a busy account is a few hundred pages.
+const MAX_CURSOR_PAGES: usize = 5000;
+
+/// Walk the chat zone from the saved token and merge every change into
+/// `cache`: a record replaces its entry, a tombstone removes it. Returns the
+/// number of changes applied. On an expired token the cache and token are
+/// cleared and the walk restarts from the beginning once.
+pub async fn sync_chats_with_cursor(
+    syncer: &dyn CloudKitSync,
+    cache: &mut CloudChatCache,
+    cursor: &mut SyncCursor,
+) -> Result<usize, PushError> {
+    let mut token = cursor.chats_token_bytes();
+    let mut restarted = false;
+    let mut applied = 0;
+    for _ in 0..MAX_CURSOR_PAGES {
+        let (next, page, status) = match syncer.fetch_chat_changes(token.clone()).await {
+            Ok(t) => t,
+            Err(e) if is_change_token_expired(&e) && !restarted => {
+                log::warn!("chat zone change token expired; rescanning the zone");
+                restarted = true;
+                cache.clear();
+                token = None;
+                cursor.chats_token = None;
+                cursor.chats_complete = false;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        for (record_id, record) in page {
+            match record {
+                Some(chat) => {
+                    cache.insert(record_id, chat);
+                }
+                None => {
+                    cache.remove(&record_id);
+                }
+            }
+            applied += 1;
+        }
+        cursor.chats_token = Some(plist::Data::new(next.clone()));
+        token = Some(next);
+        if status == 3 {
+            cursor.chats_complete = true;
+            break;
+        }
+    }
+    Ok(applied)
+}
+
+/// Walk the message zone from the saved cursor.
+///
+/// * While `cursor.messages_complete` is false this is the initial scan:
+///   every record is read (so the token ends up meaning "now"), but only
+///   those dated at or after `apply_since_ms` are stored. Tombstones are
+///   always applied.
+/// * Once complete, every change is applied regardless of date: that is the
+///   "everything that changed while the app was closed" path.
+///
+/// `on_page` is called with the updated cursor after every page so the caller
+/// can persist it; a crash mid-scan then resumes rather than restarts. An
+/// expired token resets the cursor and restarts the scan once.
+pub async fn sync_messages_with_cursor(
+    syncer: &dyn CloudKitSync,
+    store: &Store,
+    my_handles: &[String],
+    chat_map: &HashMap<String, CloudChat>,
+    cursor: &mut SyncCursor,
+    apply_since_ms: i64,
+    mut on_page: impl FnMut(&SyncCursor),
+) -> SyncResult {
+    let mut result = SyncResult::default();
+    let mut token = cursor.messages_token_bytes();
+    let mut restarted = false;
+
+    for _ in 0..MAX_CURSOR_PAGES {
+        let (next, page, status) = match syncer.fetch_message_changes(token.clone()).await {
+            Ok(t) => t,
+            Err(e) if is_change_token_expired(&e) && !restarted => {
+                log::warn!("message zone change token expired; rescanning from the start");
+                restarted = true;
+                token = None;
+                cursor.messages_token = None;
+                cursor.messages_complete = false;
+                cursor.records_scanned = 0;
+                on_page(cursor);
+                continue;
+            }
+            Err(e) => {
+                log::error!("cursor sync: fetch error: {e:?}");
+                result.error = Some(format!("{e}"));
+                break;
+            }
+        };
+        result.pages_processed += 1;
+        let scanning = !cursor.messages_complete;
+
+        let mut live: HashMap<String, CloudMessage> = HashMap::new();
+        let mut tombstones: Vec<String> = Vec::new();
+        let mut skipped = 0usize;
+        for (record_id, record) in page {
+            match record {
+                Some(cm) => {
+                    if scanning && apple_time_to_unix_ms(cm.time) < apply_since_ms {
+                        skipped += 1;
+                        continue;
+                    }
+                    live.insert(record_id, cm);
+                }
+                None => tombstones.push(record_id),
+            }
+        }
+        let tombstone_count = tombstones.len();
+        for record_id in tombstones {
+            match store.apply(Ingest::CloudRecordDeleted { record_id }).await {
+                Ok(()) => result.deleted += 1,
+                Err(e) => log::warn!("store.apply tombstone failed during sync: {e}"),
+            }
+        }
+        // Every record read counts as scanned, including placeholder
+        // records that decode to nothing and are ignored by the store.
+        let live_count = live.len();
+        let page_result = process_sync_page(live, my_handles, chat_map, store, i64::MIN).await;
+        result.messages_processed += page_result.count;
+        result.scanned += skipped;
+        cursor.records_scanned += (skipped + live_count + tombstone_count) as u64;
+
+        cursor.messages_token = Some(plist::Data::new(next.clone()));
+        token = Some(next);
+
+        if status == 3 {
+            if scanning {
+                log::info!(
+                    "initial CloudKit scan complete: {} records read, {} stored",
+                    cursor.records_scanned,
+                    result.messages_processed
+                );
+                cursor.last_scan_total = cursor.records_scanned;
+            }
+            cursor.messages_complete = true;
+            result.done = true;
+            result.final_token = cursor.messages_token_bytes();
+            on_page(cursor);
+            break;
+        }
+        on_page(cursor);
+        if scanning && result.pages_processed.is_multiple_of(10) {
+            log::info!(
+                "initial CloudKit scan: {} records read so far",
+                cursor.records_scanned
+            );
+        }
+    }
+    result.scan_complete = cursor.messages_complete;
+    result
+}
+
+#[cfg(test)]
+#[allow(clippy::result_large_err)] // PushError is a 176-byte upstream type; mirrored, not ours to shrink.
+mod cursor_sync_tests {
+    //! Pin: the token-based walk stores only the recent window during the
+    //! initial scan but still reads to the end (so the token means "now"),
+    //! applies everything on later incremental runs, persists the cursor
+    //! after every page, and survives an expired token by restarting once.
+
+    use super::*;
+    use std::collections::{HashMap, VecDeque};
+    use rustpush::cloud_messages::{
+        CloudChat, CloudMessage, CloudParticipant, GZipWrapper, MessageFlags,
+        cloudmessagesp::MessageProto,
+    };
+
+    type MsgPage = (Vec<u8>, HashMap<String, Option<CloudMessage>>, i32);
+    type ChatPage = (Vec<u8>, HashMap<String, Option<CloudChat>>, i32);
+
+    struct CursorMock {
+        messages: tokio::sync::Mutex<VecDeque<Result<MsgPage, PushError>>>,
+        chats: tokio::sync::Mutex<VecDeque<Result<ChatPage, PushError>>>,
+        /// Tokens the mock was asked to continue from, in order.
+        message_tokens_seen: tokio::sync::Mutex<Vec<Option<Vec<u8>>>>,
+    }
+
+    impl CursorMock {
+        fn new(messages: Vec<Result<MsgPage, PushError>>, chats: Vec<Result<ChatPage, PushError>>) -> Self {
+            Self {
+                messages: tokio::sync::Mutex::new(messages.into()),
+                chats: tokio::sync::Mutex::new(chats.into()),
+                message_tokens_seen: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CloudKitSync for CursorMock {
+        async fn fetch_sync_page(&self, _t: Option<Vec<u8>>) -> Result<MsgPage, PushError> {
+            Err(PushError::ResourcePanic("newest-first not modelled".into()))
+        }
+        async fn fetch_message_changes(&self, token: Option<Vec<u8>>) -> Result<MsgPage, PushError> {
+            self.message_tokens_seen.lock().await.push(token);
+            self.messages
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or_else(|| Err(PushError::ResourcePanic("no more message pages".into())))
+        }
+        async fn fetch_chat_changes(&self, _token: Option<Vec<u8>>) -> Result<ChatPage, PushError> {
+            self.chats
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or_else(|| Err(PushError::ResourcePanic("no more chat pages".into())))
+        }
+    }
+
+    fn token_expired() -> PushError {
+        use rustpush::cloudkit_proto::response_operation::{result, Result as CkResult};
+        PushError::CloudKitError(CkResult {
+            error: Some(result::Error {
+                error_description: Some(".changeTokenExpired".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    fn cm(guid: &str, time_ns: i64) -> CloudMessage {
+        CloudMessage {
+            utm: None,
+            r#type: 0,
+            error: 0,
+            chat_id: "iMessage;-;+12345".into(),
+            sender: "+12345".into(),
+            time: time_ns,
+            msg_proto_2: None,
+            destination_caller_id: "me@icloud.com".into(),
+            msg_proto: GZipWrapper(MessageProto {
+                text: Some(format!("text of {guid}")),
+                ..Default::default()
+            }),
+            flags: MessageFlags::IS_FINISHED,
+            guid: guid.into(),
+            msg_proto_3: None,
+            service: "iMessage".into(),
+            msg_proto_4: None,
+        }
+    }
+
+    /// Apple-epoch nanoseconds for "now minus `hours`".
+    fn hours_ago_ns(hours: i64) -> i64 {
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        (now_unix_ms - hours * 3_600_000 - 978_307_200_000) * 1_000_000
+    }
+
+    fn page(entries: Vec<(&str, Option<CloudMessage>)>, token: &[u8], status: i32) -> Result<MsgPage, PushError> {
+        Ok((
+            token.to_vec(),
+            entries.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            status,
+        ))
+    }
+
+    async fn stored_guids(store: &Store) -> Vec<String> {
+        let mut guids = Vec::new();
+        for chat in store.chats().await.unwrap() {
+            for m in store.messages_from(chat.id, None).await.unwrap() {
+                guids.push(m.guid);
+            }
+        }
+        guids.sort();
+        guids
+    }
+
+    #[test]
+    fn cursor_persists_and_reloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cursor = SyncCursor {
+            messages_token: Some(plist::Data::new(vec![1, 2, 3])),
+            messages_complete: false,
+            chats_token: None,
+            chats_complete: true,
+            records_scanned: 42,
+            last_scan_total: 7,
+            account_dsid: None,
+        };
+        write_cursor(tmp.path(), &cursor).unwrap();
+        let back = read_cursor(tmp.path());
+        assert_eq!(back.messages_token_bytes(), Some(vec![1, 2, 3]));
+        assert!(!back.messages_complete);
+        assert!(back.chats_complete);
+        assert_eq!(back.records_scanned, 42);
+        assert_eq!(back.last_scan_total, 7);
+        assert!(scan_pending(tmp.path()), "a token without completion is a pending scan");
+
+        // No file at all is not a pending scan.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!scan_pending(empty.path()));
+        assert!(read_cursor(empty.path()).messages_token.is_none());
+    }
+
+    #[test]
+    fn cursor_is_reset_when_a_different_account_signs_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cursor = SyncCursor {
+            messages_token: Some(plist::Data::new(vec![9])),
+            messages_complete: true,
+            account_dsid: Some("111".into()),
+            ..Default::default()
+        };
+        let mut cache = CloudChatCache::new();
+        cache.insert("rec".into(), CloudChat::default());
+
+        // Same account: untouched.
+        assert!(!ensure_cursor_account(tmp.path(), &mut cursor, &mut cache, "111"));
+        assert!(cursor.messages_complete);
+        assert_eq!(cache.len(), 1);
+
+        // Different account: everything starts over, and the reset is on disk.
+        assert!(ensure_cursor_account(tmp.path(), &mut cursor, &mut cache, "222"));
+        assert!(cursor.messages_token.is_none());
+        assert!(!cursor.messages_complete);
+        assert_eq!(cursor.account_dsid.as_deref(), Some("222"));
+        assert!(cache.is_empty());
+        assert_eq!(read_cursor(tmp.path()).account_dsid.as_deref(), Some("222"));
+        assert!(read_cloud_chats(tmp.path()).is_empty());
+
+        // A cursor from before this field existed is adopted, not discarded.
+        let mut legacy = SyncCursor {
+            messages_token: Some(plist::Data::new(vec![1])),
+            messages_complete: true,
+            ..Default::default()
+        };
+        let mut cache = CloudChatCache::new();
+        assert!(!ensure_cursor_account(tmp.path(), &mut legacy, &mut cache, "111"));
+        assert!(legacy.messages_complete, "an untagged cursor is claimed by the current account");
+        assert_eq!(legacy.account_dsid.as_deref(), Some("111"));
+    }
+
+    #[test]
+    fn chat_cache_persists_and_expands_to_lookup_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = CloudChatCache::new();
+        cache.insert(
+            "rec-1".into(),
+            CloudChat {
+                guid: "iMessage;-;+12345".into(),
+                chat_identifier: "+12345".into(),
+                service_name: "iMessage".into(),
+                style: 45,
+                participants: vec![CloudParticipant { uri: "+12345".into() }],
+                last_addressed_handle: "me@icloud.com".into(),
+                display_name: None,
+                ..Default::default()
+            },
+        );
+        write_cloud_chats(tmp.path(), &cache).unwrap();
+        let back = read_cloud_chats(tmp.path());
+        assert_eq!(back.len(), 1);
+        assert_eq!(back["rec-1"].participants[0].uri, "+12345");
+        let lookup = chat_lookup_map(&back);
+        for key in ["rec-1", "iMessage;-;+12345"] {
+            assert!(lookup.contains_key(key), "missing {key}; have {:?}", lookup.keys());
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_scan_reads_everything_but_stores_only_the_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("db.sqlite")).await.unwrap();
+        let mock = CursorMock::new(
+            vec![
+                page(vec![("r-old", Some(cm("old", hours_ago_ns(24 * 30))))], b"t1", 0),
+                page(
+                    vec![
+                        ("r-recent", Some(cm("recent", hours_ago_ns(1)))),
+                        ("r-gone", None),
+                    ],
+                    b"t2",
+                    3,
+                ),
+            ],
+            vec![],
+        );
+        let mut cursor = SyncCursor::default();
+        let mut persisted: Vec<(Option<Vec<u8>>, bool)> = Vec::new();
+        let window = hours_ago_ns(48) / 1_000_000 + 978_307_200_000;
+
+        let result = sync_messages_with_cursor(
+            &mock,
+            &store,
+            &[],
+            &HashMap::new(),
+            &mut cursor,
+            window,
+            |c| persisted.push((c.messages_token_bytes(), c.messages_complete)),
+        )
+        .await;
+
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(result.messages_processed, 1, "only the recent message is stored");
+        assert_eq!(result.scanned, 1, "the old message is read but skipped");
+        assert_eq!(result.deleted, 1, "tombstones apply even during the scan");
+        assert!(result.scan_complete);
+        assert_eq!(stored_guids(&store).await, vec!["recent".to_string()]);
+        assert_eq!(cursor.messages_token_bytes(), Some(b"t2".to_vec()));
+        assert!(cursor.messages_complete);
+        assert_eq!(cursor.records_scanned, 3);
+        assert_eq!(
+            cursor.last_scan_total, 3,
+            "a completed scan records its true size for the next rescan's progress bar"
+        );
+        assert_eq!(
+            persisted,
+            vec![(Some(b"t1".to_vec()), false), (Some(b"t2".to_vec()), true)],
+            "the cursor is handed out after every page, complete only at the end"
+        );
+        assert_eq!(
+            *mock.message_tokens_seen.lock().await,
+            vec![None, Some(b"t1".to_vec())],
+            "each page continues from the previous token"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_run_applies_old_changes_and_resumes_from_saved_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("db.sqlite")).await.unwrap();
+        // A message created a month ago but only synced now (e.g. sent from
+        // another device while this app was closed) must be stored.
+        let mock = CursorMock::new(
+            vec![page(vec![("r-late", Some(cm("late", hours_ago_ns(24 * 30))))], b"t9", 3)],
+            vec![],
+        );
+        let mut cursor = SyncCursor {
+            messages_token: Some(plist::Data::new(b"t8".to_vec())),
+            messages_complete: true,
+            ..Default::default()
+        };
+        let window = hours_ago_ns(48) / 1_000_000 + 978_307_200_000;
+
+        let result =
+            sync_messages_with_cursor(&mock, &store, &[], &HashMap::new(), &mut cursor, window, |_| {})
+                .await;
+
+        assert_eq!(result.messages_processed, 1);
+        assert_eq!(result.scanned, 0, "no date filter once the scan is complete");
+        assert_eq!(stored_guids(&store).await, vec!["late".to_string()]);
+        assert_eq!(cursor.messages_token_bytes(), Some(b"t9".to_vec()));
+        assert_eq!(*mock.message_tokens_seen.lock().await, vec![Some(b"t8".to_vec())]);
+    }
+
+    #[tokio::test]
+    async fn expired_token_restarts_the_scan_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("db.sqlite")).await.unwrap();
+        let mock = CursorMock::new(
+            vec![
+                Err(token_expired()),
+                page(vec![("r-a", Some(cm("a", hours_ago_ns(1))))], b"fresh", 3),
+            ],
+            vec![],
+        );
+        let mut cursor = SyncCursor {
+            messages_token: Some(plist::Data::new(b"stale".to_vec())),
+            messages_complete: true,
+            records_scanned: 500,
+            ..Default::default()
+        };
+        let mut persisted = Vec::new();
+        let result = sync_messages_with_cursor(
+            &mock,
+            &store,
+            &[],
+            &HashMap::new(),
+            &mut cursor,
+            i64::MIN,
+            |c| persisted.push(c.messages_token_bytes()),
+        )
+        .await;
+
+        assert!(result.error.is_none());
+        assert_eq!(result.messages_processed, 1);
+        assert!(cursor.messages_complete);
+        assert_eq!(cursor.messages_token_bytes(), Some(b"fresh".to_vec()));
+        assert_eq!(
+            *mock.message_tokens_seen.lock().await,
+            vec![Some(b"stale".to_vec()), None],
+            "after the expiry the walk restarts from no token"
+        );
+        assert_eq!(
+            persisted[0], None,
+            "the reset cursor is persisted before the rescan so a crash cannot resurrect the stale token"
+        );
+
+        // A second expiry in the same run is not retried forever.
+        let mock = CursorMock::new(vec![Err(token_expired()), Err(token_expired())], vec![]);
+        let mut cursor = SyncCursor::default();
+        let result =
+            sync_messages_with_cursor(&mock, &store, &[], &HashMap::new(), &mut cursor, i64::MIN, |_| {})
+                .await;
+        assert!(result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn chat_walk_merges_records_and_removes_tombstones() {
+        let chat = |guid: &str| CloudChat {
+            guid: guid.into(),
+            ..Default::default()
+        };
+        let mut p1 = HashMap::new();
+        p1.insert("rec-1".to_string(), Some(chat("iMessage;-;+1")));
+        p1.insert("rec-2".to_string(), Some(chat("iMessage;-;+2")));
+        let mut p2 = HashMap::new();
+        p2.insert("rec-1".to_string(), None);
+        let mock = CursorMock::new(vec![], vec![Ok((b"c1".to_vec(), p1, 0)), Ok((b"c2".to_vec(), p2, 3))]);
+
+        let mut cache = CloudChatCache::new();
+        let mut cursor = SyncCursor::default();
+        let applied = sync_chats_with_cursor(&mock, &mut cache, &mut cursor).await.unwrap();
+
+        assert_eq!(applied, 3);
+        assert_eq!(cache.len(), 1, "rec-1 was tombstoned on the second page");
+        assert!(cache.contains_key("rec-2"));
+        assert!(cursor.chats_complete);
+        assert_eq!(cursor.chats_token_bytes(), Some(b"c2".to_vec()));
+    }
+
+    #[test]
+    fn token_expired_detection() {
+        assert!(is_change_token_expired(&token_expired()));
+        assert!(!is_change_token_expired(&PushError::ResourcePanic("x".into())));
     }
 }

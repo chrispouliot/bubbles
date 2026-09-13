@@ -352,6 +352,17 @@ fn insert_message(c: &Connection, m: &IncomingMessage) -> rusqlite::Result<()> {
     }
     if !newly_inserted {
         relocate_from_placeholder(c, &m.guid, chat_id)?;
+        // A modified record from an incremental CloudKit sync (an edit or an
+        // unsend made on another device) carries the message's current text.
+        // A push-path fan-out duplicate carries identical text, so this is a
+        // no-op for it.
+        if m.text.is_some() {
+            c.execute(
+                "UPDATE message SET text = ?1, subject = COALESCE(?2, subject)
+                 WHERE guid = ?3 AND text IS NOT ?1",
+                params![m.text, m.subject, m.guid],
+            )?;
+        }
     }
     // Sending from any of our devices marks the conversation read up to that
     // point on all of them. Mirror that locally so a reply sent on the phone
@@ -1570,6 +1581,47 @@ mod tests {
             .map(|m| m.guid)
             .collect();
         assert!(still.contains(&"G-BARE".to_string()), "never move out of a properly keyed chat");
+    }
+
+    /// Pin: a re-delivered guid whose text changed (an edit or unsend synced
+    /// from CloudKit) updates the stored text; identical text (push-path
+    /// fan-out) leaves the row alone, and a missing text never blanks it.
+    #[test]
+    fn duplicate_guid_with_new_text_updates_message() {
+        let mut c = db();
+        apply_blocking(&mut c, Ingest::Message(msg("G-EDIT", 1000))).unwrap();
+
+        // Same text again: no change.
+        apply_blocking(&mut c, Ingest::Message(msg("G-EDIT", 1000))).unwrap();
+        let chats = query_chats(&c).unwrap();
+        let text = |c: &Connection| -> String {
+            c.query_row("SELECT text FROM message WHERE guid = 'G-EDIT'", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(text(&c), "Hello me");
+
+        // Edited on another device.
+        apply_blocking(
+            &mut c,
+            Ingest::Message(IncomingMessage {
+                text: Some("Hello me (edited)".into()),
+                ..msg("G-EDIT", 1000)
+            }),
+        )
+        .unwrap();
+        assert_eq!(text(&c), "Hello me (edited)");
+
+        // A record without text must not wipe what we have.
+        apply_blocking(
+            &mut c,
+            Ingest::Message(IncomingMessage {
+                text: None,
+                ..msg("G-EDIT", 1000)
+            }),
+        )
+        .unwrap();
+        assert_eq!(text(&c), "Hello me (edited)");
+        assert_eq!(query_messages(&c, chats[0].id).unwrap().len(), 1, "still one row");
     }
 
     /// Pin: a CloudKit deletion tombstone removes the message it names (via

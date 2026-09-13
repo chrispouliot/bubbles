@@ -196,6 +196,21 @@ pub enum RegistrationStatus {
 /// "re-enter password" dialog instead of a sign-out.
 pub const APPLE_LOGIN_FAILED_PREFIX: &str = "Apple ID login failed";
 
+/// Live snapshot of the cloud sync, for the sidebar progress display.
+/// Cheap to read; the UI polls it while the window is open.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncProgress {
+    /// A sync (manual or automatic) is running right now.
+    pub active: bool,
+    /// The running sync is the one-time full history scan rather than an
+    /// incremental fetch.
+    pub scanning: bool,
+    /// Records read so far in the scan.
+    pub records_scanned: u64,
+    /// Total records CloudKit reported for the message zone, when known.
+    pub total_estimate: Option<u64>,
+}
+
 /// What the receive loop pulses to the UI. Stored events collapse to `Applied`
 /// (the UI re-queries); typing is ephemeral and carried inline.
 #[derive(Clone, Debug)]
@@ -462,6 +477,12 @@ pub trait Backend: Send + Sync {
     /// [`APPLE_LOGIN_FAILED_PREFIX`] need the user's password.
     async fn heal_registration(&self, _client: &ImClient) -> std::result::Result<(), String> {
         Err("registration recovery is not supported by this backend".to_string())
+    }
+
+    /// Snapshot of the cloud sync currently running, if any. Synchronous and
+    /// cheap so the UI can poll it from the main thread.
+    fn sync_progress(&self) -> SyncProgress {
+        SyncProgress::default()
     }
 
     // --- 8. sync ---

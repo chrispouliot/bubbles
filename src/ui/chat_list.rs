@@ -753,7 +753,7 @@ impl super::Ui {
         let initial_config = crate::sync::read_config(&config_path);
         let cloud_sync_switch = adw::SwitchRow::builder()
             .title("Enable cloud sync")
-            .subtitle("Fetches missed messages from iCloud via Apple's servers. Disable to skip the sync entirely.")
+            .subtitle("Fetches missed messages from iCloud via Apple's servers. The first sync scans your full iCloud message history once (text only, resumable) so later syncs fetch only what changed. Disable to skip the sync entirely.")
             .active(initial_config.cloud_sync_enabled)
             .build();
         {

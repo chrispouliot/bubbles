@@ -467,10 +467,62 @@ pub fn enter_messaging(
     let plus_button = gtk::Button::from_icon_name("list-add-symbolic");
     plus_button.add_css_class("flat");
     plus_button.set_tooltip_text(Some("New Chat"));
+    // iCloud sync status at the bottom of the sidebar, like Messages on a
+    // Mac: a one-line label over a progress bar, hidden unless a sync is
+    // running. It polls `Backend::sync_progress` twice a second (a cheap
+    // snapshot read), so every sync trigger, manual or automatic, shows here
+    // without any extra wiring.
+    let sync_status_label = gtk::Label::builder()
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
+    sync_status_label.add_css_class("dim-label");
+    sync_status_label.add_css_class("caption");
+    let sync_status_bar = gtk::ProgressBar::builder().hexpand(true).build();
+    let sync_status = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(6)
+        .margin_bottom(6)
+        .visible(false)
+        .build();
+    sync_status.append(&sync_status_label);
+    sync_status.append(&sync_status_bar);
+    {
+        let backend = backend.clone();
+        let status = sync_status.clone();
+        let label = sync_status_label.clone();
+        let bar = sync_status_bar.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+            let p = backend.sync_progress();
+            if !p.active {
+                if status.is_visible() {
+                    status.set_visible(false);
+                }
+                return glib::ControlFlow::Continue;
+            }
+            // One short line that fits the sidebar at any width; the bar
+            // carries the progress.
+            label.set_text("Syncing with iCloud…");
+            match p.total_estimate {
+                Some(total) if p.scanning && total >= p.records_scanned => {
+                    bar.set_fraction(p.records_scanned as f64 / total as f64);
+                }
+                _ => bar.pulse(),
+            }
+            if !status.is_visible() {
+                status.set_visible(true);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
     let sidebar = page(
         "Messages",
         &scrolled(&chat_list),
-        None,
+        Some(sync_status.upcast_ref()),
         Some(plus_button.upcast_ref()),
         Some(menu_button.upcast_ref()),
     );
@@ -1063,7 +1115,9 @@ pub fn enter_messaging(
             let threshold_ms = 2 * 60 * 60 * 1000;
 
             let last_alive = crate::sync::read_last_alive(&state_dir);
-            if crate::sync::should_sync(last_alive, now_unix_ms, threshold_ms) {
+            if crate::sync::should_sync(last_alive, now_unix_ms, threshold_ms)
+                || crate::sync::scan_pending(&state_dir)
+            {
                 let cutoff_ms = last_alive
                     .unwrap_or(now_unix_ms - 48 * 60 * 60 * 1000)
                     .max(now_unix_ms - 48 * 60 * 60 * 1000);
@@ -1095,7 +1149,9 @@ pub fn enter_messaging(
                 let threshold_ms = 2 * 60 * 60 * 1000;
 
                 let last_alive = crate::sync::read_last_alive(&state_dir);
-                if crate::sync::should_sync(last_alive, now_unix_ms, threshold_ms) {
+                if crate::sync::should_sync(last_alive, now_unix_ms, threshold_ms)
+                || crate::sync::scan_pending(&state_dir)
+            {
                     let cutoff_ms = last_alive
                         .unwrap_or(now_unix_ms - 48 * 60 * 60 * 1000)
                         .max(now_unix_ms - 48 * 60 * 60 * 1000);
