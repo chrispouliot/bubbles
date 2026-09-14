@@ -1861,13 +1861,45 @@ impl Backend for RustpushBackend {
         // cutoff (a recent last-alive stamp) is closer than that.
         let now_ms = now_ms();
         let apply_since_ms = cutoff_ms.min(now_ms - 48 * 60 * 60 * 1000);
+
+        // "Only sync existing conversations": snapshot the sidebar's chat
+        // keys once per run and let the page processor drop anything else.
+        let bubbles_config =
+            crate::sync::read_config(&dir.join(crate::sync::CONFIG_FILENAME));
+        let existing_chats: Option<std::collections::HashSet<String>> =
+            if bubbles_config.sync_existing_chats_only {
+                match store.chats().await {
+                    Ok(chats) => {
+                        let keys: std::collections::HashSet<String> =
+                            chats.into_iter().map(|c| c.key).collect();
+                        log::info!(
+                            "sync limited to {} existing conversations",
+                            keys.len()
+                        );
+                        Some(keys)
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "cannot list conversations for existing-only sync ({e:#}); syncing all"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
         let cursor_dir = dir.clone();
         let progress = Arc::clone(&self.sync_progress);
+        let scope = crate::sync::SyncScope {
+            my_handles: &my_handles,
+            chat_map: &chat_map,
+            existing_chats: existing_chats.as_ref(),
+        };
         crate::sync::sync_messages_with_cursor(
             &fetcher,
             store,
-            &my_handles,
-            &chat_map,
+            &scope,
             &mut cursor,
             apply_since_ms,
             |c| {

@@ -761,9 +761,9 @@ impl super::Ui {
             let backend = self.backend.clone();
             let store = self.store.clone();
             cloud_sync_switch.connect_active_notify(move |switch| {
-                let new_config = crate::sync::BubblesConfig {
-                    cloud_sync_enabled: switch.is_active(),
-                };
+                // Read-modify-write so the other sync preferences survive.
+                let mut new_config = crate::sync::read_config(&config_path);
+                new_config.cloud_sync_enabled = switch.is_active();
                 if let Err(e) = crate::sync::write_config(&config_path, &new_config) {
                     log::warn!("failed to write config: {e}");
                 } else {
@@ -835,6 +835,32 @@ impl super::Ui {
             });
         }
         sync_group.add(&cloud_sync_switch);
+
+        // Off by default: cloud sync fills in every conversation iCloud has.
+        // On, it only touches conversations already in the sidebar, so one
+        // deleted here, or a number that only ever reached the phone, stays
+        // out until a message arrives live through push.
+        let existing_only_switch = adw::SwitchRow::builder()
+            .title("Only sync existing conversations")
+            .subtitle("Cloud sync only fills in conversations already in your sidebar. Conversations you deleted here and unknown numbers stay out until a message arrives live.")
+            .active(initial_config.sync_existing_chats_only)
+            .build();
+        {
+            let config_path = config_path.clone();
+            existing_only_switch.connect_active_notify(move |switch| {
+                let mut new_config = crate::sync::read_config(&config_path);
+                new_config.sync_existing_chats_only = switch.is_active();
+                if let Err(e) = crate::sync::write_config(&config_path, &new_config) {
+                    log::warn!("failed to write config: {e}");
+                } else {
+                    log::info!(
+                        "sync_existing_chats_only toggled to {}",
+                        switch.is_active()
+                    );
+                }
+            });
+        }
+        sync_group.add(&existing_only_switch);
 
         // Manual "Sync Now" button — forces a sync regardless of the
         // cloud_sync_enabled toggle (which only gates the automatic launch-gate

@@ -229,6 +229,9 @@ pub struct ProcessPageResult {
     /// `cutoff_ms` (i.e., older than the cutoff). The sync loop uses this
     /// to stop paginating on first-launch (48-hour cap).
     pub any_older_than_cutoff: bool,
+    /// Records skipped because their conversation is not in the sidebar
+    /// (the "only sync existing conversations" preference).
+    pub filtered: usize,
 }
 
 /// Process one page of CloudKit sync results: translate each `CloudMessage`
@@ -238,17 +241,34 @@ pub struct ProcessPageResult {
 /// `cutoff_ms` is the unix-ms timestamp below which a message is considered
 /// "older than the cutoff" (used to stop paginating on first launch). Set
 /// to `i64::MIN` to disable the cap check (e.g., for subsequent syncs).
+///
+/// `existing_chats`, when given, is the set of chat keys currently in the
+/// sidebar; messages and reactions for any other conversation are skipped
+/// and counted in `filtered`. That is how a conversation deleted here, or a
+/// number that only ever reached the phone, stays out of the sidebar.
 pub async fn process_sync_page(
     page: std::collections::HashMap<String, rustpush::cloud_messages::CloudMessage>,
     my_handles: &[String],
     chat_map: &std::collections::HashMap<String, rustpush::cloud_messages::CloudChat>,
     store: &crate::store::Store,
     cutoff_ms: i64,
+    existing_chats: Option<&std::collections::HashSet<String>>,
 ) -> ProcessPageResult {
     let mut result = ProcessPageResult::default();
 
     for (record_id, cm) in page {
         let ingest = cloud_message_to_ingest(cm, my_handles, chat_map);
+        if let Some(existing) = existing_chats {
+            let chat_key = match &ingest {
+                Ingest::Message(m) => Some(m.chat.key()),
+                Ingest::Tapback(t) => Some(t.chat.key()),
+                _ => None,
+            };
+            if chat_key.is_some_and(|key| !existing.contains(&key)) {
+                result.filtered += 1;
+                continue;
+            }
+        }
         // Remember which record name carried this guid: a deletion tombstone
         // later names only the record.
         let stored_guid = match &ingest {
@@ -418,6 +438,8 @@ pub struct SyncResult {
     pub deleted: usize,
     /// Records read during the initial scan but outside the stored window.
     pub scanned: usize,
+    /// Records skipped by the "only sync existing conversations" preference.
+    pub filtered: usize,
     /// True when the message zone has been walked to its end, i.e. the saved
     /// token now means "now" and later runs are incremental.
     pub scan_complete: bool,
@@ -492,6 +514,7 @@ pub async fn sync_once(
             chat_map,
             store,
             cutoff_ms,
+            None,
         )
         .await;
         result.messages_processed += page_result.count;
@@ -586,6 +609,10 @@ pub const DEFAULT_BACKOFF_SECS: u64 = 24 * 60 * 60;
 /// is missing/invalid.
 pub struct BubblesConfig {
     pub cloud_sync_enabled: bool,
+    /// When true, cloud sync only stores messages for conversations already
+    /// in the sidebar. A conversation deleted here, or a number that only
+    /// ever reached the phone, stays out until a message arrives live.
+    pub sync_existing_chats_only: bool,
 }
 
 impl BubblesConfig {
@@ -598,6 +625,9 @@ impl BubblesConfig {
             // sync attempt. Users opt in via the settings switch once the
             // setup flow lands.
             cloud_sync_enabled: false,
+            // Off by default: sync mirrors iCloud unless the user asks
+            // otherwise.
+            sync_existing_chats_only: false,
         }
     }
 }
@@ -618,10 +648,13 @@ pub fn read_config(path: &Path) -> BubblesConfig {
         if let Some((key, value)) = line.split_once('=') {
             let key = key.trim();
             let value = value.trim();
-            if key == "cloud_sync_enabled" {
-                config.cloud_sync_enabled = value == "true" || value == "1";
+            let enabled = value == "true" || value == "1";
+            match key {
+                "cloud_sync_enabled" => config.cloud_sync_enabled = enabled,
+                "sync_existing_chats_only" => config.sync_existing_chats_only = enabled,
+                // Other keys are ignored (forward-compat).
+                _ => {}
             }
-            // Other keys are ignored (forward-compat).
         }
         // Lines without '=' are skipped (malformed).
     }
@@ -630,7 +663,10 @@ pub fn read_config(path: &Path) -> BubblesConfig {
 
 /// Write the config to `path`. Overwrites existing file.
 pub fn write_config(path: &Path, config: &BubblesConfig) -> io::Result<()> {
-    let contents = format!("cloud_sync_enabled={}\n", config.cloud_sync_enabled);
+    let contents = format!(
+        "cloud_sync_enabled={}\nsync_existing_chats_only={}\n",
+        config.cloud_sync_enabled, config.sync_existing_chats_only
+    );
     fs::write(path, contents)
 }
 
@@ -1413,6 +1449,7 @@ mod tests {
             &HashMap::new(),
             &store,
             cutoff_ms,
+            None,
         )
         .await;
 
@@ -1421,6 +1458,7 @@ mod tests {
             ProcessPageResult {
                 count: 2,
                 any_older_than_cutoff: false,
+                filtered: 0,
             }
         );
     }
@@ -1462,6 +1500,7 @@ mod tests {
             &HashMap::new(),
             &store,
             cutoff_ms,
+            None,
         )
         .await;
 
@@ -1470,6 +1509,7 @@ mod tests {
             ProcessPageResult {
                 count: 3,
                 any_older_than_cutoff: true,
+                filtered: 0,
             }
         );
     }
@@ -1488,6 +1528,7 @@ mod tests {
             &HashMap::new(),
             &store,
             cutoff_ms,
+            None,
         )
         .await;
 
@@ -1496,6 +1537,7 @@ mod tests {
             ProcessPageResult {
                 count: 0,
                 any_older_than_cutoff: false,
+                filtered: 0,
             }
         );
     }
@@ -1796,6 +1838,28 @@ mod tests {
         write_config(&path, &config).unwrap();
         let loaded = read_config(&path);
         assert!(!loaded.cloud_sync_enabled, "default is now opt-in: cloud_sync_enabled is false until the user enables it");
+        assert!(!loaded.sync_existing_chats_only, "existing-only sync is off by default");
+    }
+
+    /// Pin: both preferences round-trip independently, and a config file
+    /// written before the second key existed reads it as off.
+    #[test]
+    fn config_existing_only_round_trip_and_legacy_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CONFIG_FILENAME);
+        let config = BubblesConfig {
+            cloud_sync_enabled: true,
+            sync_existing_chats_only: true,
+        };
+        write_config(&path, &config).unwrap();
+        let loaded = read_config(&path);
+        assert!(loaded.cloud_sync_enabled);
+        assert!(loaded.sync_existing_chats_only);
+
+        std::fs::write(&path, "cloud_sync_enabled=true\n").unwrap();
+        let legacy = read_config(&path);
+        assert!(legacy.cloud_sync_enabled);
+        assert!(!legacy.sync_existing_chats_only);
     }
 
     #[test]
@@ -2388,6 +2452,15 @@ pub async fn sync_chats_with_cursor(
     Ok(applied)
 }
 
+/// What a message walk resolves records against: our handles (from-me
+/// detection), the chat-zone lookup map, and, when the "only sync existing
+/// conversations" preference is on, the sidebar's chat keys.
+pub struct SyncScope<'a> {
+    pub my_handles: &'a [String],
+    pub chat_map: &'a HashMap<String, CloudChat>,
+    pub existing_chats: Option<&'a std::collections::HashSet<String>>,
+}
+
 /// Walk the message zone from the saved cursor.
 ///
 /// * While `cursor.messages_complete` is false this is the initial scan:
@@ -2403,8 +2476,7 @@ pub async fn sync_chats_with_cursor(
 pub async fn sync_messages_with_cursor(
     syncer: &dyn CloudKitSync,
     store: &Store,
-    my_handles: &[String],
-    chat_map: &HashMap<String, CloudChat>,
+    scope: &SyncScope<'_>,
     cursor: &mut SyncCursor,
     apply_since_ms: i64,
     mut on_page: impl FnMut(&SyncCursor),
@@ -2460,8 +2532,17 @@ pub async fn sync_messages_with_cursor(
         // Every record read counts as scanned, including placeholder
         // records that decode to nothing and are ignored by the store.
         let live_count = live.len();
-        let page_result = process_sync_page(live, my_handles, chat_map, store, i64::MIN).await;
+        let page_result = process_sync_page(
+            live,
+            scope.my_handles,
+            scope.chat_map,
+            store,
+            i64::MIN,
+            scope.existing_chats,
+        )
+        .await;
         result.messages_processed += page_result.count;
+        result.filtered += page_result.filtered;
         result.scanned += skipped;
         cursor.records_scanned += (skipped + live_count + tombstone_count) as u64;
 
@@ -2730,8 +2811,7 @@ mod cursor_sync_tests {
         let result = sync_messages_with_cursor(
             &mock,
             &store,
-            &[],
-            &HashMap::new(),
+            &SyncScope { my_handles: &[], chat_map: &HashMap::new(), existing_chats: None },
             &mut cursor,
             window,
             |c| persisted.push((c.messages_token_bytes(), c.messages_complete)),
@@ -2781,8 +2861,15 @@ mod cursor_sync_tests {
         let window = hours_ago_ns(48) / 1_000_000 + 978_307_200_000;
 
         let result =
-            sync_messages_with_cursor(&mock, &store, &[], &HashMap::new(), &mut cursor, window, |_| {})
-                .await;
+            sync_messages_with_cursor(
+                &mock,
+                &store,
+                &SyncScope { my_handles: &[], chat_map: &HashMap::new(), existing_chats: None },
+                &mut cursor,
+                window,
+                |_| {},
+            )
+            .await;
 
         assert_eq!(result.messages_processed, 1);
         assert_eq!(result.scanned, 0, "no date filter once the scan is complete");
@@ -2812,8 +2899,7 @@ mod cursor_sync_tests {
         let result = sync_messages_with_cursor(
             &mock,
             &store,
-            &[],
-            &HashMap::new(),
+            &SyncScope { my_handles: &[], chat_map: &HashMap::new(), existing_chats: None },
             &mut cursor,
             i64::MIN,
             |c| persisted.push(c.messages_token_bytes()),
@@ -2838,9 +2924,84 @@ mod cursor_sync_tests {
         let mock = CursorMock::new(vec![Err(token_expired()), Err(token_expired())], vec![]);
         let mut cursor = SyncCursor::default();
         let result =
-            sync_messages_with_cursor(&mock, &store, &[], &HashMap::new(), &mut cursor, i64::MIN, |_| {})
-                .await;
+            sync_messages_with_cursor(
+                &mock,
+                &store,
+                &SyncScope { my_handles: &[], chat_map: &HashMap::new(), existing_chats: None },
+                &mut cursor,
+                i64::MIN,
+                |_| {},
+            )
+            .await;
         assert!(result.error.is_some());
+    }
+
+    /// Pin: with "only sync existing conversations" on, a synced message for
+    /// a conversation already in the sidebar is stored and one for any other
+    /// conversation is skipped and counted, never creating a new chat.
+    #[tokio::test]
+    async fn existing_only_filter_skips_conversations_not_in_the_sidebar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("db.sqlite")).await.unwrap();
+
+        // The sidebar already has the +12345 conversation (from push).
+        store
+            .apply(Ingest::Message(IncomingMessage {
+                guid: "seed".into(),
+                chat: ChatRef {
+                    participants: vec!["tel:+12345".into(), "mailto:me@icloud.com".into()],
+                    display_name: None,
+                    service: Some("iMessage".into()),
+                },
+                sender: Some("tel:+12345".into()),
+                text: Some("hi".into()),
+                date: 1,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let existing: std::collections::HashSet<String> =
+            store.chats().await.unwrap().into_iter().map(|c| c.key).collect();
+        assert_eq!(existing.len(), 1);
+
+        let mut spam = cm("spam", hours_ago_ns(1));
+        spam.chat_id = "iMessage;-;+99999".into();
+        spam.sender = "+99999".into();
+        let mock = CursorMock::new(
+            vec![page(
+                vec![
+                    ("r-known", Some(cm("known", hours_ago_ns(1)))),
+                    ("r-spam", Some(spam)),
+                ],
+                b"t1",
+                3,
+            )],
+            vec![],
+        );
+        let mut cursor = SyncCursor {
+            messages_complete: true,
+            ..Default::default()
+        };
+
+        let result = sync_messages_with_cursor(
+            &mock,
+            &store,
+            &SyncScope {
+                my_handles: &[],
+                chat_map: &HashMap::new(),
+                existing_chats: Some(&existing),
+            },
+            &mut cursor,
+            i64::MIN,
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(result.messages_processed, 1);
+        assert_eq!(result.filtered, 1, "the unknown conversation is skipped and counted");
+        assert_eq!(store.chats().await.unwrap().len(), 1, "no chat was created for it");
+        assert_eq!(stored_guids(&store).await, vec!["known".to_string(), "seed".to_string()]);
+        assert_eq!(cursor.records_scanned, 2, "skipped records still advance the scan");
     }
 
     #[tokio::test]
