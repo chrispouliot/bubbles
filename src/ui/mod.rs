@@ -1132,7 +1132,9 @@ pub fn enter_messaging(
     }
 
     // --- Wake-from-sleep sync gate ---
-    // Run a sync on resume if the sleep gap exceeded 2 hours.
+    // Run a sync on resume if the sleep gap exceeded 2 hours. The resume
+    // signal arrives before Wi-Fi has re-associated, so wait for DNS to work
+    // first, and give a sync that still failed on connectivity one more try.
     #[cfg(feature = "rustpush")]
     {
         let backend = backend.clone();
@@ -1149,19 +1151,37 @@ pub fn enter_messaging(
                 let threshold_ms = 2 * 60 * 60 * 1000;
 
                 let last_alive = crate::sync::read_last_alive(&state_dir);
-                if crate::sync::should_sync(last_alive, now_unix_ms, threshold_ms)
-                || crate::sync::scan_pending(&state_dir)
-            {
-                    let cutoff_ms = last_alive
-                        .unwrap_or(now_unix_ms - 48 * 60 * 60 * 1000)
-                        .max(now_unix_ms - 48 * 60 * 60 * 1000);
-                    let sync_result = backend
+                if !(crate::sync::should_sync(last_alive, now_unix_ms, threshold_ms)
+                    || crate::sync::scan_pending(&state_dir))
+                {
+                    log::info!("wake sync: skipped (gap < 2h)");
+                    return;
+                }
+                let cutoff_ms = last_alive
+                    .unwrap_or(now_unix_ms - 48 * 60 * 60 * 1000)
+                    .max(now_unix_ms - 48 * 60 * 60 * 1000);
+
+                if !crate::sync::wait_for_network(std::time::Duration::from_secs(60)).await {
+                    log::warn!("wake sync: network not back after 60s; trying anyway");
+                }
+                let mut sync_result = backend
+                    .sync_missed_messages(&store, cutoff_ms, false)
+                    .await;
+                if sync_result
+                    .error
+                    .as_deref()
+                    .is_some_and(crate::sync::is_connectivity_error)
+                {
+                    log::warn!(
+                        "wake sync: connectivity failure ({}); retrying in 15s",
+                        sync_result.error.as_deref().unwrap_or_default()
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    sync_result = backend
                         .sync_missed_messages(&store, cutoff_ms, false)
                         .await;
-                    log::info!("wake sync: {sync_result:?}");
-                } else {
-                    log::info!("wake sync: skipped (gap < 2h)");
                 }
+                log::info!("wake sync: {sync_result:?}");
             });
         });
     }

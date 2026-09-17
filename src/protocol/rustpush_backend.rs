@@ -1209,7 +1209,29 @@ impl Backend for RustpushBackend {
                                             }
                                         }
                                     }
-                                    // Acknowledge inbound content with a Delivered receipt.
+                                    // Certify delivery to Apple's server. A message sent
+                                    // with certified delivery stays in this device's
+                                    // queue until the device returns its receipt, and
+                                    // is flushed again on every reconnect until then.
+                                    // The APNs ack and the peer Delivered receipt below
+                                    // do not count; only this does. rustpush's own
+                                    // receive loop certifies every message that carries
+                                    // a context, including our own fan-out copies, so
+                                    // do the same. Without it, a chat deleted here is
+                                    // rebuilt from the replay at the next connect.
+                                    if let Some(context) = &inst.certified_context {
+                                        let topic = if inst.message.is_sms() {
+                                            "com.apple.private.alloy.sms"
+                                        } else {
+                                            "com.apple.madrid"
+                                        };
+                                        match imclient.identity.certify_delivery(topic, context, false).await {
+                                            Ok(()) => log::debug!("certified delivery of {}", inst.id),
+                                            Err(e) => log::warn!("certify delivery of {}: {e:?}", inst.id),
+                                        }
+                                    }
+                                    // Acknowledge inbound content with a Delivered receipt
+                                    // to the sender's devices.
                                     if SEND_DELIVERED_RECEIPTS && is_incoming_content(&inst, &handles) {
                                         send_receipt_for(&imclient, &inst, &handles, false).await;
                                     }

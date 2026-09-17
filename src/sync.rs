@@ -578,6 +578,49 @@ pub fn read_last_alive(state_dir: &Path) -> Option<i64> {
     contents.trim().parse::<i64>().ok()
 }
 
+/// Whether a sync error string describes a network that was not there, as
+/// opposed to Apple rejecting something. Used by the wake path to decide
+/// that a failure is worth one retry once the connection is back.
+///
+/// "Token missing" is included on purpose: on resume it is what a failed
+/// token refresh degrades to when the refresh could not reach the anisette
+/// server, and one extra attempt costs nothing if it turns out to be real.
+pub fn is_connectivity_error(error: &str) -> bool {
+    const MARKERS: [&str; 8] = [
+        "dns error",
+        "Name or service not known",
+        "ConnectError",
+        "Connection refused",
+        "Network is unreachable",
+        "timed out",
+        "ErrorGettingAnisette",
+        "Token missing",
+    ];
+    MARKERS.iter().any(|m| error.contains(m))
+}
+
+/// Host whose DNS resolution stands in for "the network is usable". Apple's
+/// auth endpoint is the first thing any sync contacts, so if this resolves
+/// the sync has a real chance.
+const NETWORK_PROBE_HOST: &str = "gsa.apple.com:443";
+
+/// Wait until DNS resolution works, polling every couple of seconds up to
+/// `max_wait`. Returns `true` when the network came up in time. Resume from
+/// sleep fires before Wi-Fi has re-associated, and a sync started in that
+/// gap fails on the first lookup.
+pub async fn wait_for_network(max_wait: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if tokio::net::lookup_host(NETWORK_PROBE_HOST).await.is_ok() {
+            return true;
+        }
+        if started.elapsed() >= max_wait {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
 /// Decide whether to run a CloudKit sync based on the gap since the last
 /// alive timestamp. Returns `true` if `last_alive_ms` is `None` (first
 /// launch) or `now_ms - last_alive_ms > threshold_ms`.
@@ -1829,6 +1872,19 @@ mod tests {
     // ---------------------------------------------------------------------------
     // BubblesConfig tests
     // ---------------------------------------------------------------------------
+
+    /// Pin: the wake path retries only when the failure was the network,
+    /// never when Apple actually rejected something.
+    #[test]
+    fn connectivity_errors_are_recognised() {
+        let dns = r#"ErrorGettingAnisette(ReqwestError(reqwest::Error { kind: Request, source: hyper::Error(Connect, ConnectError("dns error", Custom { error: "failed to lookup address information: Name or service not known" })) }))"#;
+        assert!(is_connectivity_error(dns));
+        assert!(is_connectivity_error("Token missing"));
+        assert!(is_connectivity_error("request timed out after 30s"));
+        assert!(!is_connectivity_error("Apple ID login failed: Enter the correct password for this Apple Account. (-22406)"));
+        assert!(!is_connectivity_error("Not in clique!"));
+        assert!(!is_connectivity_error(""));
+    }
 
     #[test]
     fn config_default_round_trip() {
