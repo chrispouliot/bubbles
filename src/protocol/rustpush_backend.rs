@@ -84,6 +84,11 @@ pub struct RustpushBackend {
     /// Live state of the running cloud sync, read by the sidebar progress
     /// display through `Backend::sync_progress`.
     sync_progress: Arc<StdMutex<SyncProgress>>,
+    /// Serialises 6005 recoveries. A failed send and the UI's resource
+    /// watcher both react to the same failure; without this they each mint
+    /// an auth cert and register in whichever order the network decides,
+    /// and the loser is rejected as superseded.
+    heal_lock: Mutex<()>,
 }
 
 /// Marks a cloud sync as running for its whole duration, including every
@@ -118,6 +123,7 @@ impl RustpushBackend {
             config: StdMutex::new(None),
             conn: StdMutex::new(None),
             sync_progress: Arc::new(StdMutex::new(SyncProgress::default())),
+            heal_lock: Mutex::new(()),
         }
     }
 
@@ -512,11 +518,25 @@ impl RustpushBackend {
     /// identity keys, so Apple sees the same device renewing itself, not a
     /// new one.
     async fn heal_6005(&self, imclient: &Arc<IMClient>) -> std::result::Result<(), String> {
+        // One recovery at a time. Whoever arrives second waits, then finds
+        // the registration already healthy and returns without minting.
+        let _serial = self.heal_lock.lock().await;
+        if registration_is_healthy(imclient) {
+            log::info!("6005 heal: registration already healthy (healed concurrently)");
+            return Ok(());
+        }
+
         match imclient.identity.refresh_now().await {
-            Ok(()) => {
+            // `refresh_now` returns Ok without doing anything when a
+            // registration succeeded under 15 seconds ago, so an Ok has to
+            // be checked against the actual resource state.
+            Ok(()) if registration_is_healthy(imclient) => {
                 log::info!("6005 heal: plain re-register succeeded");
                 return Ok(());
             }
+            Ok(()) => log::warn!(
+                "6005 heal: plain re-register was skipped or did not recover; refreshing Apple account credentials"
+            ),
             Err(e) => log::warn!(
                 "6005 heal: plain re-register failed ({e:?}); refreshing Apple account credentials"
             ),
@@ -530,9 +550,36 @@ impl RustpushBackend {
             .update_users(vec![new_user])
             .await
             .map_err(|e| format!("re-register with refreshed credentials failed: {e:?}"))?;
+        if !registration_is_healthy(imclient) {
+            // The re-register inside update_users hit the 15-second guard
+            // and was skipped; the new cert is loaded but not yet
+            // registered. Wait the guard out and register it now rather
+            // than leaving it to the resource's five-minute backoff.
+            log::info!("6005 heal: re-register deferred by the regen guard; retrying in 16s");
+            tokio::time::sleep(std::time::Duration::from_secs(16)).await;
+            imclient
+                .identity
+                .refresh_now()
+                .await
+                .map_err(|e| format!("re-register with refreshed credentials failed: {e:?}"))?;
+            if !registration_is_healthy(imclient) {
+                let status = registration_status_from(&imclient.identity.resource_state.borrow());
+                return Err(format!(
+                    "re-register with refreshed credentials did not recover: {status:?}"
+                ));
+            }
+        }
         log::info!("6005 heal: re-registered with refreshed Apple account credentials");
         Ok(())
     }
+}
+
+/// Whether the identity resource is currently registered and usable.
+fn registration_is_healthy(imclient: &Arc<IMClient>) -> bool {
+    matches!(
+        *imclient.identity.resource_state.borrow(),
+        rustpush::ResourceState::Generated
+    )
 }
 
 /// Stamp `last_sync_error` with "now" so the automatic launch/wake sync backs
@@ -1387,20 +1434,26 @@ impl Backend for RustpushBackend {
         let date = now_ms();
         let inst = Mutex::new(inst);
 
-        // Try the send. If the underlying error is a 6005 cert/identity
-        // rejection from Apple (the typical "stale IDS cert" symptom — the
-        // auto-rereg already fired once and failed), attempt a self-heal
-        // before giving up. The self-heal forces a fresh re-register on the
-        // IMClient's IdentityManager; if Apple's auth state has cleared
-        // since the last rereg, this succeeds and the cert is updated in
-        // place so the retry uses the new cert. The next launch's
-        // `reconstruct_account` (which always runs `do_login`) provides
-        // a second chance to refresh the cert.
-        let result = crate::retry::retry(3, std::time::Duration::from_millis(500), || async {
+        // Try the send, absorbing transient errors with a short retry. A
+        // 6005 (Apple rejected the auth cert) is not transient: retrying it
+        // only repeats a failed re-register and can stall for minutes on the
+        // resource's backoff, so it goes straight to the self-heal below.
+        let mut result = Err(PushError::SendTimedOut);
+        for attempt in 1..=3 {
             let mut guard = inst.lock().await;
-            imclient.send(&mut guard).await
-        })
-        .await;
+            result = imclient.send(&mut guard).await;
+            drop(guard);
+            match &result {
+                Ok(_) => break,
+                Err(e) if is_6005_error(e) => break,
+                Err(e) => {
+                    log::warn!("send attempt {attempt} failed: {e:?}");
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }
+        }
 
         let send_result = match result {
             Ok(job) => Ok(job),
