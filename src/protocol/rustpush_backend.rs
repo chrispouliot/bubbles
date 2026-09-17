@@ -123,18 +123,19 @@ impl RustpushBackend {
 
     /// Reconstruct the AppleAccount from the encrypted credentials in
     /// `gsa.plist` via `login_email_pass`. On success, stores the
-    /// `AppleAccount` in `self.account` and returns `Ok(())`. On failure
-    /// (missing gsa.plist, decryption error, network auth failure), logs
-    /// a warning and returns `Err(())` without updating `self.account`.
+    /// `AppleAccount` in `self.account`. On failure (missing gsa.plist,
+    /// decryption error, network auth failure), logs a warning and returns
+    /// `Err` without updating `self.account`.
     ///
-    /// This is the auth path that lets the sync run on every launch. It
-    /// also regenerates the IDS cert (via the `do_login` step) so that
-    /// Apple's server-side state is fresh on every launch — this is what
-    /// keeps the iMessage cert from going stale every few hours. The
-    /// previous "MME cache" optimization that skipped `do_login` when the
-    /// MME was fresh was removed because it caused the cert to stay bad
-    /// when the rereg failed (Apple's auth state rotates faster than the
-    /// 7-day MME window).
+    /// This is the Apple ID login the cloud sync needs for its CloudKit
+    /// tokens, and nothing more. It deliberately does **not** run
+    /// `do_login`: that mints a brand-new IDS auth cert, and Apple treats
+    /// the newest cert as the only valid one for this device. A cert minted
+    /// here and never applied to the registration invalidated the one in
+    /// use, so every launch that synced was followed by a 6005 on the next
+    /// re-register (and a re-register command from Apple within
+    /// milliseconds). Minting a cert is [`Self::refresh_ids_identity`]'s
+    /// job, and only the recovery path calls it, applying the result.
     ///
     /// When `force` is true, the `cloud_sync_enabled` config gate and the
     /// post-failure backoff are bypassed. This is used by the manual "Sync
@@ -145,7 +146,7 @@ impl RustpushBackend {
     /// with [`APPLE_LOGIN_FAILED_PREFIX`] mean the Apple ID password login
     /// itself did not complete; the Sync Now UI offers the re-auth dialog
     /// for those.
-    async fn reconstruct_account(&self, force: bool) -> Result<Option<IDSUser>, String> {
+    async fn reconstruct_account(&self, force: bool) -> Result<(), String> {
         let conn_arc = self.conn.lock().unwrap().clone();
         let conn = match conn_arc {
             Some(c) => c,
@@ -242,32 +243,6 @@ impl RustpushBackend {
                          ({state:?}); sign out and sign in again to complete it"
                     ));
                 }
-                // Always run do_login. The previous "skip if MME is fresh"
-                // optimization caused the IDS cert to stay bad whenever the
-                // rereg failed (Apple's auth state rotates faster than the
-                // 7-day MME window). Running do_login on every launch keeps
-                // the Apple account state fresh so rustpush's auto-rereg
-                // succeeds in the background.
-                let new_user = match api::do_login(
-                    self.state_path.clone(),
-                    &account,
-                    None,
-                    &config,
-                ).await {
-                    Ok(user) => {
-                        log::info!("reconstruct_account: do_login succeeded");
-                        Some(user)
-                    }
-                    Err(e) => {
-                        log::warn!("reconstruct_account: do_login failed: {e:?}");
-                        // Continue anyway — the account is still partially usable, and
-                        // sync_missed_messages will report the failure clearly. Storing
-                        // the account lets a future attempt (e.g., on the next launch or
-                        // wake) try do_login again without re-doing try_auth.
-                        None
-                    }
-                };
-
                 log::info!("reconstruct_account: successfully reconstructed AppleAccount");
                 // Clear any previous sync error — a successful reconstruction
                 // means the backoff should be reset.
@@ -277,7 +252,7 @@ impl RustpushBackend {
                     log::warn!("clear_last_sync_error failed: {e}");
                 }
                 *self.account.lock().unwrap() = Some(account);
-                Ok(new_user)
+                Ok(())
             }
             Err(e) => {
                 log::warn!("reconstruct_account: try_auth failed: {e:?}");
@@ -495,17 +470,47 @@ async fn log_zone_schema<P: rustpush::AnisetteProvider>(
 }
 
 impl RustpushBackend {
+    /// Mint a fresh IDS auth cert for this device via `do_login`.
+    ///
+    /// Apple honours only the newest auth cert issued to a device, so the
+    /// caller **must** apply the returned user to the running registration
+    /// (`update_users`, which also persists id.plist). Minting one and
+    /// dropping it is exactly the bug that made every launch end in a 6005.
+    /// Signs the Apple ID in first if this process has not yet.
+    async fn refresh_ids_identity(&self) -> std::result::Result<IDSUser, String> {
+        if self.account.lock().unwrap().is_none() {
+            self.reconstruct_account(true).await?;
+        }
+        let account = self
+            .account
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "Apple account is not signed in".to_string())?;
+        let config = self
+            .config
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "no OS config stored for this session".to_string())?;
+        let user = api::do_login(self.state_path.clone(), &account, None, &config)
+            .await
+            .map_err(|e| format!("refreshing the iMessage login (do_login) failed: {e:#}"))?;
+        log::info!("refresh_ids_identity: new IDS auth cert issued");
+        Ok(user)
+    }
+
     /// Recover from an IDS 6005 ("bad auth cert") on the identity resource.
     ///
     /// Step 1 is a plain re-register: cheap, and enough when Apple's state
     /// was only momentarily inconsistent. `refresh_now` (not `refresh`) is
     /// used because only it wakes the resource manager out of a backoff
-    /// sleep. Step 2 refreshes the Apple-account credentials behind the
-    /// registration with a full `do_login` (`reconstruct_account`) and
-    /// re-registers with the fresh IDS auth, which is the only thing that
-    /// clears a 6005 caused by a stale auth cert. Neither step touches the
-    /// hardware identity, the push token or the identity keys, so Apple sees
-    /// the same device renewing itself, not a new one.
+    /// sleep. Step 2 mints a fresh IDS auth cert
+    /// ([`Self::refresh_ids_identity`]) and re-registers with it, which is
+    /// the only thing that clears a 6005 caused by a superseded cert.
+    /// Neither step touches the hardware identity, the push token or the
+    /// identity keys, so Apple sees the same device renewing itself, not a
+    /// new one.
     async fn heal_6005(&self, imclient: &Arc<IMClient>) -> std::result::Result<(), String> {
         match imclient.identity.refresh_now().await {
             Ok(()) => {
@@ -516,26 +521,17 @@ impl RustpushBackend {
                 "6005 heal: plain re-register failed ({e:?}); refreshing Apple account credentials"
             ),
         }
-        match self.reconstruct_account(true).await {
-            Ok(Some(new_user)) => {
-                // update_users swaps in the fresh IDSUser (new auth cert) and
-                // triggers a re-register that uses it.
-                imclient
-                    .identity
-                    .resource
-                    .update_users(vec![new_user])
-                    .await
-                    .map_err(|e| format!("re-register with refreshed credentials failed: {e:?}"))?;
-                log::info!("6005 heal: re-registered with refreshed Apple account credentials");
-                Ok(())
-            }
-            Ok(None) => Err(
-                "Apple account signed in, but refreshing the iMessage login (do_login) failed; \
-                 see the log for the cause"
-                    .to_string(),
-            ),
-            Err(reason) => Err(reason),
-        }
+        let new_user = self.refresh_ids_identity().await?;
+        // update_users swaps in the fresh IDSUser (new auth cert), persists
+        // it, and triggers a re-register that uses it.
+        imclient
+            .identity
+            .resource
+            .update_users(vec![new_user])
+            .await
+            .map_err(|e| format!("re-register with refreshed credentials failed: {e:?}"))?;
+        log::info!("6005 heal: re-registered with refreshed Apple account credentials");
+        Ok(())
     }
 }
 
@@ -2148,10 +2144,13 @@ impl Backend for RustpushBackend {
 
         match state {
             RpLoginState::LoggedIn => {
-                api::do_login(self.state_path.clone(), &account, None, &config)
+                // Save the accepted credentials only. Minting a new IDS auth
+                // cert here would invalidate the registration in use; if the
+                // registration needs one, the heal mints and applies it.
+                api::save_gsa_credentials(&self.state_path, &account)
                     .await
                     .map_err(|e| {
-                        format!("Apple accepted the password, but saving the session failed: {e:#}")
+                        format!("Apple accepted the password, but saving the credentials failed: {e:#}")
                     })?;
                 *self.account.lock().unwrap() = Some(account);
                 let state_dir = std::path::PathBuf::from(&self.state_path);

@@ -540,6 +540,34 @@ pub async fn try_icloud_login(path: String, conf: &JoinedOSConfig, account: &Arc
     }
 }
 
+/// Persist the signed-in account's Apple ID credentials to `gsa.plist` so
+/// the saved-password replay (cloud sync, registration recovery) works.
+fn write_gsa_credentials(conf_dir: &Path, account: &AppleAccount<DefaultAnisetteProvider>) -> anyhow::Result<()> {
+    let saved_hash = account.hashed_password.clone().ok_or(anyhow!("no password hash on account"))?;
+    let gsa_config = GSAConfig {
+        username: account.username.clone().ok_or(anyhow!("no username on account"))?,
+        encrypted_password: GSAConfig::encrypt(&saved_hash)?,
+        postdata_done: Some(true),
+    };
+    info!(
+        "saving Apple ID credentials: username={} password_hash_fp={} len={}",
+        gsa_config.username,
+        secret_fingerprint(&saved_hash),
+        saved_hash.len()
+    );
+    crate::persist::write_atomic(&conf_dir.join("gsa.plist"), &plist_to_buf(&gsa_config)?)?;
+    Ok(())
+}
+
+/// [`write_gsa_credentials`] for a shared account handle. This is all a
+/// re-auth needs: it must **not** run `do_login`, which mints a new IDS
+/// auth cert and thereby invalidates the registration currently in use.
+pub async fn save_gsa_credentials(path: &str, account: &Arc<Mutex<AppleAccount<DefaultAnisetteProvider>>>) -> anyhow::Result<()> {
+    let conf_dir = PathBuf::from_str(path).unwrap();
+    let account = account.lock().await;
+    write_gsa_credentials(&conf_dir, &account)
+}
+
 pub async fn do_login(path: String, account: &Arc<Mutex<AppleAccount<DefaultAnisetteProvider>>>, finish: Option<UpdateAccountFinish>, os_config: &JoinedOSConfig) -> anyhow::Result<IDSUser> {
     let mut account = account.lock().await;
     
@@ -562,19 +590,7 @@ pub async fn do_login(path: String, account: &Arc<Mutex<AppleAccount<DefaultAnis
     };
     
     
-    let saved_hash = account.hashed_password.clone().unwrap();
-    let gsa_config = GSAConfig {
-        username: account.username.clone().unwrap(),
-        encrypted_password: GSAConfig::encrypt(&saved_hash)?,
-        postdata_done: Some(true),
-    };
-    info!(
-        "saving Apple ID credentials: username={} password_hash_fp={} len={}",
-        gsa_config.username,
-        secret_fingerprint(&saved_hash),
-        saved_hash.len()
-    );
-    crate::persist::write_atomic(&conf_dir.join("gsa.plist"), &plist_to_buf(&gsa_config)?)?;
+    write_gsa_credentials(&conf_dir, &account)?;
 
     let sk_path = conf_dir.join("statuskit.plist");
     let sk_state = StatusKitState {
