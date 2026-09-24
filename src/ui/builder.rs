@@ -912,18 +912,21 @@ fn message_body(
         }
     }
 
-    let has_text = m
-        .text
-        .as_deref()
-        .is_some_and(|t| !strip_marker(t).is_empty());
+    let preview = previews.get(&(m.guid.clone(), 0));
+    let text = body_text(m);
+    let text = preview
+        .map(|preview| text_without_preview_url(&text, preview))
+        .unwrap_or(text);
+    let has_text = m.text.as_deref().is_some_and(|t| !strip_marker(t).is_empty())
+        && !text.trim().is_empty();
     let is_tapback = m.associated_guid.is_some();
     let bubble_or_overlay: Option<gtk::Widget> = if has_text || is_tapback {
         let bubble = bubble_box(own);
-        bubble.append(&bubble_label(&body_text(m), show_picker, show_edit, show_retry));
+        bubble.append(&bubble_label(&text, show_picker, show_edit, show_retry));
         let result = bubble_with_chip(&bubble, own, chip);
         col.append(&result);
         Some(result)
-    } else if m.attachments.is_empty() {
+    } else if m.attachments.is_empty() && preview.is_none() {
         let bubble = bubble_box(own);
         bubble.append(&bubble_label("(no text)", show_picker, show_edit, show_retry));
         let result = bubble_with_chip(&bubble, own, chip);
@@ -938,7 +941,7 @@ fn message_body(
     // asynchronously to avoid a sync decode on the main thread. Register the
     // card in `preview_cards` so `refresh_link_card` can swap it in place on
     // a placeholder→fillin without rebuilding the timeline.
-    if let Some(preview) = previews.get(&(m.guid.clone(), 0)) {
+    if let Some(preview) = preview {
         let card = link_preview_card(preview);
         preview_cards
             .borrow_mut()

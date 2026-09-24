@@ -221,15 +221,15 @@ row.entry image.edit-icon {
   border-radius: 12px;
   border: 1px solid alpha(currentColor, 0.08);
   background-color: alpha(currentColor, 0.03);
-  min-width: 220px;
+  min-width: 0;
 }
 .link-preview:hover {
   background-color: alpha(currentColor, 0.06);
 }
 .link-preview-thumb {
   border-radius: 8px;
-  min-width: 72px;
-  min-height: 72px;
+  min-width: 224px;
+  min-height: 280px;
   background-color: alpha(currentColor, 0.08);
 }
 .link-preview-title {
@@ -248,8 +248,8 @@ row.entry image.edit-icon {
 }
 .link-preview-thumb-fallback {
   border-radius: 8px;
-  min-width: 72px;
-  min-height: 72px;
+  min-width: 224px;
+  min-height: 280px;
   background-color: alpha(currentColor, 0.08);
   color: alpha(currentColor, 0.5);
 }
@@ -2411,9 +2411,6 @@ fn _update_crop_indicator_math_doc(
     let y = (display_cy - display_r).round() as i32;
     let _ = (dia, x, y);
 }
-
-
-
 
 
 
