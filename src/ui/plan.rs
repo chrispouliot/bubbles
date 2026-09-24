@@ -150,6 +150,52 @@ pub fn plan_chat_update(
     }
 }
 
+/// Decide what display update is needed while also accounting for the
+/// attachments already rendered for each message. A message that acquires a
+/// locally available image cannot be updated by the existing in-place plans,
+/// so it requires rebuilding its bubble.
+pub fn plan_chat_update_with_attachments(
+    prev_guids: &[String],
+    prev_receipt: Option<&str>,
+    prev_reactions: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
+    prev_text: &std::collections::HashMap<String, String>,
+    prev_attachments: &std::collections::HashMap<String, Vec<crate::store::StoredAttachment>>,
+    new_msgs: &[StoredMessage],
+    new_reactions: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
+) -> ChatUpdatePlan {
+    let gained_local_image = new_msgs.iter().any(|message| {
+        message.associated_guid.is_none()
+            && prev_guids.iter().any(|guid| guid == &message.guid)
+            && has_local_image(&message.attachments)
+            && !prev_attachments
+                .get(&message.guid)
+                .is_some_and(|attachments| has_local_image(attachments))
+    });
+
+    if gained_local_image {
+        ChatUpdatePlan::Rebuild
+    } else {
+        plan_chat_update(
+            prev_guids,
+            prev_receipt,
+            prev_reactions,
+            prev_text,
+            new_msgs,
+            new_reactions,
+        )
+    }
+}
+
+fn has_local_image(attachments: &[crate::store::StoredAttachment]) -> bool {
+    attachments.iter().any(|attachment| {
+        attachment.local_path.is_some()
+            && attachment
+                .mime
+                .as_deref()
+                .is_some_and(|mime| mime.starts_with("image/"))
+    })
+}
+
 /// Compare two reaction-chip maps and produce a list of changes.
 ///
 /// An entry in `new` that is absent from `prev` (or has different chips) is a
@@ -774,6 +820,35 @@ mod plan_chat_update_tests {
             m_text("B", false, 2000, "same B"),
         ];
         assert_noop(plan_chat_update(&prev, None, &no_reactions(), &prev_text, &new, &no_reactions()));
+    }
+
+    #[test]
+    fn plan_chat_update_rebuild_when_existing_message_gains_local_image() {
+        let prev = guids(&["A"]);
+        let prev_text = HashMap::from([("A".to_string(), "photo".to_string())]);
+        let prev_attachments: HashMap<String, Vec<crate::store::StoredAttachment>> =
+            HashMap::from([("A".to_string(), vec![])]);
+        let mut message = m_text("A", false, 1000, "photo");
+        message.attachments.push(crate::store::StoredAttachment {
+            mime: Some("image/jpeg".to_string()),
+            name: Some("photo.jpg".to_string()),
+            local_path: Some("/tmp/photo.jpg".to_string()),
+            width: None,
+            height: None,
+            is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
+        });
+
+        assert_rebuild(plan_chat_update_with_attachments(
+            &prev,
+            None,
+            &no_reactions(),
+            &prev_text,
+            &prev_attachments,
+            &[message],
+            &no_reactions(),
+        ));
     }
 
     #[test]

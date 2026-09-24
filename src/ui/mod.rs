@@ -385,6 +385,9 @@ struct Ui {
     /// instead of `Noop` or `Rebuild`. Updated after every populate_messages
     /// rebuild and after every in-place text update.
     current_text: Rc<RefCell<std::collections::HashMap<String, String>>>,
+    /// Attachments currently rendered for each message, keyed by guid. Used to
+    /// detect when a refresh makes a locally available image renderable.
+    current_attachments: Rc<RefCell<std::collections::HashMap<String, Vec<StoredAttachment>>>>,
     /// Banner shown at the top of the content pane reflecting the iMessage
     /// identity registration state (re-registering, transient failure, logged
     /// out by Apple).
@@ -739,6 +742,7 @@ pub fn enter_messaging(
         current_chips: Rc::new(RefCell::new(std::collections::HashMap::new())),
         current_reactions: Rc::new(RefCell::new(std::collections::BTreeMap::new())),
         current_text: Rc::new(RefCell::new(std::collections::HashMap::new())),
+        current_attachments: Rc::new(RefCell::new(std::collections::HashMap::new())),
         reg_banner: reg_banner.clone(),
         reg_notified: Rc::new(Cell::new(false)),
         heal_in_flight: Rc::new(Cell::new(false)),
@@ -2167,6 +2171,7 @@ fn sync_tracked_state_after_rebuild(
     current_receipt_text: &Rc<RefCell<Option<String>>>,
     receipt_label: &Rc<RefCell<Option<gtk::Label>>>,
     current_text: &Rc<RefCell<std::collections::HashMap<String, String>>>,
+    current_attachments: &Rc<RefCell<std::collections::HashMap<String, Vec<StoredAttachment>>>>,
 ) {
     // The old receipt_label handle is now stale (the widget was destroyed by
     // clear_box). Drop it before re-extracting.
@@ -2181,6 +2186,11 @@ fn sync_tracked_state_after_rebuild(
         .iter()
         .filter(|m| m.associated_guid.is_none())
         .filter_map(|m| m.text.as_ref().map(|t| (m.guid.clone(), t.clone())))
+        .collect();
+    *current_attachments.borrow_mut() = msgs
+        .iter()
+        .filter(|m| m.associated_guid.is_none())
+        .map(|m| (m.guid.clone(), m.attachments.clone()))
         .collect();
     if let Some(label) = extract_receipt_label(container) {
         let text = label.text().to_string();
@@ -2411,7 +2421,6 @@ fn _update_crop_indicator_math_doc(
     let y = (display_cy - display_r).round() as i32;
     let _ = (dia, x, y);
 }
-
 
 
 
