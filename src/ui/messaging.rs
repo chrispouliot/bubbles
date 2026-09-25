@@ -294,6 +294,7 @@ impl super::Ui {
                         for w in &widgets {
                             ui.msg_container.append(w);
                         }
+                        update_timeline_timestamps(&msgs, &ui.current_chips.borrow());
                         if let Some(w) = marker {
                             *ui.unread_marker.borrow_mut() = Some(w.clone());
                             *ui.unread_marker_shown.borrow_mut() = true;
@@ -602,6 +603,16 @@ impl super::Ui {
                 for w in widgets.into_iter().rev() {
                     ui.msg_container.prepend(&w);
                 }
+                // Keep the tracked order in sync with the actual timeline so
+                // later prepends can identify the real first row and latest send.
+                let mut rendered_guids = older
+                    .iter()
+                    .filter(|m| m.associated_guid.is_none())
+                    .map(|m| m.guid.clone())
+                    .collect::<Vec<_>>();
+                rendered_guids.extend(ui.rendered_guids.borrow().iter().cloned());
+                *ui.rendered_guids.borrow_mut() = rendered_guids;
+                update_rendered_timestamps(&ui.rendered_guids.borrow(), &ui.current_chips.borrow());
                 // After prepending, if the newest real message in the batch and
                 // the oldest previously-rendered real message are on different
                 // calendar days, insert a date divider at the boundary.  This

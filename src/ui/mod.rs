@@ -2089,6 +2089,7 @@ fn build_message_widgets(
         Some(p) => (Some(group_key(p)), p.date, Some(p.is_from_me)),
         None => (None, 0i64, None),
     };
+    let mut previous_visible_date = prev.map(|p| p.date);
     // Date-divider tracking: seeded from `divider_prev_date` when present
     // (prepend path — compares against the adjacent old content's date so
     // duplicate dividers are avoided when the batch shares a date with
@@ -2122,6 +2123,7 @@ fn build_message_widgets(
         let key = group_key(m);
         let show_header =
             last_key.as_deref() != Some(key.as_str()) || m.date - last_date > GROUP_GAP_MS;
+        let show_timestamp = crate::time_format::should_show_chunk_timestamp(previous_visible_date, m.date);
         let side_changed = last_from_me != Some(m.is_from_me);
         let top = if last_from_me.is_none() {
             8
@@ -2138,24 +2140,27 @@ fn build_message_widgets(
         let chip = reactions
             .get(&m.guid)
             .map(|chips| reaction_chips_row(chips));
-        let ctx = MessageContext { m, show_header, top, previews, preview_cards, handles, contacts };
+        let ctx = MessageContext { m, show_header, show_timestamp, top, previews, preview_cards, handles, contacts };
         let (row, bubble_or_overlay) = message_widget(ctx, is_group, on_reaction, on_edit, on_retry, chip.as_ref());
         let bubble_widget = match &bubble_or_overlay {
             Some(b) => b.clone(),
             None => row.clone(),
         };
-        out.push(row);
-
         // Record chip entry for in-place update support.
         let entry = ChipEntry {
             bubble: bubble_widget,
+            timestamp: first_message_timestamp(&row).expect("message row has timestamp"),
+            is_from_me: m.is_from_me,
+            date: m.date,
             chip: chip.clone(),
         };
         chip_map.insert(m.guid.clone(), entry);
+        out.push(row);
 
         last_key = Some(key);
         last_date = m.date;
         last_from_me = Some(m.is_from_me);
+        previous_visible_date = Some(m.date);
         prev_date = Some(m.date);
     }
     (out, marker, chip_map)
@@ -2230,6 +2235,73 @@ fn extract_receipt_label(container: &gtk::Box) -> Option<gtk::Label> {
     None
 }
 
+/// Find the first message timestamp in timeline order, descending through each
+/// row's widget tree. Used when an older page changes the predecessor of the
+/// previously first visible message.
+fn first_message_timestamp(widget: &gtk::Widget) -> Option<gtk::Label> {
+    if let Ok(label) = widget.clone().downcast::<gtk::Label>() {
+        if label.has_css_class("message-timestamp") {
+            return Some(label);
+        }
+    }
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        if let Some(label) = first_message_timestamp(&current) {
+            return Some(label);
+        }
+        child = current.next_sibling();
+    }
+    None
+}
+
+/// Reapply timestamp visibility after an append, using the complete loaded
+/// timeline so an incoming tail does not displace the latest outgoing bubble.
+fn update_timeline_timestamps(
+    msgs: &[StoredMessage],
+    entries: &std::collections::HashMap<String, ChipEntry>,
+) {
+    let latest_outgoing = crate::ui::plan::latest_visible_message_index(msgs, true);
+    let latest_incoming = crate::ui::plan::latest_visible_message_index(msgs, false);
+    let mut previous = None;
+    for (i, m) in msgs.iter().enumerate() {
+        if m.associated_guid.is_some() {
+            continue;
+        }
+        if let Some(entry) = entries.get(&m.guid) {
+            entry.timestamp.set_visible(crate::time_format::should_show_message_timestamp(
+                previous,
+                m.date,
+                Some(i) == latest_outgoing || Some(i) == latest_incoming,
+            ));
+        }
+        previous = Some(m.date);
+    }
+}
+
+/// Recompute timestamps over the rendered order after older pages are prepended.
+fn update_rendered_timestamps(
+    guids: &[String],
+    entries: &std::collections::HashMap<String, ChipEntry>,
+) {
+    let latest_outgoing = guids.iter().rposition(|guid| {
+        entries.get(guid).is_some_and(|entry| entry.is_from_me)
+    });
+    let latest_incoming = guids.iter().rposition(|guid| {
+        entries.get(guid).is_some_and(|entry| !entry.is_from_me)
+    });
+    let mut previous = None;
+    for (i, guid) in guids.iter().enumerate() {
+        if let Some(entry) = entries.get(guid) {
+            entry.timestamp.set_visible(crate::time_format::should_show_message_timestamp(
+                previous,
+                entry.date,
+                Some(i) == latest_outgoing || Some(i) == latest_incoming,
+            ));
+            previous = Some(entry.date);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn populate_messages(
     container: &gtk::Box,
@@ -2252,12 +2324,14 @@ fn populate_messages(
     preview_cards.borrow_mut().clear();
     let mut last_key: Option<String> = None;
     let mut last_date = 0i64;
+    let mut previous_visible_date: Option<i64> = None;
     let mut last_from_me: Option<bool> = None;
     let mut marker: Option<gtk::Widget> = None;
     let mut chip_map: std::collections::HashMap<String, ChipEntry> = std::collections::HashMap::new();
     // The single message that carries the Delivered/Read indicator.
     // Skip tapback rows — they render as chips on the target message.
-    let last_sent_idx = msgs.iter().rposition(|m| m.is_from_me && m.associated_guid.is_none());
+    let last_sent_idx = crate::ui::plan::latest_visible_message_index(msgs, true);
+    let last_received_idx = crate::ui::plan::latest_visible_message_index(msgs, false);
 
     // Date-divider tracking: the last non-tapback message's timestamp so we
     // can decide whether a new calendar-date divider is needed.
@@ -2295,6 +2369,11 @@ fn populate_messages(
         let key = group_key(m);
         let show_header =
             last_key.as_deref() != Some(key.as_str()) || m.date - last_date > GROUP_GAP_MS;
+        let show_timestamp = crate::time_format::should_show_message_timestamp(
+            previous_visible_date,
+            m.date,
+            Some(i) == last_sent_idx || Some(i) == last_received_idx,
+        );
         // Bigger gap on a received <-> sent flip, medium for a new same-side
         // group, tight within a group.
         let side_changed = last_from_me != Some(m.is_from_me);
@@ -2316,7 +2395,7 @@ fn populate_messages(
         let chip = reactions
             .get(&m.guid)
             .map(|chips| reaction_chips_row(chips));
-        let ctx = MessageContext { m, show_header, top, previews, preview_cards, handles, contacts };
+        let ctx = MessageContext { m, show_header, show_timestamp, top, previews, preview_cards, handles, contacts };
         let (row, bubble_or_overlay) = message_widget(ctx, is_group, on_reaction, on_edit, on_retry, chip.as_ref());
         let bubble_widget = match &bubble_or_overlay {
             Some(b) => b.clone(),
@@ -2326,6 +2405,9 @@ fn populate_messages(
         // Record chip entry for in-place update support.
         let entry = ChipEntry {
             bubble: bubble_widget,
+            timestamp: first_message_timestamp(&row).expect("message row has timestamp"),
+            is_from_me: m.is_from_me,
+            date: m.date,
             chip: chip.clone(),
         };
         chip_map.insert(m.guid.clone(), entry);
@@ -2348,6 +2430,7 @@ fn populate_messages(
         last_key = Some(key);
         last_date = m.date;
         last_from_me = Some(m.is_from_me);
+        previous_visible_date = Some(m.date);
         prev_date = Some(m.date);
     }
     (marker, chip_map)
@@ -2421,6 +2504,3 @@ fn _update_crop_indicator_math_doc(
     let y = (display_cy - display_r).round() as i32;
     let _ = (dia, x, y);
 }
-
-
-

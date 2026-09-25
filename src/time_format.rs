@@ -119,6 +119,31 @@ pub fn format_date_label(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// Decide whether a message should display its chunk timestamp.
+///
+/// The first message always displays a timestamp. Subsequent messages display
+/// one only when more than five minutes have elapsed since the immediately
+/// preceding visible message.
+pub fn should_show_chunk_timestamp(prev: Option<i64>, current: i64) -> bool {
+    match prev {
+        None => true,
+        Some(prev_ms) => current
+            .checked_sub(prev_ms)
+            .is_some_and(|gap_ms| gap_ms > 5 * 60 * 1000),
+    }
+}
+
+/// Decide whether a message should display its timestamp, allowing the
+/// latest visible message in either sender direction to override the usual
+/// five-minute gap.
+pub fn should_show_message_timestamp(
+    prev: Option<i64>,
+    current: i64,
+    is_latest_in_direction: bool,
+) -> bool {
+    is_latest_in_direction || should_show_chunk_timestamp(prev, current)
+}
+
 /// Decide whether a date divider should be shown before a message.
 ///
 /// * `prev` — timestamp of the previous message in the list, or `None` for
@@ -424,5 +449,34 @@ mod tests {
         let current = datetime_ms(2024, 6, 15, 9, 0, 0);
         // prev is also today → no duplicate divider
         assert!(!should_show_date_divider(prev, current, now));
+    }
+
+    #[test]
+    fn should_show_chunk_timestamp_only_after_five_minutes_from_previous_message() {
+        let first = 1_000_000_i64;
+        assert!(should_show_chunk_timestamp(None, first));
+        assert!(!should_show_chunk_timestamp(Some(first), first + 59_000));
+        assert!(!should_show_chunk_timestamp(Some(first), first + 300_000));
+        assert!(should_show_chunk_timestamp(Some(first), first + 300_001));
+
+        // The third message is eight minutes after the first, but only four
+        // minutes after the immediately preceding visible message.
+        let second = first + 240_000;
+        let third = second + 240_000;
+        assert!(!should_show_chunk_timestamp(Some(first), second));
+        assert!(!should_show_chunk_timestamp(Some(second), third));
+    }
+
+    #[test]
+    fn should_show_message_timestamp_latest_outgoing_overrides_only_the_gap() {
+        let first = 1_000_000_i64;
+        assert!(should_show_message_timestamp(None, first, false));
+        assert!(!should_show_message_timestamp(Some(first), first + 300_000, false));
+        assert!(should_show_message_timestamp(Some(first), first + 300_001, false));
+
+        let current = first + 60_000;
+        assert!(should_show_message_timestamp(Some(first), current, true));
+        // The same message loses its override when it is no longer latest outgoing.
+        assert!(!should_show_message_timestamp(Some(first), current, false));
     }
 }

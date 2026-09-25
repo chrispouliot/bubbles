@@ -196,6 +196,17 @@ fn has_local_image(attachments: &[crate::store::StoredAttachment]) -> bool {
     })
 }
 
+/// Return the last visible message index for the requested sender direction.
+/// Tapbacks are not visible messages and are ignored.
+pub(crate) fn latest_visible_message_index(
+    msgs: &[StoredMessage],
+    is_from_me: bool,
+) -> Option<usize> {
+    msgs.iter().rposition(|message| {
+        message.is_from_me == is_from_me && message.associated_guid.is_none()
+    })
+}
+
 /// Compare two reaction-chip maps and produce a list of changes.
 ///
 /// An entry in `new` that is absent from `prev` (or has different chips) is a
@@ -662,6 +673,32 @@ mod plan_chat_update_tests {
     }
 
     // ── individual tests ───────────────────────────────────────────
+
+    #[test]
+    fn latest_visible_message_index_tracks_each_direction_ignoring_tapbacks() {
+        let mut msgs = vec![
+            m("incoming-old", false, 900),
+            m("outgoing-old", true, 800),
+            m("outgoing-latest", true, 100),
+            m("incoming-latest", false, 50),
+            tapback(m("incoming-reaction", false, 2_000), "outgoing-latest"),
+            tapback(m("outgoing-reaction", true, 3_000), "incoming-latest"),
+        ];
+
+        assert_eq!(latest_visible_message_index(&msgs, true), Some(2));
+        assert_eq!(latest_visible_message_index(&msgs, false), Some(3));
+
+        msgs.push(m("incoming-newer", false, 10));
+        msgs.push(tapback(m("outgoing-reaction-2", true, 4_000), "incoming-newer"));
+        assert_eq!(latest_visible_message_index(&msgs, false), Some(6));
+        assert_eq!(latest_visible_message_index(&msgs, true), Some(2));
+
+        let no_visible_outgoing = vec![
+            m("incoming-only", false, 1),
+            tapback(m("outgoing-reaction-only", true, 2), "incoming-only"),
+        ];
+        assert_eq!(latest_visible_message_index(&no_visible_outgoing, true), None);
+    }
 
     #[test]
     fn plan_chat_update_noop_when_guids_and_receipt_unchanged() {

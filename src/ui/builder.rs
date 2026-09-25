@@ -22,6 +22,13 @@ pub(super) struct ChipEntry {
     /// "add first chip" case (where the bubble is still a plain Box) and to
     /// find the overlay in the "update/remove chip" cases.
     pub(super) bubble: gtk::Widget,
+    /// The timestamp label belonging to this message row.
+    pub(super) timestamp: gtk::Label,
+    /// Whether this message was sent by the local user.
+    pub(super) is_from_me: bool,
+    /// Message timestamp in timeline order, used when a prepend changes the
+    /// latest message for either sender direction.
+    pub(super) date: i64,
     /// The chip widget, if the message currently has reactions. `None` means
     /// the message was rendered without a chip and we'd need to add one (the
     /// "add first chip" case).
@@ -599,6 +606,7 @@ pub(super) fn chat_row(ui: &Ui, c: &ChatSummary) -> gtk::ListBoxRow {
 pub(super) struct MessageContext<'a> {
     pub(super) m: &'a StoredMessage,
     pub(super) show_header: bool,
+    pub(super) show_timestamp: bool,
     pub(super) top: i32,
     pub(super) previews: &'a std::collections::HashMap<(String, i64), MessageLinkPreview>,
     pub(super) preview_cards: &'a Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
@@ -638,7 +646,7 @@ fn incoming_message(
     on_reaction: Option<&Rc<ReactionHandler>>,
     chip: Option<&gtk::Widget>,
 ) -> (gtk::Widget, Option<gtk::Widget>) {
-    let MessageContext { m, show_header, top, previews, preview_cards, handles, contacts } = ctx;
+    let MessageContext { m, show_header, show_timestamp, top, previews, preview_cards, handles, contacts } = ctx;
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -757,9 +765,9 @@ fn incoming_message(
         chip,
     );
     line.append(&body_col);
-    if show_header {
-        line.append(&time_label(m));
-    }
+    let timestamp = time_label(m);
+    timestamp.set_visible(show_timestamp);
+    line.append(&timestamp);
     col.append(&line);
 
     row.append(&col);
@@ -775,7 +783,7 @@ fn own_message(
     on_retry: Option<&Rc<RetryHandler>>,
     chip: Option<&gtk::Widget>,
 ) -> (gtk::Widget, Option<gtk::Widget>) {
-    let MessageContext { m, show_header, top, previews, preview_cards, .. } = ctx;
+    let MessageContext { m, show_header: _, show_timestamp, top, previews, preview_cards, .. } = ctx;
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .margin_start(56)
@@ -789,9 +797,9 @@ fn own_message(
         .spacing(6)
         .halign(gtk::Align::End)
         .build();
-    if show_header {
-        line.append(&time_label(m));
-    }
+    let timestamp = time_label(m);
+    timestamp.set_visible(show_timestamp);
+    line.append(&timestamp);
 
     // Error indicator for failed-send messages.
     if let Some(cat) = m.send_error {
@@ -1150,6 +1158,9 @@ pub(super) fn apply_chip_change(
                     }
                     o.insert(ChipEntry {
                         bubble: overlay,
+                        timestamp: o.get().timestamp.clone(),
+                        is_from_me: o.get().is_from_me,
+                        date: o.get().date,
                         chip: Some(chip),
                     });
                 }
@@ -1277,6 +1288,7 @@ pub(super) fn time_label(m: &StoredMessage) -> gtk::Label {
     let l = gtk::Label::builder().label(fmt_time(m.date)).build();
     l.add_css_class("dim-label");
     l.add_css_class("caption");
+    l.add_css_class("message-timestamp");
     l.set_valign(gtk::Align::End);
     l.set_tooltip_text(Some(&crate::time_format::format_full_timestamp(
         m.date,
