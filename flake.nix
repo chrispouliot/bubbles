@@ -131,6 +131,8 @@
           gst_all_1.gst-plugins-good
           gst_all_1.gst-libav
           gst_all_1.gst-plugins-rs
+        ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+          pkgs.stdenv.cc.cc.lib # libatomic
         ];
       in
       {
@@ -144,6 +146,9 @@
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "bubbles";
           version = "0.2.0";
+
+          # Unicorn's native code needs libatomic for 128-bit atomics on Linux.
+          NIX_LDFLAGS = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux "-latomic";
 
           # Explicit source allowlist via `lib.fileset` — only these paths are
           # copied into the build. This is deliberately independent of HOW the
@@ -236,6 +241,8 @@
             gst_all_1.gst-plugins-good
             gst_all_1.gst-libav
             gst_all_1.gst-plugins-rs
+          ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            pkgs.stdenv.cc.cc.lib # libatomic
           ];
 
           postInstall = ''
@@ -298,6 +305,9 @@
 
         devShells.default = pkgs.mkShell {
           inherit nativeBuildInputs buildInputs;
+
+          # Match the package build when running cargo from nix develop.
+          NIX_LDFLAGS = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux "-latomic";
 
           shellHook = ''
             export RUST_SRC_PATH="${toolchain}/lib/rustlib/src/rust/library"
