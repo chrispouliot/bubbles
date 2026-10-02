@@ -199,22 +199,41 @@ fn image_widget_with_motion(
     const MAX_H: f64 = 340.0;
 
     let pic = gtk::Picture::new();
-    pic.set_size_request(MAX_W as i32, MAX_H as i32);
+    pic.set_hexpand(true);
+    pic.set_vexpand(true);
+    pic.set_halign(gtk::Align::Fill);
+    pic.set_valign(gtk::Align::Fill);
     pic.set_content_fit(gtk::ContentFit::Contain);
     pic.set_overflow(gtk::Overflow::Hidden);
     pic.add_css_class("attachment-image");
     pic.set_cursor_from_name(Some("pointer"));
+
+    // The dedicated sizing child, rather than the decoded texture's natural
+    // size, determines the viewport's allocation. The picture is a non-measuring
+    // overlay and fills that aspect-fitted viewport without cropping.
+    let (initial_w, initial_h) = dimensions
+        .map(|(w, h)| thumbnail_size(w, h, MAX_W, MAX_H))
+        .unwrap_or((MAX_W as i32, MAX_H as i32));
+    let size = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    size.set_size_request(initial_w, initial_h);
+    let viewport = gtk::Overlay::new();
+    viewport.set_halign(gtk::Align::Start);
+    viewport.set_overflow(gtk::Overflow::Hidden);
+    viewport.add_css_class("attachment-image");
+    viewport.set_child(Some(&size));
+    viewport.add_overlay(&pic);
+    viewport.set_measure_overlay(&pic, false);
 
     // Owned for the 'static decode callback below.
     let path_string = path.to_string();
 
     if let Some((width, height)) = dimensions {
         let (thumb_w, thumb_h) = thumbnail_size(width, height, MAX_W, MAX_H);
-        pic.set_size_request(thumb_w, thumb_h);
+        size.set_size_request(thumb_w, thumb_h);
     }
 
     let has_cached_thumbnail = if let Some(cached) = cached_thumbnail(path) {
-        pic.set_size_request(cached.width, cached.height);
+        size.set_size_request(cached.width, cached.height);
         pic.set_paintable(Some(&cached.texture));
         true
     } else {
@@ -224,9 +243,13 @@ fn image_widget_with_motion(
     // Schedule background decode via the image scheduler.
     if !has_cached_thumbnail {
         let weak = pic.downgrade();
+        let size_weak = size.downgrade();
+        let viewport_weak = viewport.downgrade();
         crate::image::schedule_image_loads(vec![std::path::PathBuf::from(path)], Some(CHAT_THUMBNAIL_MAX_EDGE), {
             move |result| {
-                if let Some(pic) = weak.upgrade() {
+                if let (Some(pic), Some(size), Some(viewport)) =
+                    (weak.upgrade(), size_weak.upgrade(), viewport_weak.upgrade())
+                {
                     match result {
                         Ok(decoded) => {
                             let w = decoded.width as i32;
@@ -242,11 +265,11 @@ fn image_widget_with_motion(
                             .upcast::<gtk::gdk::Texture>();
                             let (new_w, new_h) = thumbnail_size(w, h, MAX_W, MAX_H);
 
-                            let old_h = pic.height_request();
-                            pic.set_size_request(new_w, new_h);
+                            let old_h = size.height_request();
+                            size.set_size_request(new_w, new_h);
                             if old_h != new_h {
                                 maybe_adjust_scroll_for_thumbnail(
-                                    pic.upcast_ref(),
+                                    viewport.upcast_ref(),
                                     old_h,
                                     new_h,
                                 );
@@ -282,11 +305,12 @@ fn image_widget_with_motion(
     pic.add_controller(gesture);
 
     let Some(motion_path) = motion_path else {
-        return pic.upcast();
+        return viewport.upcast();
     };
 
     let overlay = gtk::Overlay::new();
-    overlay.set_child(Some(&pic));
+    overlay.set_halign(gtk::Align::Start);
+    overlay.set_child(Some(&viewport));
 
     let live_button = gtk::Button::from_icon_name("media-playback-start-symbolic");
     live_button.add_css_class("live-photo-button");

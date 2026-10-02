@@ -141,6 +141,7 @@ impl super::Ui {
                     &ui.current_receipt_text,
                     &ui.receipt_label,
                     &ui.current_text,
+                    &ui.current_attachments,
                 );
 
                 let to = match &marker {
@@ -215,11 +216,12 @@ impl super::Ui {
                 let prev_guids = ui.rendered_guids.borrow().clone();
                 let prev_receipt = ui.current_receipt_text.borrow().clone();
                 let prev_reactions = ui.collect_current_reactions();
-                let plan = plan_chat_update(
+                let plan = plan::plan_chat_update_with_attachments(
                     &prev_guids,
                     prev_receipt.as_deref(),
                     &prev_reactions,
                     &ui.current_text.borrow(),
+                    &ui.current_attachments.borrow(),
                     &msgs,
                     &reactions,
                 );
@@ -292,6 +294,7 @@ impl super::Ui {
                         for w in &widgets {
                             ui.msg_container.append(w);
                         }
+                        update_timeline_timestamps(&msgs, &ui.current_chips.borrow());
                         if let Some(w) = marker {
                             *ui.unread_marker.borrow_mut() = Some(w.clone());
                             *ui.unread_marker_shown.borrow_mut() = true;
@@ -334,6 +337,9 @@ impl super::Ui {
                             if let Some(text) = &m.text {
                                 ui.current_text.borrow_mut().insert(m.guid.clone(), text.clone());
                             }
+                            ui.current_attachments
+                                .borrow_mut()
+                                .insert(m.guid.clone(), m.attachments.clone());
                         }
                         ui.refresh_typing_row(is_group);
                         ui.update_unread_pill();
@@ -424,6 +430,7 @@ impl super::Ui {
                             &ui.current_receipt_text,
                             &ui.receipt_label,
                             &ui.current_text,
+                            &ui.current_attachments,
                         );
                         if ui.morph_pending.replace(false) {
                             if let Some(last) = ui.msg_container.last_child() {
@@ -562,6 +569,12 @@ impl super::Ui {
                 );
                 ui.current_chips.borrow_mut().extend(chip_map);
                 *ui.current_reactions.borrow_mut() = reactions.clone();
+                ui.current_attachments.borrow_mut().extend(
+                    older
+                        .iter()
+                        .filter(|m| m.associated_guid.is_none())
+                        .map(|m| (m.guid.clone(), m.attachments.clone())),
+                );
                 // If the batch's newest non-today calendar date matches the old
                 // oldest message's date, the old top date divider is now redundant,
                 // because the batch already provides one for that date farther up
@@ -590,6 +603,16 @@ impl super::Ui {
                 for w in widgets.into_iter().rev() {
                     ui.msg_container.prepend(&w);
                 }
+                // Keep the tracked order in sync with the actual timeline so
+                // later prepends can identify the real first row and latest send.
+                let mut rendered_guids = older
+                    .iter()
+                    .filter(|m| m.associated_guid.is_none())
+                    .map(|m| m.guid.clone())
+                    .collect::<Vec<_>>();
+                rendered_guids.extend(ui.rendered_guids.borrow().iter().cloned());
+                *ui.rendered_guids.borrow_mut() = rendered_guids;
+                update_rendered_timestamps(&ui.rendered_guids.borrow(), &ui.current_chips.borrow());
                 // After prepending, if the newest real message in the batch and
                 // the oldest previously-rendered real message are on different
                 // calendar days, insert a date divider at the boundary.  This
@@ -779,6 +802,7 @@ impl super::Ui {
                     &ui.current_receipt_text,
                     &ui.receipt_label,
                     &ui.current_text,
+                    &ui.current_attachments,
                 );
                 let to = match &marker {
                     Some(w) => ScrollTo::Widget(w.clone()),

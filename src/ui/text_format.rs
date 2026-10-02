@@ -4,6 +4,8 @@
 //! Extracted from [`super`](mod.rs). Pure text transformations — no GTK widget
 //! construction, no global state beyond the cached URL regex.
 
+use crate::store::MessageLinkPreview;
+use gtk::gio::prelude::AppLaunchContextExt;
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -43,6 +45,43 @@ pub(super) fn text_to_markup(text: &str) -> String {
     result
 }
 
+/// Remove only URL tokens represented by this message's rich-link preview.
+/// All surrounding prose and any other linkified URLs remain untouched.
+pub(super) fn text_without_preview_url(text: &str, preview: &MessageLinkPreview) -> String {
+    let represented: Vec<String> = [preview.original_url.as_deref(), preview.url.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(normalize_preview_url)
+        .collect();
+    if represented.is_empty() {
+        return text.to_string();
+    }
+
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+    for found in url_re().find_iter(text) {
+        if represented
+            .iter()
+            .any(|url| *url == normalize_preview_url(found.as_str()))
+        {
+            result.push_str(&text[last_end..found.start()]);
+            last_end = found.end();
+        }
+    }
+    result.push_str(&text[last_end..]);
+    result
+}
+
+fn normalize_preview_url(url: &str) -> String {
+    let url = url.trim();
+    let normalized = if url.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("www.")) {
+        format!("https://{url}")
+    } else {
+        url.to_string()
+    };
+    normalized
+}
+
 /// Escape a string for safe inclusion inside Pango markup.
 fn escape_markup(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -67,7 +106,9 @@ pub(super) fn open_uri(uri: &str) {
     } else {
         uri.to_string()
     };
-    if let Err(e) = gtk::gio::AppInfo::launch_default_for_uri(&uri, None::<&gtk::gio::AppLaunchContext>) {
+    let context = gtk::gio::AppLaunchContext::new();
+    context.unsetenv("LD_LIBRARY_PATH");
+    if let Err(e) = gtk::gio::AppInfo::launch_default_for_uri(&uri, Some(&context)) {
         eprintln!("failed to open URI {}: {e}", uri);
     }
 }

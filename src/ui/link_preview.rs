@@ -37,12 +37,13 @@ fn link_preview_placeholder_card(p: &MessageLinkPreview) -> gtk::Widget {
         .has_frame(false)
         .halign(gtk::Align::Start)
         .build();
+    card.set_focus_on_click(false);
     card.add_css_class("link-preview");
     let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
         .build();
-    row.append(&link_preview_thumb(p));
+    row.append(&link_preview_thumb(p, 224, 280));
     let text_col = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -52,16 +53,31 @@ fn link_preview_placeholder_card(p: &MessageLinkPreview) -> gtk::Widget {
     let label = gtk::Label::builder()
         .label("Loading preview…")
         .xalign(0.0)
+        .max_width_chars(28)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
         .build();
     label.add_css_class("link-preview-placeholder");
     text_col.append(&label);
     if let Some(u) = p.url.as_deref().or(p.original_url.as_deref()) {
-        let host = gtk::Label::builder().label(host_caption(u)).xalign(0.0).build();
+        let host = gtk::Label::builder()
+            .label(host_caption(u))
+            .xalign(0.0)
+            .max_width_chars(28)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .build();
         host.add_css_class("link-preview-host");
         text_col.append(&host);
     }
     row.append(&text_col);
-    card.set_child(Some(&row));
+    let content = adw::Clamp::builder()
+        .maximum_size(224)
+        .tightening_threshold(224)
+        .unit(adw::LengthUnit::Px)
+        .child(&row)
+        .build();
+    card.set_child(Some(&content));
     // Clicking the placeholder opens the URL too (best UX while we wait).
     if let Some(u) = p.url.as_deref().or(p.original_url.as_deref()) {
         let url = u.to_string();
@@ -71,23 +87,35 @@ fn link_preview_placeholder_card(p: &MessageLinkPreview) -> gtk::Widget {
     card.upcast()
 }
 
-/// A 72×72 rounded thumbnail, loaded from `image_path` on disk. The
+/// A rounded thumbnail, loaded from `image_path` on disk. The
 /// thumbnail bytes were just written there by the link-preview ingest, so
 /// the synchronous read is fast and fresh. If the cached image can't be
 /// decoded (HEIC on a system without gdk-pixbuf HEIC, or the file was
 /// deleted), the cell is filled with a neutral chain-link icon.
-fn link_preview_thumb(p: &MessageLinkPreview) -> gtk::Widget {
+fn link_preview_thumb(p: &MessageLinkPreview, width: i32, height: i32) -> gtk::Widget {
     if let Some(path) = p.image_path.as_deref() {
         if let Ok(texture) = gtk::gdk::Texture::from_filename(path) {
             let pic = gtk::Picture::new();
             pic.set_paintable(Some(&texture));
-            // Cover-fit: thumbnail may be a different aspect ratio than the box.
+            // The overlay viewport owns the size requisition. Excluding the
+            // picture from overlay measurement keeps the texture's natural
+            // dimensions from widening the card.
             pic.set_content_fit(gtk::ContentFit::Cover);
-            pic.set_size_request(72, 72);
             pic.set_can_shrink(true);
-            pic.set_overflow(gtk::Overflow::Hidden);
-            pic.add_css_class("link-preview-thumb");
-            return pic.upcast();
+            pic.set_hexpand(true);
+            pic.set_vexpand(true);
+            pic.set_halign(gtk::Align::Fill);
+            pic.set_valign(gtk::Align::Fill);
+
+            let viewport = gtk::Overlay::new();
+            viewport.set_overflow(gtk::Overflow::Hidden);
+            viewport.add_css_class("link-preview-thumb");
+            let size = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            size.set_size_request(width, height);
+            viewport.set_child(Some(&size));
+            viewport.add_overlay(&pic);
+            viewport.set_measure_overlay(&pic, false);
+            return viewport.upcast();
         }
     }
     // Fallback: neutral chain icon in a rounded box the same size as the thumb.
@@ -96,7 +124,7 @@ fn link_preview_thumb(p: &MessageLinkPreview) -> gtk::Widget {
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)
         .build();
-    box_.set_size_request(72, 72);
+    box_.set_size_request(width, height);
     box_.add_css_class("link-preview-thumb-fallback");
     let icon = gtk::Image::from_icon_name("insert-link-symbolic");
     icon.set_pixel_size(32);
@@ -116,13 +144,14 @@ pub(super) fn link_preview_card(p: &MessageLinkPreview) -> gtk::Widget {
         .has_frame(false)
         .halign(gtk::Align::Start)
         .build();
+    card.set_focus_on_click(false);
     card.add_css_class("link-preview");
 
     let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(10)
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
         .build();
-    row.append(&link_preview_thumb(p));
+    row.append(&link_preview_thumb(p, 224, 280));
 
     let text_col = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -136,9 +165,9 @@ pub(super) fn link_preview_card(p: &MessageLinkPreview) -> gtk::Widget {
         let title = gtk::Label::builder()
             .label(&title_text)
             .xalign(0.0)
-            .max_width_chars(40)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .single_line_mode(true)
+            .max_width_chars(28)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
             .build();
         title.add_css_class("link-preview-title");
         apply_text_scale(&title, 13.0);
@@ -149,10 +178,9 @@ pub(super) fn link_preview_card(p: &MessageLinkPreview) -> gtk::Widget {
         let summary = gtk::Label::builder()
             .label(&summary_text)
             .xalign(0.0)
-            .max_width_chars(60)
+            .max_width_chars(32)
             .wrap(true)
-            .lines(2)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
             .build();
         summary.add_css_class("link-preview-desc");
         apply_text_scale(&summary, 11.0);
@@ -162,13 +190,22 @@ pub(super) fn link_preview_card(p: &MessageLinkPreview) -> gtk::Widget {
         let host = gtk::Label::builder()
             .label(host_caption(u))
             .xalign(0.0)
+            .max_width_chars(28)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
             .build();
         host.add_css_class("link-preview-host");
         apply_text_scale(&host, 10.0);
         text_col.append(&host);
     }
     row.append(&text_col);
-    card.set_child(Some(&row));
+    let content = adw::Clamp::builder()
+        .maximum_size(224)
+        .tightening_threshold(224)
+        .unit(adw::LengthUnit::Px)
+        .child(&row)
+        .build();
+    card.set_child(Some(&content));
 
     // Open the URL when clicked. Use the original URL (what the sender typed)
     // when it differs from the canonical one — that's the link the sender
